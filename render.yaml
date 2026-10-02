@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: roshanbrand
+    runtime: node
+    plan: starter
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start
+    disk:
+      name: roshanbrand-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATA_DIR
+        value: /var/data
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: ADMIN_RECOVERY_KEY
+        sync: false

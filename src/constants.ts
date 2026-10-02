@@ -1,0 +1,56 @@
+import { StoreConfig } from './types';
+
+export const LIMITS = {
+  ID_REGEX: /^[a-zA-Z0-9_-]+$/,
+  UTR_REGEX: /^[0-9]{12}$/,
+  ALPHANUM_UTR_REGEX: /^[a-zA-Z0-9_-]{6,32}$/,
+  ORDER_ID_MIN: 4,
+  ORDER_ID_MAX: 64,
+  UTR_MIN: 6,
+  UTR_MAX: 32,
+  SITE_TITLE_MIN: 2,
+  SITE_TITLE_MAX: 80,
+  ANNOUNCEMENT_MIN: 2,
+  ANNOUNCEMENT_MAX: 200,
+  UPI_ID_MIN: 3,
+  UPI_ID_MAX: 100,
+  PAYEE_NAME_MIN: 2,
+  PAYEE_NAME_MAX: 80,
+  QR_URL_MAX: 2000000,
+  SUPPORT_HANDLE_MIN: 2,
+  SUPPORT_HANDLE_MAX: 100,
+  DELIVERY_NOTE_MIN: 2,
+  DELIVERY_NOTE_MAX: 180,
+  CUSTOMER_REF_MIN: 1,
+  CUSTOMER_REF_MAX: 80,
+  CUSTOM_SPEC_MAX: 240,
+  CREDENTIALS_MAX: 10000,
+  ADMIN_NOTE_MAX: 300,
+  QUANTITY_MIN: 1,
+  QUANTITY_MAX: 500,
+};
+
+export const DEFAULT_STORE_CONFIG: StoreConfig = {
+  siteTitle: 'Roshanbrand',
+  announcementText: 'AUTHORIZED IRCTC ACCOUNTS · 24H RENTAL ID @ ₹49 · INSTANT UPI UTR VERIFICATION',
+  upiId: 'roshanbrand.pay@okaxis',
+  payeeName: 'Roshanbrand Official',
+  qrCodeUrl: '',
+  supportHandle: '@RoshanbrandSupport · 24×7 Instant Help',
+  price1Id: 350,
+  price2Id: 680,
+  price5Id: 1700,
+  price10Id: 3300,
+  priceBulkPerId: 300,
+  priceCustomPerId: 340,
+  priceRental24h: 49,
+  stockAvailable: 145,
+  rentalStockAvailable: 68,
+  instantAutoVerify: true,
+  presetRentalCredentials:
+    'Username: roshan_rent24_vip | Password: Tatkal@2499 | TxnPin: 4412 | 24-Hour Active Rental',
+  presetPermanentCredentials:
+    'Username: rb_irctc_vip801 | Password: RailPass@801 | TxnPin: 1928 | Permanent Aadhaar Verified',
+  instantDeliveryNote:
+    'Payment ke turant baad 12-digit UPI UTR number enter karein. Instant UPI Gateway verification hote hi aapki IRCTC ID aur Password isi screen par mil jayega.',
+};

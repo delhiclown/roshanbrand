@@ -1,0 +1,6 @@
+{
+  "name": "Roshanbrand — 3D Neon IRCTC ID Store & 24H Rental",
+  "description": "Get verified IRCTC accounts and 24-hour rental IRCTC IDs at ₹49 on Roshanbrand. Pay via UPI QR code with instant UTR verification and on-screen credential delivery.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

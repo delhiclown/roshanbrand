@@ -1397,7 +1397,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-cyan-500/35 text-sm text-emerald-400 font-mono font-black"
                   />
                   <p className="text-[11px] text-slate-400">
-                    Manual display count; orders and Vault changes will not alter it.
+                    Manual stock counter. Customer availability follows this value.
                   </p>
                 </div>
 
@@ -1418,7 +1418,49 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-emerald-500/40 text-sm text-emerald-400 font-mono font-black"
                   />
                   <p className="text-[11px] text-slate-400">
-                    Manual display count; orders and Vault changes will not alter it.
+                    Manual stock counter. Customer availability follows this value.
+                  </p>
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="block text-xs font-extrabold text-cyan-300">
+                    7 Days Guarantee IDs Stock
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    value={formConfig.stock7DayGuaranteeAvailable}
+                    onChange={(e) =>
+                      setFormConfig({
+                        ...formConfig,
+                        stock7DayGuaranteeAvailable: Number(e.target.value),
+                      })
+                    }
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-cyan-500/35 text-sm text-emerald-400 font-mono font-black"
+                  />
+                  <p className="text-[11px] text-slate-400">
+                    Alag stock; verified orders automatically reduce this count.
+                  </p>
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="block text-xs font-extrabold text-emerald-300">
+                    1 Month Guarantee IDs Stock
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    value={formConfig.stock1MonthGuaranteeAvailable}
+                    onChange={(e) =>
+                      setFormConfig({
+                        ...formConfig,
+                        stock1MonthGuaranteeAvailable: Number(e.target.value),
+                      })
+                    }
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-emerald-500/40 text-sm text-emerald-400 font-mono font-black"
+                  />
+                  <p className="text-[11px] text-slate-400">
+                    Alag stock; verified orders automatically reduce this count.
                   </p>
                 </div>
 

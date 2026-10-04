@@ -31,6 +31,8 @@ export interface StoreConfig {
   rentalStockAvailable: number;
   stockDisplayAvailable: number;
   rentalStockDisplayAvailable: number;
+  stock7DayGuaranteeAvailable: number;
+  stock1MonthGuaranteeAvailable: number;
   instantAutoVerify: boolean;
   presetRentalCredentials?: string;
   presetPermanentCredentials?: string;

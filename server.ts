@@ -152,6 +152,14 @@ function loadDb(): PersistedDatabase {
               DEFAULT_STORE_CONFIG.rentalStockDisplayAvailable
             )
           ),
+          stock7DayGuaranteeAvailable: normalizeStock(
+            savedStoreConfig.stock7DayGuaranteeAvailable,
+            DEFAULT_STORE_CONFIG.stock7DayGuaranteeAvailable
+          ),
+          stock1MonthGuaranteeAvailable: normalizeStock(
+            savedStoreConfig.stock1MonthGuaranteeAvailable,
+            DEFAULT_STORE_CONFIG.stock1MonthGuaranteeAvailable
+          ),
         },
         orders,
         vault: Array.isArray(parsed.vault) ? parsed.vault : buildInitialVault(),
@@ -609,6 +617,14 @@ async function startServer() {
         body.rentalStockDisplayAvailable,
         db.storeConfig.rentalStockDisplayAvailable
       ),
+      stock7DayGuaranteeAvailable: normalizeStock(
+        body.stock7DayGuaranteeAvailable,
+        db.storeConfig.stock7DayGuaranteeAvailable
+      ),
+      stock1MonthGuaranteeAvailable: normalizeStock(
+        body.stock1MonthGuaranteeAvailable,
+        db.storeConfig.stock1MonthGuaranteeAvailable
+      ),
       instantAutoVerify: false,
       presetRentalCredentials: String(
         body.presetRentalCredentials ??
@@ -677,6 +693,19 @@ async function startServer() {
     }
 
     const isRental24h = packType === 'rental_24h';
+    const availableStock =
+      packType === 'rental_24h'
+        ? db.storeConfig.rentalStockDisplayAvailable
+        : packType === 'guarantee_7days'
+          ? db.storeConfig.stock7DayGuaranteeAvailable
+          : packType === 'guarantee_1month'
+            ? db.storeConfig.stock1MonthGuaranteeAvailable
+            : db.storeConfig.stockDisplayAvailable;
+    if (quantity > availableStock) {
+      res.status(409).json({ error: 'Not enough stock is available for this package.' });
+      return;
+    }
+
     let totalAmount: number;
     switch (packType) {
       case 'pack_1':
@@ -866,6 +895,16 @@ async function startServer() {
         db.storeConfig.rentalStockAvailable = Math.max(
           0,
           db.storeConfig.rentalStockAvailable - order.quantity
+        );
+      } else if (order.packType === 'guarantee_7days') {
+        db.storeConfig.stock7DayGuaranteeAvailable = Math.max(
+          0,
+          db.storeConfig.stock7DayGuaranteeAvailable - order.quantity
+        );
+      } else if (order.packType === 'guarantee_1month') {
+        db.storeConfig.stock1MonthGuaranteeAvailable = Math.max(
+          0,
+          db.storeConfig.stock1MonthGuaranteeAvailable - order.quantity
         );
       } else {
         db.storeConfig.stockAvailable = Math.max(

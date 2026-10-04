@@ -75,15 +75,13 @@ export default function App() {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [supportOpen, setSupportOpen] = useState<boolean>(false);
   const [inlineQrDataUrl, setInlineQrDataUrl] = useState<string>('');
-  const displayedPermanentStock = Math.min(
-    storeConfig.stockAvailable,
-    storeConfig.stockDisplayAvailable
-  );
-  const displayedRentalStock = Math.min(
-    storeConfig.rentalStockAvailable,
-    storeConfig.rentalStockDisplayAvailable
-  );
-  const totalDisplayedStock = displayedPermanentStock + displayedRentalStock;
+  const displayedPermanentStock = storeConfig.stockDisplayAvailable;
+  const displayedRentalStock = storeConfig.rentalStockDisplayAvailable;
+  const totalDisplayedStock =
+    displayedPermanentStock +
+    displayedRentalStock +
+    storeConfig.stock7DayGuaranteeAvailable +
+    storeConfig.stock1MonthGuaranteeAvailable;
 
   useEffect(() => {
     if (trackedOrder?.status !== 'verified_delivered') return;
@@ -712,7 +710,11 @@ export default function App() {
                 const unitPrice = Number(storeConfig[option.unitPriceKey]) || 49;
                 const stockCount = option.isRental24h
                   ? displayedRentalStock
-                  : displayedPermanentStock;
+                  : option.isSevenDayGuarantee
+                    ? storeConfig.stock7DayGuaranteeAvailable
+                    : option.isOneMonthGuarantee
+                      ? storeConfig.stock1MonthGuaranteeAvailable
+                      : displayedPermanentStock;
                 const isOutOfStock = stockCount <= 0;
 
                 return (

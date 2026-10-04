@@ -92,7 +92,7 @@ export default function App() {
     };
   }, [trackedOrder?.status]);
 
-  // Fetch live store config
+  // Keep storefront stock and settings in sync with admin changes.
   useEffect(() => {
     const loadStore = async () => {
       try {
@@ -108,6 +108,20 @@ export default function App() {
       }
     };
     loadStore();
+
+    const events = new EventSource('/api/events');
+    events.onmessage = (event) => {
+      try {
+        const message = JSON.parse(event.data) as { type?: string };
+        if (message.type === 'config_updated') {
+          loadStore();
+        }
+      } catch {
+        // Ignore malformed event payloads and keep the last loaded configuration.
+      }
+    };
+
+    return () => events.close();
   }, []);
 
   // Poll tracked order if present
@@ -804,7 +818,7 @@ export default function App() {
                               ? 'Loading stock…'
                               : isOutOfStock
                                 ? 'Out of stock'
-                                : `${stockCount} ready`}
+                                : `${stockCount} ID${stockCount === 1 ? '' : 's'} in stock`}
                           </span>
                           {option.isRental24h && (
                             <>

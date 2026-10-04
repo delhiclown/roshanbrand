@@ -1397,7 +1397,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-cyan-500/35 text-sm text-emerald-400 font-mono font-black"
                   />
                   <p className="text-[11px] text-slate-400">
-                    Manual stock counter. Customer availability follows this value.
+                    Customer availability follows this value; verified sales reduce it automatically.
                   </p>
                 </div>
 
@@ -1418,7 +1418,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-emerald-500/40 text-sm text-emerald-400 font-mono font-black"
                   />
                   <p className="text-[11px] text-slate-400">
-                    Manual stock counter. Customer availability follows this value.
+                    Customer availability follows this value; verified sales reduce it automatically.
                   </p>
                 </div>
 
@@ -1439,7 +1439,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-cyan-500/35 text-sm text-emerald-400 font-mono font-black"
                   />
                   <p className="text-[11px] text-slate-400">
-                    Alag stock; verified orders automatically reduce this count.
+                    Customer availability follows this value; verified sales reduce it automatically.
                   </p>
                 </div>
 
@@ -1460,7 +1460,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-emerald-500/40 text-sm text-emerald-400 font-mono font-black"
                   />
                   <p className="text-[11px] text-slate-400">
-                    Alag stock; verified orders automatically reduce this count.
+                    Customer availability follows this value; verified sales reduce it automatically.
                   </p>
                 </div>
 

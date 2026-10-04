@@ -1351,7 +1351,7 @@ export default function App() {
 
               <div className="grid gap-2 sm:grid-cols-2">
                 <a
-                  href="https://wa.link/m97wgo"
+                  href="https://wa.me/14086439496"
                   target="_blank"
                   rel="noreferrer"
                   className="flex items-center gap-3 rounded-xl border border-emerald-400/40 bg-emerald-950/40 p-3 text-left hover:bg-emerald-900/50"

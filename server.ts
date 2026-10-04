@@ -865,7 +865,6 @@ async function startServer() {
       );
     }
 
-    const wasPending = order.status !== 'verified_delivered';
     const now = new Date();
     order.status = 'verified_delivered';
     order.deliveredCredentials = sanitizeDeliveredCredentials(creds).slice(
@@ -891,35 +890,8 @@ async function startServer() {
       }
     }
 
-    if (wasPending) {
-      if (order.packType === 'rental_24h') {
-        db.storeConfig.rentalStockDisplayAvailable = Math.max(
-          0,
-          db.storeConfig.rentalStockDisplayAvailable - order.quantity
-        );
-      } else if (order.packType === 'guarantee_7days') {
-        db.storeConfig.stock7DayGuaranteeAvailable = Math.max(
-          0,
-          db.storeConfig.stock7DayGuaranteeAvailable - order.quantity
-        );
-      } else if (order.packType === 'guarantee_1month') {
-        db.storeConfig.stock1MonthGuaranteeAvailable = Math.max(
-          0,
-          db.storeConfig.stock1MonthGuaranteeAvailable - order.quantity
-        );
-      } else {
-        db.storeConfig.stockDisplayAvailable = Math.max(
-          0,
-          db.storeConfig.stockDisplayAvailable - order.quantity
-        );
-      }
-    }
-
     db.utrIndex[order.utrNumber] = order.orderId;
     saveDb(db);
-    if (wasPending) {
-      broadcastStateUpdate('config_updated', { storeConfig: db.storeConfig });
-    }
     broadcastStateUpdate('order_verified', { order });
     res.json({ order, storeConfig: db.storeConfig });
   });

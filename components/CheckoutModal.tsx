@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   AlertCircle,
   Check,
@@ -11,12 +11,10 @@ import {
   Loader2,
   QrCode,
   ShieldCheck,
-  Sparkles,
   X,
-  Zap,
 } from 'lucide-react';
-import { LIMITS } from '../constants';
-import { CheckoutDraft, OrderRecord, StoreConfig } from '../types';
+import { LIMITS } from '../src/constants';
+import { CheckoutDraft, OrderRecord, StoreConfig } from '../src/types';
 import { UpiQrBox } from './UpiQrBox';
 
 interface CheckoutModalProps {
@@ -50,13 +48,11 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   const [customerRef, setCustomerRef] = useState('');
   const [customSpec, setCustomSpec] = useState(draft?.initialCustomSpec || '');
   const [submitting, setSubmitting] = useState(false);
-  const [verifyStep, setVerifyStep] = useState<number>(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [completedOrder, setCompletedOrder] = useState<OrderRecord | null>(activeOrder);
-  const lastAutoTriedUtrRef = useRef<string>('');
 
-  const verifyUtrWithGateway = useCallback(
+  const submitUtrForReview = useCallback(
     async (rawUtrToVerify: string) => {
       if (!draft || submitting || completedOrder) return;
       setErrorMsg(null);
@@ -64,19 +60,12 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
       const extracted12 = extract12DigitUtr(rawUtrToVerify);
       const cleanedUtr = extracted12 || rawUtrToVerify.trim().replace(/\s+/g, '');
 
-      if (
-        cleanedUtr.length < LIMITS.UTR_MIN ||
-        cleanedUtr.length > LIMITS.UTR_MAX ||
-        !LIMITS.ALPHANUM_UTR_REGEX.test(cleanedUtr)
-      ) {
-        setErrorMsg(
-          'Kripya valid 12-digit UPI UTR / Transaction Reference ID dalein (digits/letters only).'
-        );
+      if (!LIMITS.UTR_REGEX.test(cleanedUtr)) {
+        setErrorMsg('Kripya apna valid 12-digit numeric UPI UTR dalein.');
         return;
       }
 
       setSubmitting(true);
-      setVerifyStep(1);
 
       try {
         const response = await fetch('/api/orders/verify-upi', {
@@ -98,9 +87,8 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
 
         const data = await response.json();
         if (!response.ok) {
-          setErrorMsg(data.error || 'UTR verification failed. Please check your UTR number.');
+          setErrorMsg(data.error || 'UTR submission failed. Please check your UTR number.');
           setSubmitting(false);
-          setVerifyStep(0);
           return;
         }
 
@@ -124,11 +112,10 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         setErrorMsg(
           err instanceof Error
             ? err.message
-            : 'Network error while auto-verifying UPI payment. Please try again.'
+            : 'Network error while submitting your UTR. Please try again.'
         );
       } finally {
         setSubmitting(false);
-        setVerifyStep(0);
       }
     },
     [draft, submitting, completedOrder, upiAppUsed, customerRef, customSpec, onOrderCreated]
@@ -167,24 +154,6 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
       clearInterval(interval);
     };
   }, [completedOrder, onOrderCreated]);
-
-  // Auto-verify in 0ms as soon as a 12-digit UTR is typed or pasted!
-  useEffect(() => {
-    const detected12 = extract12DigitUtr(utrNumber);
-    if (
-      detected12 &&
-      detected12.length === 12 &&
-      !submitting &&
-      !completedOrder &&
-      lastAutoTriedUtrRef.current !== detected12
-    ) {
-      lastAutoTriedUtrRef.current = detected12;
-      if (utrNumber !== detected12) {
-        setUtrNumber(detected12);
-      }
-      verifyUtrWithGateway(detected12);
-    }
-  }, [utrNumber, submitting, completedOrder, verifyUtrWithGateway]);
 
   if (!draft && !completedOrder) return null;
 
@@ -225,31 +194,25 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
     URL.revokeObjectURL(url);
   };
 
-  const handleAutoDetectPaid = () => {
-    const generated12 =
-      '4' + Array.from({ length: 11 }, () => Math.floor(Math.random() * 10)).join('');
-    lastAutoTriedUtrRef.current = generated12;
-    setUtrNumber(generated12);
-    setErrorMsg(null);
-    verifyUtrWithGateway(generated12);
-  };
-
   const handlePasteFromClipboard = async () => {
     try {
       const text = await navigator.clipboard.readText();
       if (text) {
-        const extracted = extract12DigitUtr(text) || text.trim();
+        const extracted = extract12DigitUtr(text);
+        if (!extracted) {
+          setErrorMsg('Clipboard me 12-digit UTR nahi mila. Apna payment receipt check karein.');
+          return;
+        }
         setUtrNumber(extracted);
       }
     } catch {
-      // Fallback if clipboard permission denied
-      handleAutoDetectPaid();
+      setErrorMsg('Clipboard access nahi mila. UTR ko manually paste ya type karein.');
     }
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    await verifyUtrWithGateway(utrNumber);
+    await submitUtrForReview(utrNumber);
   };
 
   return (
@@ -270,15 +233,23 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
             <div className="min-w-0">
               <h3 className="text-sm sm:text-base font-extrabold text-white truncate">
                 {completedOrder
-                  ? 'UTR Auto-Verified — Instant IRCTC ID Delivered'
+                  ? completedOrder.status === 'verified_delivered'
+                    ? 'Payment Confirmed — IRCTC ID Delivered'
+                    : completedOrder.status === 'rejected'
+                    ? 'Payment UTR Rejected'
+                    : 'UTR Submitted — Payment Review Pending'
                   : draft?.isRental24h
-                  ? '24-Hour Rental IRCTC ID · Auto-Verify UPI Checkout'
-                  : 'Instant UPI QR Checkout & Automatic UTR Verification'}
+                  ? '24-Hour Rental IRCTC ID · UPI Checkout'
+                  : draft?.packType === 'guarantee_7days'
+                  ? 'IRCTC ID · 7 Days Guarantee · UPI Checkout'
+                  : draft?.packType === 'guarantee_1month'
+                  ? 'IRCTC ID · 1 Month Guarantee · UPI Checkout'
+                  : 'UPI Checkout & Manual Payment Confirmation'}
               </h3>
               <p className="text-[11px] text-cyan-300/85 truncate">
                 {completedOrder
-                  ? `Order #${completedOrder.orderId} · Auto-Verified UTR: ${completedOrder.utrNumber}`
-                  : '12-digit UTR enter ya paste karte hi automatic verify hokar ID screen par aa jayegi'}
+                  ? `Order #${completedOrder.orderId} · UTR: ${completedOrder.utrNumber}`
+                  : `Payment sirf ${storeConfig.upiId} par karein; UTR receipt ke baad submit karein.`}
               </p>
             </div>
           </div>
@@ -296,94 +267,121 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         {/* Completed Order View */}
         {completedOrder ? (
           <div className="p-5 sm:p-6 space-y-5">
-            <div className="space-y-4">
-              <div className="p-4 rounded-2xl bg-emerald-950/50 border border-emerald-400/50 flex flex-wrap items-center justify-between gap-3">
-                <div className="flex items-center gap-3">
-                  <div className="w-11 h-11 rounded-xl bg-emerald-500/20 border border-emerald-400/50 text-emerald-300 flex items-center justify-center shrink-0">
-                    <CheckCircle2 className="w-6 h-6" />
+            {completedOrder.status === 'verified_delivered' ? (
+              <div className="space-y-4">
+                <div className="p-4 rounded-2xl bg-emerald-950/50 border border-emerald-400/50 flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <div className="w-11 h-11 rounded-xl bg-emerald-500/20 border border-emerald-400/50 text-emerald-300 flex items-center justify-center shrink-0">
+                      <CheckCircle2 className="w-6 h-6" />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-sm font-extrabold text-white">
+                          UPI Payment ₹{completedOrder.totalAmount} Confirmed
+                        </span>
+                        <span className="text-[11px] font-mono font-bold text-emerald-300">
+                          UTR {completedOrder.utrNumber}
+                        </span>
+                      </div>
+                      <p className="text-xs text-emerald-200/90 mt-0.5">
+                        {completedOrder.isRental24h
+                          ? `24-Hour Rental Active · Valid until ${
+                              completedOrder.rentalExpiresAt
+                                ? new Date(completedOrder.rentalExpiresAt).toLocaleString()
+                                : '24 Hours from now'
+                            }`
+                          : 'Your IRCTC credentials are ready below.'}
+                      </p>
+                    </div>
                   </div>
-                  <div>
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className="text-sm font-extrabold text-white">
-                        UPI Payment ₹{completedOrder.totalAmount} Auto-Verified!
-                      </span>
-                      <span className="text-[11px] font-mono font-bold text-emerald-300">
-                        UTR {completedOrder.utrNumber}
+
+                  {completedOrder.isRental24h && (
+                    <div className="px-3 py-1.5 rounded-xl bg-slate-950/90 border border-emerald-400/40 flex items-center gap-1.5 text-xs font-bold text-emerald-300">
+                      <Clock className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>24H Active Rental</span>
+                    </div>
+                  )}
+                </div>
+
+                <div className="rounded-xl border border-emerald-400/35 bg-emerald-950/25 p-4">
+                  <div className="flex items-center justify-between gap-2 text-xs font-bold text-emerald-300 mb-2">
+                    <div className="flex items-center gap-2">
+                      <KeyRound className="w-4 h-4 text-emerald-400" />
+                      <span>
+                        Your Delivered IRCTC Login ID{completedOrder.quantity > 1 ? 's' : ''} &amp;
+                        Password{completedOrder.quantity > 1 ? 's' : ''}
                       </span>
                     </div>
-                    <p className="text-xs text-emerald-200/90 mt-0.5">
-                      {completedOrder.isRental24h
-                        ? `24-Hour Rental Active · Valid until ${
-                            completedOrder.rentalExpiresAt
-                              ? new Date(completedOrder.rentalExpiresAt).toLocaleString()
-                              : '24 Hours from now'
-                          }`
-                        : 'Your permanent Aadhaar-verified IRCTC credentials are ready below.'}
-                    </p>
-                  </div>
-                </div>
-
-                {completedOrder.isRental24h && (
-                  <div className="px-3 py-1.5 rounded-xl bg-slate-950/90 border border-emerald-400/40 flex items-center gap-1.5 text-xs font-bold text-emerald-300">
-                    <Clock className="w-3.5 h-3.5 text-emerald-400" />
-                    <span>24H Active Rental</span>
-                  </div>
-                )}
-              </div>
-
-              <div className="rounded-xl border border-emerald-400/35 bg-emerald-950/25 p-4">
-                <div className="flex items-center justify-between gap-2 text-xs font-bold text-emerald-300 mb-2">
-                  <div className="flex items-center gap-2">
-                    <KeyRound className="w-4 h-4 text-emerald-400" />
-                    <span>
-                      Your Delivered IRCTC Login ID{completedOrder.quantity > 1 ? 's' : ''} &amp;
-                      Password{completedOrder.quantity > 1 ? 's' : ''}
+                    <span className="font-mono text-[11px] text-sky-300">
+                      {completedOrder.packLabel}
                     </span>
                   </div>
-                  <span className="font-mono text-[11px] text-sky-300">
-                    {completedOrder.packLabel}
+                  <pre className="p-3.5 bg-[#060a1d] border border-sky-400/25 rounded-xl font-mono text-xs sm:text-sm text-sky-200 whitespace-pre-wrap break-words leading-relaxed select-all">
+                    {completedOrder.deliveredCredentials}
+                  </pre>
+                  {completedOrder.adminNote && (
+                    <p className="mt-2.5 text-xs text-slate-300">
+                      <span className="font-semibold text-white">Payment status:</span>{' '}
+                      {completedOrder.adminNote}
+                    </p>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <button
+                    type="button"
+                    onClick={() => copyText(completedOrder.deliveredCredentials, 'all')}
+                    className="h-11 rounded-xl store-pay-pill text-white font-bold text-xs sm:text-sm inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    {copiedKey === 'all' ? (
+                      <>
+                        <Check className="w-4 h-4 text-emerald-300" />
+                        <span>Copied Credentials!</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-4 h-4" />
+                        <span>Copy All IDs &amp; Passwords</span>
+                      </>
+                    )}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => downloadCsv(completedOrder)}
+                    className="h-11 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs sm:text-sm inline-flex items-center justify-center gap-1.5 cursor-pointer transition-colors"
+                  >
+                    <Download className="w-4 h-4" />
+                    <span>Download CSV Backup</span>
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="p-4 rounded-2xl bg-amber-950/45 border border-amber-400/50 space-y-2">
+                <div className="flex items-center gap-2 text-sm font-extrabold text-amber-200">
+                  {completedOrder.status === 'rejected' ? (
+                    <AlertCircle className="w-5 h-5 text-rose-400" />
+                  ) : (
+                    <Clock className="w-5 h-5 text-amber-300" />
+                  )}
+                  <span>
+                    {completedOrder.status === 'rejected'
+                      ? 'Payment UTR rejected'
+                      : 'UTR received — payment confirmation pending'}
                   </span>
                 </div>
-                <pre className="p-3.5 bg-[#060a1d] border border-sky-400/25 rounded-xl font-mono text-xs sm:text-sm text-sky-200 whitespace-pre-wrap break-words leading-relaxed select-all">
-                  {completedOrder.deliveredCredentials}
-                </pre>
-                {completedOrder.adminNote && (
-                  <p className="mt-2.5 text-xs text-slate-300">
-                    <span className="font-semibold text-white">Auto-Verify Status:</span>{' '}
-                    {completedOrder.adminNote}
+                <p className="text-xs text-slate-200">
+                  {completedOrder.status === 'rejected'
+                    ? completedOrder.adminNote || 'Please contact support.'
+                    : `Order #${completedOrder.orderId} · ₹${completedOrder.totalAmount} · UTR ${completedOrder.utrNumber}. Credentials release only after an admin confirms this exact payment arrived at ${completedOrder.paymentUpiId || storeConfig.upiId}.`}
+                </p>
+                {completedOrder.status === 'pending_verification' && (
+                  <p className="text-[11px] text-amber-200">
+                    UTR submit karna payment proof nahi hai. Apne payment app ki receipt sambhal kar rakhein.
                   </p>
                 )}
               </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <button
-                  type="button"
-                  onClick={() => copyText(completedOrder.deliveredCredentials, 'all')}
-                  className="h-11 rounded-xl store-pay-pill text-white font-bold text-xs sm:text-sm inline-flex items-center justify-center gap-1.5 cursor-pointer"
-                >
-                  {copiedKey === 'all' ? (
-                    <>
-                      <Check className="w-4 h-4 text-emerald-300" />
-                      <span>Copied Credentials!</span>
-                    </>
-                  ) : (
-                    <>
-                      <Copy className="w-4 h-4" />
-                      <span>Copy All IDs &amp; Passwords</span>
-                    </>
-                  )}
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => downloadCsv(completedOrder)}
-                  className="h-11 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs sm:text-sm inline-flex items-center justify-center gap-1.5 cursor-pointer transition-colors"
-                >
-                  <Download className="w-4 h-4" />
-                  <span>Download CSV Backup</span>
-                </button>
-              </div>
-            </div>
+            )}
 
             <div className="flex items-center justify-end pt-2 border-t border-white/10">
               <button
@@ -391,7 +389,9 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                 onClick={onClose}
                 className="w-full sm:w-auto px-5 py-2.5 text-xs font-bold text-slate-200 bg-white/10 hover:bg-white/20 rounded-xl transition-colors cursor-pointer"
               >
-                Done &amp; View on Storefront
+                {completedOrder.status === 'verified_delivered'
+                  ? 'View Order Details'
+                  : 'Done & View on Storefront'}
               </button>
             </div>
           </div>
@@ -403,9 +403,14 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                   upiId={storeConfig.upiId}
                   payeeName={storeConfig.payeeName}
                   amount={draft.totalAmount}
-                  customQrUrl={storeConfig.qrCodeUrl}
                   orderNote={`${storeConfig.siteTitle} ${
-                    draft.isRental24h ? '24H Rental' : ''
+                    draft.isRental24h
+                      ? '24H Rental'
+                      : draft.packType === 'guarantee_7days'
+                      ? '7 Days Guarantee'
+                      : draft.packType === 'guarantee_1month'
+                      ? '1 Month Guarantee'
+                      : ''
                   } ${draft.quantity} ID`}
                 />
               </div>
@@ -441,15 +446,9 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                   </div>
                 </div>
 
-                {/* Live Automatic UTR Verification Banner */}
-                <div className="px-3.5 py-2.5 rounded-xl bg-emerald-950/45 border border-emerald-400/40 flex items-center justify-between gap-2 text-xs">
-                  <div className="flex items-center gap-2 text-emerald-200 font-medium">
-                    <Zap className="w-4 h-4 text-emerald-400 shrink-0 animate-pulse" />
-                    <span>
-                      <strong>Auto-Verify Active:</strong> 12-digit UTR type ya paste karte hi bina
-                      button dabaye automatic verify ho jayega!
-                    </span>
-                  </div>
+                <div className="px-3.5 py-2.5 rounded-xl bg-amber-950/45 border border-amber-400/40 text-xs text-amber-100">
+                  <strong>Manual payment check:</strong> Sirf {storeConfig.upiId} par payment karein.
+                  UTR submit karne se pehle apni UPI receipt me sahi amount aur receiver check karein.
                 </div>
 
                 {errorMsg && (
@@ -459,12 +458,12 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                   </div>
                 )}
 
-                {/* Step 2: 12-Digit UTR Auto-Verify Input */}
+                {/* Submit the UTR for a manual payment check. */}
                 <div className="space-y-3">
                   <div>
                     <div className="flex items-center justify-between gap-2 mb-1.5">
                       <label className="block text-xs font-bold text-sky-200">
-                        Step 2: Enter or Paste 12-Digit UPI UTR (Auto-Verifies) *
+                        Enter your 12-digit UPI UTR *
                       </label>
                       <div className="flex items-center gap-2">
                         <button
@@ -475,15 +474,6 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                           <ClipboardPaste className="w-3 h-3 text-emerald-400" />
                           <span>Paste UTR</span>
                         </button>
-                        <span className="text-slate-600">·</span>
-                        <button
-                          type="button"
-                          onClick={handleAutoDetectPaid}
-                          className="text-[11px] font-bold text-cyan-300 hover:text-white underline cursor-pointer flex items-center gap-1"
-                        >
-                          <Sparkles className="w-3 h-3 text-cyan-400" />
-                          <span>Auto-Fill &amp; Verify</span>
-                        </button>
                       </div>
                     </div>
 
@@ -491,14 +481,13 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                       <input
                         type="text"
                         required
+                        inputMode="numeric"
                         value={utrNumber}
                         onChange={(e) => {
-                          const val = e.target.value;
-                          const maybe12 = extract12DigitUtr(val);
-                          setUtrNumber(maybe12 || val);
+                          setUtrNumber(e.target.value.replace(/\D/g, '').slice(0, 12));
                         }}
-                        placeholder="Paste 12-digit UTR or UPI SMS (Auto-Verifies on 12th digit)"
-                        maxLength={120}
+                        placeholder="Enter 12-digit UTR from your payment receipt"
+                        maxLength={12}
                         className="w-full px-3.5 py-2.5 pr-24 text-sm font-mono bg-[#070c21] border border-sky-400/40 rounded-xl text-white placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-400/35 focus:border-emerald-400"
                       />
                       <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[11px] font-mono font-bold text-emerald-400">
@@ -507,23 +496,9 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                     </div>
 
                     <p className="mt-1 text-[11px] text-slate-400">
-                      Jaise hi 12 digits poore honge, system automatic UTR verify karke aapki ID
-                      screen par dikha dega.
+                      UTR submit hone ke baad payment ko {storeConfig.upiId} account me manually check kiya jayega.
                     </p>
                   </div>
-
-                  {/* 1-Click Auto-Detect UPI Payment Button */}
-                  <button
-                    type="button"
-                    disabled={submitting}
-                    onClick={handleAutoDetectPaid}
-                    className="w-full py-2.5 px-4 rounded-xl bg-emerald-950/70 hover:bg-emerald-900/80 border border-emerald-400/50 text-emerald-200 hover:text-white text-xs font-extrabold flex items-center justify-center gap-2 transition-colors cursor-pointer"
-                  >
-                    <Zap className="w-4 h-4 text-emerald-400" />
-                    <span>
-                      I Have Paid ₹{draft.totalAmount} on UPI — Auto-Detect &amp; Verify UTR Now
-                    </span>
-                  </button>
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <div>
@@ -558,19 +533,11 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                   </div>
                 </div>
 
-                {/* Live Gateway Progress */}
                 {submitting && (
                   <div className="p-3.5 rounded-xl bg-slate-950/90 border border-emerald-400/50 space-y-2">
                     <div className="flex items-center gap-2 text-xs font-bold text-emerald-300">
                       <Loader2 className="w-4 h-4 animate-spin text-emerald-400" />
-                      <span>
-                        {verifyStep === 1 &&
-                          '12-Digit UTR Detected! Connecting to NPCI UPI Gateway...'}
-                        {verifyStep === 2 &&
-                          `Auto-Verifying UTR ${utrNumber} & Amount ₹${draft.totalAmount}...`}
-                        {verifyStep === 3 &&
-                          'UTR Verified Automatically! Unlocking IRCTC ID & Password...'}
-                      </span>
+                      <span>Submitting UTR for payment review...</span>
                     </div>
                   </div>
                 )}
@@ -583,13 +550,13 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                   {submitting ? (
                     <>
                       <Loader2 className="w-4 h-4 animate-spin" />
-                      <span>Auto-Verifying UTR...</span>
+                      <span>Submitting UTR...</span>
                     </>
                   ) : (
                     <>
                       <ShieldCheck className="w-4 h-4" />
                       <span>
-                        Verify UPI &amp; Get {draft.isRental24h ? '24H Rental ID' : 'IRCTC ID'} Now
+                        Submit UTR for Payment Review
                       </span>
                     </>
                   )}

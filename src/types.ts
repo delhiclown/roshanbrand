@@ -5,7 +5,9 @@ export type PackType =
   | 'pack_10'
   | 'bulk'
   | 'custom'
-  | 'rental_24h';
+  | 'rental_24h'
+  | 'guarantee_7days'
+  | 'guarantee_1month';
 
 export type OrderStatus = 'pending_verification' | 'verified_delivered' | 'rejected';
 
@@ -23,8 +25,12 @@ export interface StoreConfig {
   priceBulkPerId: number;
   priceCustomPerId: number;
   priceRental24h: number;
+  price7DayGuaranteePerId: number;
+  price1MonthGuaranteePerId: number;
   stockAvailable: number;
   rentalStockAvailable: number;
+  stockDisplayAvailable: number;
+  rentalStockDisplayAvailable: number;
   instantAutoVerify: boolean;
   presetRentalCredentials?: string;
   presetPermanentCredentials?: string;
@@ -42,6 +48,7 @@ export interface OrderRecord {
   quantity: number;
   unitPrice: number;
   totalAmount: number;
+  paymentUpiId?: string;
   utrNumber: string;
   upiAppUsed?: string;
   customerReference: string;

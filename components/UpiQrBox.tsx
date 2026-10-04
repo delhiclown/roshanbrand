@@ -6,7 +6,6 @@ interface UpiQrBoxProps {
   upiId: string;
   payeeName: string;
   amount: number;
-  customQrUrl?: string;
   orderNote?: string;
 }
 
@@ -21,32 +20,24 @@ export function buildDynamicUpiUri({
   amount: number;
   orderNote?: string;
 }): string {
-  const cleanUpi = (upiId || 'roshanbrand.pay@okaxis').trim();
+  const cleanUpiId = encodeURIComponent(upiId.trim());
   const cleanPayee = encodeURIComponent((payeeName || 'Roshanbrand Official').trim());
   const exactAmount = Math.max(1, Number(amount) || 49).toFixed(2);
   const cleanNote = encodeURIComponent(
     `${orderNote.trim()} - Rs ${exactAmount}`
   );
   // Standard NPCI UPI Deep Link with locked 'am' (Amount) and 'cu=INR'
-  return `upi://pay?pa=${cleanUpi}&pn=${cleanPayee}&am=${exactAmount}&cu=INR&tn=${cleanNote}`;
+  return `upi://pay?pa=${cleanUpiId}&pn=${cleanPayee}&am=${exactAmount}&cu=INR&tn=${cleanNote}`;
 }
 
 export const UpiQrBox: React.FC<UpiQrBoxProps> = ({
   upiId,
   payeeName,
   amount,
-  customQrUrl,
   orderNote = 'Roshanbrand IRCTC ID Order',
 }) => {
   const [copied, setCopied] = useState(false);
   const [qrDataUrl, setQrDataUrl] = useState<string>('');
-  const [useStaticCustomQr, setUseStaticCustomQr] = useState(false);
-
-  useEffect(() => {
-    if (!customQrUrl || customQrUrl.trim().length === 0) {
-      setUseStaticCustomQr(false);
-    }
-  }, [customQrUrl]);
 
   const exactAmountFormatted = useMemo(
     () => Math.max(1, Number(amount) || 49).toFixed(2),
@@ -93,10 +84,6 @@ export const UpiQrBox: React.FC<UpiQrBoxProps> = ({
     setTimeout(() => setCopied(false), 1800);
   };
 
-  const showCustomStatic = Boolean(
-    useStaticCustomQr && customQrUrl && customQrUrl.trim().length > 0
-  );
-
   return (
     <div className="neon-card-3d p-4 sm:p-5 flex flex-col items-center">
       <div className="w-full flex items-center justify-between pb-3 mb-3 border-b border-sky-400/20 text-xs text-slate-300">
@@ -118,15 +105,7 @@ export const UpiQrBox: React.FC<UpiQrBoxProps> = ({
 
       {/* Scannable QR Container */}
       <div className="relative w-52 h-52 sm:w-56 sm:h-56 bg-white border-2 border-sky-400 rounded-2xl p-3 flex items-center justify-center shadow-[0_0_30px_rgba(56,189,248,0.35),0_6px_0_#0f296b]">
-        {showCustomStatic ? (
-          <img
-            src={customQrUrl}
-            alt={`UPI payment QR for ${payeeName}`}
-            referrerPolicy="no-referrer"
-            onError={() => setUseStaticCustomQr(false)}
-            className="w-full h-full object-contain rounded-lg"
-          />
-        ) : qrDataUrl ? (
+        {qrDataUrl ? (
           <img
             src={qrDataUrl}
             alt={`Dynamic UPI QR Code for ₹${exactAmountFormatted}`}
@@ -143,18 +122,6 @@ export const UpiQrBox: React.FC<UpiQrBoxProps> = ({
           Amount Locked: ₹{exactAmountFormatted}
         </div>
       </div>
-
-      {customQrUrl && customQrUrl.trim().length > 0 && (
-        <button
-          type="button"
-          onClick={() => setUseStaticCustomQr((prev) => !prev)}
-          className="mt-3 text-[11px] font-bold text-cyan-300 hover:text-white underline cursor-pointer"
-        >
-          {useStaticCustomQr
-            ? `Switch to Dynamic ₹${exactAmountFormatted} Auto-Amount QR`
-            : 'Switch to Uploaded Static QR'}
-        </button>
-      )}
 
       <p className="mt-3.5 text-xs font-semibold text-sky-200/90 text-center">
         Scan karte hi UPI App me{' '}

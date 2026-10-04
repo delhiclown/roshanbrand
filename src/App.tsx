@@ -16,6 +16,7 @@ import {
   Plus,
   QrCode,
   Search,
+  Send,
   ShieldCheck,
   SlidersVertical,
   Sparkles,
@@ -23,9 +24,11 @@ import {
   XCircle,
   Zap,
 } from 'lucide-react';
-import { AdminPortal } from './components/AdminPortal';
-import { CheckoutModal } from './components/CheckoutModal';
-import { buildDynamicUpiUri } from './components/UpiQrBox';
+import { AdminPortal } from '../components/AdminPortal';
+import { CheckoutModal } from '../components/CheckoutModal';
+import { Dashboard } from '../components/Dashboard';
+import { DeliveredOrderDetails } from '../components/DeliveredOrderDetails';
+import { buildDynamicUpiUri } from '../components/UpiQrBox';
 import { DEFAULT_STORE_CONFIG, LIMITS } from './constants';
 import { CheckoutDraft, OrderRecord, PackType, StoreConfig } from './types';
 
@@ -37,15 +40,19 @@ interface ProductOption {
   unitPriceKey: keyof StoreConfig;
   defaultQty: number;
   packType: PackType;
-  isBulkTier?: boolean;
   isRental24h?: boolean;
+  isSevenDayGuarantee?: boolean;
+  isOneMonthGuarantee?: boolean;
 }
 
 export default function App() {
-  const [viewMode, setViewMode] = useState<'store' | 'admin'>('store');
+  const [viewMode, setViewMode] = useState<'store' | 'admin' | 'dashboard'>(() =>
+    window.location.pathname.startsWith('/dashboard') ? 'dashboard' : 'store'
+  );
   const [storeConfig, setStoreConfig] = useState<StoreConfig>(DEFAULT_STORE_CONFIG);
+  const [storeConfigLoaded, setStoreConfigLoaded] = useState(false);
 
-  // Default open card so user immediately sees all 3 options and can buy in 1 tap
+  // Open a product by default so checkout options are immediately visible.
   const [openCardId, setOpenCardId] = useState<string>('irctc-rental-24h');
   const [selectedTier, setSelectedTier] = useState<string>('1');
   const [quantity, setQuantity] = useState<number>(1);
@@ -68,6 +75,24 @@ export default function App() {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [supportOpen, setSupportOpen] = useState<boolean>(false);
   const [inlineQrDataUrl, setInlineQrDataUrl] = useState<string>('');
+  const displayedPermanentStock = Math.min(
+    storeConfig.stockAvailable,
+    storeConfig.stockDisplayAvailable
+  );
+  const displayedRentalStock = Math.min(
+    storeConfig.rentalStockAvailable,
+    storeConfig.rentalStockDisplayAvailable
+  );
+  const totalDisplayedStock = displayedPermanentStock + displayedRentalStock;
+
+  useEffect(() => {
+    if (trackedOrder?.status !== 'verified_delivered') return;
+    const previousTitle = document.title;
+    document.title = 'SkyVPS - Order Details';
+    return () => {
+      document.title = previousTitle;
+    };
+  }, [trackedOrder?.status]);
 
   // Fetch live store config
   useEffect(() => {
@@ -78,6 +103,7 @@ export default function App() {
         const data = await res.json();
         if (data.storeConfig) {
           setStoreConfig({ ...DEFAULT_STORE_CONFIG, ...data.storeConfig });
+          setStoreConfigLoaded(true);
         }
       } catch {
         // fallback to default config
@@ -131,25 +157,35 @@ export default function App() {
       title: 'IRCTC ID — Aadhaar Verified',
       subtitle: '100% Working · Fast Tatkal & Normal Booking Ready',
       tag: 'Best Seller',
-      unitPriceKey: 'price1Id',
+      unitPriceKey: 'priceCustomPerId',
       defaultQty: 1,
       packType: 'pack_1',
     },
     {
-      id: 'irctc-bulk-custom',
-      title: 'IRCTC Bulk & Custom Order Pack',
-      subtitle: 'Special wholesale rates for agents, cyber cafes & bulk buyers',
-      tag: 'Wholesale Rate',
-      unitPriceKey: 'priceBulkPerId',
-      defaultQty: 20,
-      packType: 'bulk',
-      isBulkTier: true,
+      id: 'irctc-7day-guarantee',
+      title: 'IRCTC ID — 7 Days Guarantee',
+      subtitle: 'IRCTC ID with a 7 Days Guarantee',
+      tag: '7 Days Guarantee',
+      unitPriceKey: 'price7DayGuaranteePerId',
+      defaultQty: 1,
+      packType: 'guarantee_7days',
+      isSevenDayGuarantee: true,
+    },
+    {
+      id: 'irctc-1month-guarantee',
+      title: 'IRCTC ID — 1 Month Guarantee',
+      subtitle: 'IRCTC ID with a 1 Month Guarantee',
+      tag: '1 Month Guarantee',
+      unitPriceKey: 'price1MonthGuaranteePerId',
+      defaultQty: 1,
+      packType: 'guarantee_1month',
+      isOneMonthGuarantee: true,
     },
     {
       id: 'irctc-rental-24h',
       title: 'Buy Rental IRCTC ID for 24 Hours',
       subtitle:
-        '24-Hour Active Rental Access · Instant UPI Verification · Tatkal & Emergency Booking Ready',
+        '24-Hour Active Rental Access · Payment Confirmation Required · Tatkal & Emergency Booking Ready',
       tag: '24H Rental · ₹49',
       unitPriceKey: 'priceRental24h',
       defaultQty: 1,
@@ -161,20 +197,19 @@ export default function App() {
   const calculateTotal = (
     qty: number,
     tier: string,
-    isBulk?: boolean,
-    isRental24h?: boolean
+    isRental24h?: boolean,
+    isSevenDayGuarantee?: boolean,
+    isOneMonthGuarantee?: boolean
   ): number => {
     if (isRental24h) {
       return qty * (storeConfig.priceRental24h || 49);
     }
-    if (isBulk) {
-      return qty * storeConfig.priceBulkPerId;
+    if (isSevenDayGuarantee) {
+      return qty * storeConfig.price7DayGuaranteePerId;
     }
-    if (tier === '1' && qty === 1) return storeConfig.price1Id;
-    if (tier === '2' && qty === 2) return storeConfig.price2Id;
-    if (tier === '5' && qty === 5) return storeConfig.price5Id;
-    if (tier === '10' && qty === 10) return storeConfig.price10Id;
-    if (tier === 'bulk' || qty >= 15) return qty * storeConfig.priceBulkPerId;
+    if (isOneMonthGuarantee) {
+      return qty * storeConfig.price1MonthGuaranteePerId;
+    }
     return qty * storeConfig.priceCustomPerId;
   };
 
@@ -187,13 +222,18 @@ export default function App() {
   const totalPayable = calculateTotal(
     safeQty,
     selectedTier,
-    activeProduct.isBulkTier,
-    activeProduct.isRental24h
+    activeProduct.isRental24h,
+    activeProduct.isSevenDayGuarantee,
+    activeProduct.isOneMonthGuarantee
   );
   const effectiveUnitPrice = Math.max(1, Math.round(totalPayable / safeQty));
 
   const resolvedPackType: PackType = activeProduct.isRental24h
     ? 'rental_24h'
+    : activeProduct.isSevenDayGuarantee
+    ? 'guarantee_7days'
+    : activeProduct.isOneMonthGuarantee
+    ? 'guarantee_1month'
     : selectedTier === '1'
     ? 'pack_1'
     : selectedTier === '2'
@@ -208,6 +248,10 @@ export default function App() {
 
   const resolvedPackLabel = activeProduct.isRental24h
     ? `24-Hour Rental IRCTC ID (${safeQty} ID${safeQty > 1 ? 's' : ''} · 24H Validity)`
+    : activeProduct.isSevenDayGuarantee
+    ? `IRCTC ID — 7 Days Guarantee (${safeQty} ID${safeQty > 1 ? 's' : ''})`
+    : activeProduct.isOneMonthGuarantee
+    ? `IRCTC ID — 1 Month Guarantee (${safeQty} ID${safeQty > 1 ? 's' : ''})`
     : selectedTier === '1'
     ? '1 IRCTC ID Pack'
     : selectedTier === '2'
@@ -227,7 +271,13 @@ export default function App() {
         payeeName: storeConfig.payeeName,
         amount: totalPayable,
         orderNote: `${storeConfig.siteTitle} ${
-          activeProduct.isRental24h ? '24H Rental' : ''
+          activeProduct.isRental24h
+            ? '24H Rental'
+            : activeProduct.isSevenDayGuarantee
+            ? '7 Days Guarantee'
+            : activeProduct.isOneMonthGuarantee
+            ? '1 Month Guarantee'
+            : ''
         } ${safeQty} ID`,
       }),
     [
@@ -236,6 +286,8 @@ export default function App() {
       storeConfig.siteTitle,
       totalPayable,
       activeProduct.isRental24h,
+      activeProduct.isSevenDayGuarantee,
+      activeProduct.isOneMonthGuarantee,
       safeQty,
     ]
   );
@@ -366,6 +418,39 @@ export default function App() {
     );
   }
 
+  if (viewMode === 'dashboard') {
+    return <Dashboard />;
+  }
+
+  if (trackedOrder?.status === 'verified_delivered') {
+    return (
+      <div className="delivered-order-shell">
+        <header className="delivered-order-topbar">
+          <a className="delivered-order-brand" href="/dashboard">
+            <span>SV</span>
+            <strong>SkyVPS</strong>
+          </a>
+          <span className="delivered-order-topbar-status">
+            <CheckCircle2 /> Order delivered
+          </span>
+        </header>
+        <main className="delivered-order-main">
+          <DeliveredOrderDetails
+            order={trackedOrder}
+            copiedKey={copiedKey}
+            onCopy={copyToClipboard}
+            onDownload={downloadOrderCsv}
+            onBack={() => {
+              setTrackedOrder(null);
+              setTrackedOrderId('');
+              setSearchInput('');
+            }}
+          />
+        </main>
+      </div>
+    );
+  }
+
   return (
     <div className="app-shell relative min-h-dvh flex flex-col text-slate-100">
       <div className="app-scene" aria-hidden="true">
@@ -395,15 +480,21 @@ export default function App() {
             >
               <span
                 className={`w-2 h-2 rounded-full ${
-                  storeConfig.stockAvailable > 0
+                  totalDisplayedStock > 0
                     ? 'bg-emerald-400 shadow-[0_0_8px_#34d399]'
                     : 'bg-amber-400'
                 }`}
               />
-              <span className="tabular-nums font-bold text-white">
-                {storeConfig.stockAvailable + (storeConfig.rentalStockAvailable || 0)}
+              <span className="font-bold text-white">
+                {!storeConfigLoaded
+                  ? '…'
+                  : totalDisplayedStock > 0
+                    ? <span className="tabular-nums">{totalDisplayedStock}</span>
+                    : 'Out of stock'}
               </span>
-              <span className="text-slate-400 font-normal hidden sm:inline">in stock</span>
+              {storeConfigLoaded && totalDisplayedStock > 0 && (
+                <span className="text-slate-400 font-normal hidden sm:inline">in stock</span>
+              )}
             </span>
 
             {/* Track Order Popover */}
@@ -427,9 +518,7 @@ export default function App() {
                 {trackedOrder && (
                   <span
                     className={`w-2 h-2 rounded-full ${
-                      trackedOrder.status === 'verified_delivered'
-                        ? 'bg-emerald-400 shadow-[0_0_8px_#34d399]'
-                        : trackedOrder.status === 'pending_verification'
+                      trackedOrder.status === 'pending_verification'
                         ? 'bg-amber-400 animate-pulse'
                         : 'bg-rose-400'
                     }`}
@@ -509,120 +598,21 @@ export default function App() {
       {/* Main Storefront Content */}
       <main className="relative z-10 flex-1 flex flex-col min-h-0">
         <div className="max-w-4xl mx-auto w-full px-3 sm:px-5 pt-4 sm:pt-6 pb-32 flex-1 flex flex-col">
-          {/* Announcement Banner */}
-          {storeConfig.announcementText && (
-            <div className="mb-4 px-3.5 py-2.5 rounded-xl bg-blue-950/70 border border-cyan-400/35 flex items-center justify-between gap-2 text-xs text-cyan-200 font-medium shadow-[inset_0_1px_0_rgba(255,255,255,0.12),0_4px_14px_rgba(6,182,212,0.2)]">
-              <div className="flex items-center gap-2 min-w-0">
-                <Sparkles className="w-4 h-4 text-cyan-400 shrink-0" />
-                <span className="truncate">{storeConfig.announcementText}</span>
+          {storeConfig.announcementText.trim() && (
+            <div className="mb-5 flex justify-center">
+              <div className="flex w-fit max-w-full items-center justify-center gap-2.5 rounded-2xl border border-cyan-400/35 bg-gradient-to-r from-cyan-950/70 via-blue-950/55 to-slate-950/80 px-4 py-3 text-center shadow-[0_8px_28px_rgba(8,145,178,0.12)]">
+                <Sparkles className="h-4 w-4 shrink-0 text-cyan-300" />
+                <p className="min-w-0 whitespace-normal break-words text-center text-xs font-extrabold uppercase tracking-wide text-cyan-100 sm:text-sm">
+                  {storeConfig.announcementText}
+                </p>
               </div>
-              <span className="hidden sm:inline-flex items-center gap-1 text-[11px] font-bold text-emerald-300 shrink-0">
-                <Zap className="w-3.5 h-3.5 text-emerald-400" />
-                Instant UPI Verify
-              </span>
             </div>
           )}
 
           {/* Active / Tracked Order Status Box */}
           {trackedOrder && (
             <div className="mb-6">
-              {trackedOrder.status === 'verified_delivered' ? (
-                <div className="neon-card-3d border-emerald-400/60 overflow-hidden">
-                  <div className="p-4 sm:p-5 bg-gradient-to-b from-emerald-950/50 to-slate-950/40">
-                    <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
-                      <div className="flex items-center gap-2.5">
-                        <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-emerald-500 to-teal-600 text-white flex items-center justify-center shadow-[inset_0_1.5px_0_rgba(255,255,255,0.4),0_4px_0_#064e3b] shrink-0">
-                          <CheckCircle2 className="w-5 h-5" />
-                        </div>
-                        <div>
-                          <h2 className="text-base font-extrabold text-white leading-tight">
-                            {trackedOrder.isRental24h
-                              ? '24-Hour Rental IRCTC ID Active'
-                              : 'Order Complete — UPI Verified'}
-                          </h2>
-                          <p className="text-xs text-emerald-300 font-medium">
-                            {trackedOrder.isRental24h && trackedOrder.rentalExpiresAt
-                              ? `Active for 24 Hours · Valid until ${new Date(
-                                  trackedOrder.rentalExpiresAt
-                                ).toLocaleString()}`
-                              : 'Your IRCTC IDs are ready — copy or download below'}
-                          </p>
-                        </div>
-                      </div>
-                      <span className="text-[11px] font-mono text-emerald-300 bg-emerald-950/90 px-2.5 py-1 rounded-lg border border-emerald-400/40 font-bold">
-                        Order #{trackedOrder.orderId} · UTR {trackedOrder.utrNumber}
-                      </span>
-                    </div>
-
-                    <div className="space-y-2.5 mt-3">
-                      {splitLines(trackedOrder.deliveredCredentials || '').map((line, idx) => (
-                        <div
-                          key={idx}
-                          className="rounded-xl border border-cyan-500/30 bg-slate-950/90 p-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] flex items-center justify-between gap-2"
-                        >
-                          <div className="min-w-0">
-                            <span className="text-[10px] font-extrabold uppercase tracking-wider text-cyan-400 block mb-0.5">
-                              {trackedOrder.isRental24h
-                                ? `24H Rental Account #${idx + 1}`
-                                : `Account #${idx + 1}`}
-                            </span>
-                            <p className="font-mono text-xs sm:text-sm font-bold text-white break-all">
-                              {line}
-                            </p>
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() => copyToClipboard(line, `line-${idx}`)}
-                            className="shrink-0 inline-flex items-center gap-1 text-xs font-bold text-cyan-200 hover:text-white px-3 py-1.5 rounded-lg bg-blue-950/80 hover:bg-blue-900 border border-cyan-400/40 shadow-[0_3px_0_#091538] active:translate-y-0.5 transition-all cursor-pointer"
-                          >
-                            {copiedKey === `line-${idx}` ? (
-                              <>
-                                <Check className="w-3.5 h-3.5 text-emerald-400" />
-                                <span>Copied</span>
-                              </>
-                            ) : (
-                              <>
-                                <Copy className="w-3.5 h-3.5" />
-                                <span>Copy</span>
-                              </>
-                            )}
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-
-                    <div className="flex flex-wrap gap-2.5 mt-4">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          copyToClipboard(trackedOrder.deliveredCredentials, 'all-creds')
-                        }
-                        className="flex-1 min-w-[130px] py-2.5 px-3 rounded-xl font-bold text-xs bg-slate-900 text-cyan-200 hover:text-white border border-cyan-400/40 shadow-[inset_0_1px_0_rgba(255,255,255,0.15),0_4px_0_#040817] flex items-center justify-center gap-1.5 transition-all cursor-pointer"
-                      >
-                        {copiedKey === 'all-creds' ? (
-                          <>
-                            <Check className="w-3.5 h-3.5 text-emerald-400" />
-                            <span>Copied All!</span>
-                          </>
-                        ) : (
-                          <>
-                            <Copy className="w-3.5 h-3.5" />
-                            <span>Copy all</span>
-                          </>
-                        )}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => downloadOrderCsv(trackedOrder)}
-                        className="flex-1 min-w-[130px] py-2.5 px-3 rounded-xl font-bold text-xs text-white store-pay-pill flex items-center justify-center gap-1.5 cursor-pointer"
-                      >
-                        <Download className="w-3.5 h-3.5" />
-                        <span>CSV Download</span>
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              ) : trackedOrder.status === 'pending_verification' ? (
+              {trackedOrder.status === 'pending_verification' ? (
                 <div className="neon-card-3d border-amber-400/50 p-4 sm:p-5">
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div className="flex items-center gap-3">
@@ -632,7 +622,7 @@ export default function App() {
                       <div>
                         <div className="flex items-center gap-2">
                           <h3 className="text-sm font-extrabold text-white">
-                            Verifying your UTR Payment...
+                            UTR submitted — waiting for payment confirmation
                           </h3>
                           <span className="text-[11px] font-mono font-bold text-amber-300">
                             {trackedOrder.orderId}
@@ -644,8 +634,9 @@ export default function App() {
                             {trackedOrder.utrNumber}
                           </span>{' '}
                           (₹{trackedOrder.totalAmount} for {trackedOrder.quantity} ID
-                          {trackedOrder.quantity > 1 ? 's' : ''}) submitted. Your ID &amp;
-                          Password will appear here automatically!
+                          {trackedOrder.quantity > 1 ? 's' : ''}) submitted. Credentials will be
+                          released only after this payment is confirmed in{' '}
+                          {trackedOrder.paymentUpiId || storeConfig.upiId}.
                         </p>
                       </div>
                     </div>
@@ -689,19 +680,10 @@ export default function App() {
 
           {/* Hero Section */}
           <header className="text-center max-w-lg mx-auto mb-5 sm:mb-7">
-            <p className="text-[11px] font-extrabold uppercase tracking-widest text-cyan-300 mb-2">
-              3D Instant Automated Vault · Instant UPI Verification
-            </p>
             <h1 className="font-display text-xl sm:text-3xl font-black text-white tracking-tight leading-snug drop-shadow-[0_4px_16px_rgba(0,0,0,0.8)]">
               Buy <span className="gradient-text">IRCTC ID</span> or{' '}
-              <span className="text-emerald-400">24H Rental @ ₹49</span>
+              <span className="text-emerald-400">24H Rental</span>
             </h1>
-            <p className="text-xs sm:text-sm text-slate-300 mt-1.5 leading-relaxed">
-              No sign-up. Pick Permanent IDs, Bulk Packs, or{' '}
-              <strong className="text-emerald-300">24-Hour Rental IRCTC ID at ₹49</strong>, pay
-              via UPI QR, verify UTR instantly, and get your ID &amp; password right on this
-              screen.
-            </p>
             <div className="store-intro-step">
               <span className="store-intro-step-pill">Step 1</span>
               <span className="text-xs font-bold text-slate-100">
@@ -729,8 +711,8 @@ export default function App() {
                 const isOpen = openCardId === option.id;
                 const unitPrice = Number(storeConfig[option.unitPriceKey]) || 49;
                 const stockCount = option.isRental24h
-                  ? storeConfig.rentalStockAvailable
-                  : storeConfig.stockAvailable;
+                  ? displayedRentalStock
+                  : displayedPermanentStock;
                 const isOutOfStock = stockCount <= 0;
 
                 return (
@@ -747,13 +729,8 @@ export default function App() {
                           setOpenCardId('');
                         } else {
                           setOpenCardId(option.id);
-                          if (option.isBulkTier) {
-                            setSelectedTier('bulk');
-                            setQuantity(20);
-                          } else {
-                            setSelectedTier('1');
-                            setQuantity(1);
-                          }
+                          setSelectedTier('1');
+                          setQuantity(1);
                         }
                       }}
                       className="w-full text-left p-4 sm:p-5 flex items-center gap-3.5 sm:gap-4 transition-colors focus:outline-none cursor-pointer"
@@ -765,7 +742,13 @@ export default function App() {
                             : 'store-product-icon'
                         }`}
                       >
-                        {option.isRental24h ? '24H' : 'ID'}
+                        {option.isRental24h
+                          ? '24H'
+                          : option.isSevenDayGuarantee
+                          ? '7D'
+                          : option.isOneMonthGuarantee
+                          ? '1M'
+                          : 'ID'}
                       </div>
 
                       <div className="flex-1 min-w-0">
@@ -775,7 +758,11 @@ export default function App() {
                           </h3>
                           <span
                             className={`text-[11px] font-bold ${
-                              option.isRental24h ? 'text-emerald-300' : 'text-cyan-300'
+                              option.isRental24h ||
+                              option.isSevenDayGuarantee ||
+                              option.isOneMonthGuarantee
+                                ? 'text-emerald-300'
+                                : 'text-cyan-300'
                             }`}
                           >
                             · {option.tag}
@@ -790,10 +777,20 @@ export default function App() {
                           </span>
                           <span
                             className={`text-[11px] font-semibold ${
-                              option.isRental24h ? 'text-emerald-300/90' : 'text-cyan-300/80'
+                              option.isRental24h ||
+                              option.isSevenDayGuarantee ||
+                              option.isOneMonthGuarantee
+                                ? 'text-emerald-300/90'
+                                : 'text-cyan-300/80'
                             }`}
                           >
-                            {option.isRental24h ? 'for 24 Hours' : 'per ID'}
+                            {option.isRental24h
+                              ? 'for 24 Hours'
+                              : option.isSevenDayGuarantee
+                              ? 'per ID · 7 days guarantee'
+                              : option.isOneMonthGuarantee
+                              ? 'per ID · 1 month guarantee'
+                              : 'per ID'}
                           </span>
                           <span className="text-slate-600">·</span>
                           <span
@@ -801,14 +798,18 @@ export default function App() {
                               isOutOfStock ? 'text-rose-400' : 'text-emerald-400'
                             }`}
                           >
-                            {isOutOfStock ? 'Out of stock' : `${stockCount} ready`}
+                            {!storeConfigLoaded
+                              ? 'Loading stock…'
+                              : isOutOfStock
+                                ? 'Out of stock'
+                                : `${stockCount} ready`}
                           </span>
                           {option.isRental24h && (
                             <>
                               <span className="text-slate-600">·</span>
                               <span className="text-xs font-semibold text-sky-300 flex items-center gap-1">
                                 <Zap className="w-3 h-3 text-emerald-400" />
-                                Instant UPI Verify
+                                Manual UPI Check
                               </span>
                             </>
                           )}
@@ -886,6 +887,56 @@ export default function App() {
                                 </button>
                               </div>
                             </div>
+                          ) : option.isSevenDayGuarantee || option.isOneMonthGuarantee ? (
+                            <div>
+                              <div className="flex items-center justify-between mb-2">
+                                <p className="text-[11px] font-extrabold uppercase tracking-wider text-emerald-300">
+                                  Select {option.isOneMonthGuarantee ? '1 Month' : '7 Days'} Guarantee ID Quantity
+                                </p>
+                                <span className="text-[11px] text-slate-300 font-medium">
+                                  ₹{option.isOneMonthGuarantee
+                                    ? storeConfig.price1MonthGuaranteePerId
+                                    : storeConfig.price7DayGuaranteePerId}/ID · {option.isOneMonthGuarantee ? '1 month' : '7 days'} guarantee
+                                </span>
+                              </div>
+                              <div className="grid grid-cols-3 sm:grid-cols-6 gap-2.5">
+                                {[1, 2, 5, 10].map((num) => (
+                                  <button
+                                    key={num}
+                                    type="button"
+                                    onClick={() => handleSelectTier(String(num), num)}
+                                    className={`qty-chip-card cursor-pointer ${
+                                      selectedTier === String(num) && safeQty === num
+                                        ? 'qty-chip-card--selected'
+                                        : ''
+                                    }`}
+                                  >
+                                    <span className="text-xs font-extrabold tabular-nums">
+                                      {num} ID{num > 1 ? 's' : ''}
+                                    </span>
+                                    <span className="text-[10px] font-bold tabular-nums text-emerald-400">
+                                      ₹{num * (option.isOneMonthGuarantee
+                                        ? storeConfig.price1MonthGuaranteePerId
+                                        : storeConfig.price7DayGuaranteePerId)}
+                                    </span>
+                                  </button>
+                                ))}
+                                <button
+                                  type="button"
+                                  onClick={() => handleSelectTier('custom', 3)}
+                                  className={`qty-chip-card cursor-pointer ${
+                                    selectedTier === 'custom' ? 'qty-chip-card--selected' : ''
+                                  }`}
+                                >
+                                  <span className="text-xs font-extrabold">Custom Qty</span>
+                                  <span className="text-[10px] font-bold text-emerald-400">
+                                    ₹{option.isOneMonthGuarantee
+                                      ? storeConfig.price1MonthGuaranteePerId
+                                      : storeConfig.price7DayGuaranteePerId}/ID
+                                  </span>
+                                </button>
+                              </div>
+                            </div>
                           ) : (
                             /* Standard / Bulk Quantity Picker */
                             <div>
@@ -917,7 +968,7 @@ export default function App() {
                                         : 'text-cyan-400'
                                     }`}
                                   >
-                                    ₹{storeConfig.price1Id}
+                                    ₹{storeConfig.priceCustomPerId}
                                   </span>
                                 </button>
 
@@ -940,7 +991,7 @@ export default function App() {
                                         : 'text-cyan-400'
                                     }`}
                                   >
-                                    ₹{storeConfig.price2Id}
+                                    ₹{2 * storeConfig.priceCustomPerId}
                                   </span>
                                 </button>
 
@@ -963,7 +1014,7 @@ export default function App() {
                                         : 'text-cyan-400'
                                     }`}
                                   >
-                                    ₹{storeConfig.price5Id}
+                                    ₹{5 * storeConfig.priceCustomPerId}
                                   </span>
                                 </button>
 
@@ -986,7 +1037,7 @@ export default function App() {
                                         : 'text-cyan-400'
                                     }`}
                                   >
-                                    ₹{storeConfig.price10Id}
+                                    ₹{10 * storeConfig.priceCustomPerId}
                                   </span>
                                 </button>
 
@@ -1005,7 +1056,7 @@ export default function App() {
                                         : 'text-cyan-400'
                                     }`}
                                   >
-                                    ₹{storeConfig.priceBulkPerId}/ID
+                                    ₹{storeConfig.priceCustomPerId}/ID
                                   </span>
                                 </button>
 
@@ -1106,7 +1157,7 @@ export default function App() {
                                 <button
                                   type="button"
                                   onClick={handleOpenCheckout}
-                                  title={`Click to open full ₹${totalPayable} QR & Auto-Verify`}
+                                  title={`Click to open full ₹${totalPayable} payment QR`}
                                   className="w-16 h-16 rounded-xl bg-white p-1 border-2 border-sky-400 shrink-0 shadow-[0_0_18px_rgba(56,189,248,0.35)] hover:scale-105 transition-transform cursor-pointer"
                                 >
                                   <img
@@ -1148,7 +1199,7 @@ export default function App() {
                             >
                               <QrCode className="w-4 h-4" />
                               <span>
-                                Pay ₹{totalPayable} via UPI QR (Instant Verify)
+                                Pay ₹{totalPayable} via UPI QR
                               </span>
                             </button>
                           </div>
@@ -1226,9 +1277,8 @@ export default function App() {
                   How does the ₹49 24-Hour Rental IRCTC ID work?
                 </p>
                 <p className="text-slate-300 leading-relaxed">
-                  Pay ₹{storeConfig.priceRental24h} via UPI QR and enter your 12-digit UTR. You
-                  immediately get a verified IRCTC login ID &amp; password active for 24 hours for
-                  Tatkal or normal ticket booking.
+                  Pay ₹{storeConfig.priceRental24h} via UPI QR and submit your 12-digit UTR.
+                  Credentials are delivered after payment is confirmed by an admin.
                 </p>
               </div>
 
@@ -1263,6 +1313,18 @@ export default function App() {
                   <span className="min-w-0">
                     <span className="block font-bold text-white">WhatsApp Support</span>
                     <span className="block truncate text-[11px] text-emerald-200">Chat with us</span>
+                  </span>
+                </a>
+                <a
+                  href="https://t.me/Roshanadminn"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="flex items-center gap-3 rounded-xl border border-sky-400/40 bg-sky-950/40 p-3 text-left hover:bg-sky-900/50"
+                >
+                  <Send className="h-5 w-5 shrink-0 text-sky-300" />
+                  <span className="min-w-0">
+                    <span className="block font-bold text-white">Telegram Support</span>
+                    <span className="block truncate text-[11px] text-sky-200">@Roshanadminn · Message us</span>
                   </span>
                 </a>
                 <a
@@ -1314,7 +1376,7 @@ export default function App() {
                         Pay UPI QR &amp; UTR
                       </p>
                       <p className="text-[9px] text-slate-400 truncate hidden sm:block">
-                        Instant UPI verification
+                        Manual payment confirmation
                       </p>
                     </div>
                   </li>
@@ -1324,7 +1386,7 @@ export default function App() {
                     </span>
                     <div className="min-w-0 leading-tight">
                       <p className="text-[10px] font-bold text-white truncate">
-                        Get ID on screen
+                        Get ID after payment review
                       </p>
                       <p className="text-[9px] text-slate-400 truncate hidden sm:block">
                         Copy or CSV download
@@ -1356,7 +1418,7 @@ export default function App() {
                       <span>24/7</span>
                     </p>
                     <p className="text-[9px] text-cyan-300/80 font-medium mt-0.5">
-                      Instant UPI
+                      Rodex UPI
                     </p>
                   </div>
                 </div>
@@ -1366,7 +1428,7 @@ export default function App() {
         </div>
       </aside>
 
-      {/* Checkout & Instant UPI Verification Modal */}
+      {/* UPI Checkout & Payment Review Modal */}
       {checkoutDraft && (
         <CheckoutModal
           draft={checkoutDraft}

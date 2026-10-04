@@ -1,0 +1,1681 @@
+.skyvps-dashboard {
+  --sky-bg: #09140f;
+  --sky-sidebar: #0b2118;
+  --sky-surface: #0e1915;
+  --sky-surface-raised: #12251c;
+  --sky-border: rgba(158, 190, 171, 0.13);
+  --sky-border-strong: rgba(159, 200, 177, 0.2);
+  --sky-text: #f0f4f1;
+  --sky-muted: #8c9891;
+  --sky-green: #16bf8d;
+  --sky-green-light: #78dfb6;
+  display: flex;
+  min-height: 100vh;
+  color: var(--sky-text);
+  background: var(--sky-bg);
+  font-family: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 14px;
+}
+
+.skyvps-dashboard *,
+.skyvps-dashboard *::before,
+.skyvps-dashboard *::after {
+  box-sizing: border-box;
+}
+
+.skyvps-dashboard button {
+  color: inherit;
+  font: inherit;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.skyvps-sidebar {
+  position: fixed;
+  z-index: 20;
+  inset: 0 auto 0 0;
+  width: 312px;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid rgba(117, 164, 137, 0.12);
+  background:
+    radial-gradient(ellipse at 5% 0%, rgba(20, 95, 63, 0.18), transparent 50%),
+    linear-gradient(180deg, #0d261b 0%, #0b2118 100%);
+}
+
+.skyvps-brand-card {
+  min-height: 77px;
+  margin: 27px 12px 16px 5px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid rgba(152, 191, 166, 0.15);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.035);
+  text-align: left;
+  cursor: pointer;
+}
+
+.skyvps-brand-icon {
+  width: 47px;
+  height: 47px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  color: #baffdd;
+  border: 1px solid rgba(85, 205, 144, 0.24);
+  border-radius: 13px;
+  background: linear-gradient(145deg, #1b7048, #12432e);
+  box-shadow: inset 0 1px 3px rgba(255, 255, 255, 0.1), 0 0 17px rgba(22, 191, 141, 0.12);
+}
+
+.skyvps-brand-icon svg {
+  width: 27px;
+  height: 27px;
+  stroke-width: 1.8;
+}
+
+.skyvps-brand-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.skyvps-brand-copy strong {
+  color: #f6faf7;
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: -0.8px;
+  line-height: 1;
+}
+
+.skyvps-brand-copy > span {
+  padding: 5px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: #a7c2b3;
+  border: 1px solid rgba(165, 202, 179, 0.12);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.035);
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.55px;
+  white-space: nowrap;
+}
+
+.skyvps-brand-copy > span b {
+  color: #d2f0de;
+  font-size: 10px;
+}
+
+.skyvps-brand-copy i,
+.skyvps-status-dot,
+.skyvps-user-avatar > span,
+.skyvps-top-avatar > span {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--sky-green);
+  box-shadow: 0 0 9px rgba(22, 191, 141, 0.55);
+}
+
+.skyvps-side-scroll {
+  min-height: 0;
+  flex: 1;
+  padding: 18px 17px 16px 8px;
+  overflow: auto;
+  scrollbar-color: rgba(39, 201, 145, 0.55) transparent;
+  scrollbar-width: thin;
+}
+
+.skyvps-side-scroll::-webkit-scrollbar {
+  width: 5px;
+}
+
+.skyvps-side-scroll::-webkit-scrollbar-thumb {
+  border-radius: 5px;
+  background: rgba(39, 201, 145, 0.65);
+}
+
+.skyvps-nav-section + .skyvps-nav-section {
+  margin-top: 27px;
+}
+
+.skyvps-nav-heading {
+  width: 100%;
+  min-height: 24px;
+  margin: 0 0 8px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  color: #88dfb6;
+  border: 0;
+  background: transparent;
+  font-size: 13px;
+  font-weight: 800;
+  text-align: left;
+}
+
+.skyvps-nav-section:first-child .skyvps-nav-heading,
+.skyvps-nav-toggle {
+  padding-left: 14px;
+  border-left: 2px solid #38d29e;
+}
+
+.skyvps-nav-toggle {
+  justify-content: space-between;
+  cursor: pointer;
+}
+
+.skyvps-nav-toggle > svg {
+  width: 15px;
+  height: 15px;
+  margin-right: 2px;
+  transition: transform 150ms ease;
+}
+
+.skyvps-nav-toggle > svg.is-collapsed {
+  transform: rotate(-90deg);
+}
+
+.skyvps-nav-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.skyvps-nav-link {
+  position: relative;
+  width: 100%;
+  min-height: 46px;
+  padding: 0 16px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  color: #9ba9a1;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  font-size: 14px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  transition: color 140ms ease, border-color 140ms ease, background 140ms ease;
+}
+
+.skyvps-nav-link > svg {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  stroke-width: 2;
+}
+
+.skyvps-nav-link:hover {
+  color: #e6f4ec;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.skyvps-nav-link.is-active {
+  color: #ecfff5;
+  border-color: rgba(112, 225, 169, 0.55);
+  background: linear-gradient(100deg, rgba(40, 137, 91, 0.46), rgba(31, 92, 65, 0.65));
+  box-shadow: inset 2px 0 #80e5b5, 0 5px 14px rgba(10, 22, 16, 0.22);
+}
+
+.skyvps-shop-pill {
+  margin-left: auto;
+  padding: 4px 10px;
+  color: #b2f1d1;
+  border: 1px solid rgba(69, 198, 139, 0.2);
+  border-radius: 999px;
+  background: rgba(52, 182, 121, 0.22);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.skyvps-sidebar-footer {
+  flex: 0 0 auto;
+  padding: 16px 27px 30px 8px;
+  border-top: 1px solid rgba(158, 190, 171, 0.1);
+}
+
+.skyvps-account-card {
+  width: 100%;
+  min-height: 65px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid rgba(86, 166, 117, 0.22);
+  border-radius: 13px;
+  background: rgba(44, 107, 71, 0.24);
+  text-align: left;
+  cursor: pointer;
+}
+
+.skyvps-user-avatar {
+  position: relative;
+  width: 39px;
+  height: 39px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  color: #d8ffeb;
+  border: 1px solid rgba(76, 216, 145, 0.3);
+  border-radius: 12px;
+  background: linear-gradient(145deg, #176641, #12482f);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.skyvps-user-avatar > span {
+  position: absolute;
+  right: -2px;
+  bottom: -1px;
+  width: 8px;
+  height: 8px;
+  border: 1px solid #0d261b;
+}
+
+.skyvps-account-copy {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.skyvps-account-copy strong {
+  overflow: hidden;
+  color: #eff6f1;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skyvps-account-copy > span {
+  overflow: hidden;
+  color: #98aaa0;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skyvps-account-card > svg {
+  width: 17px;
+  height: 17px;
+  color: #8da196;
+}
+
+.skyvps-signout {
+  width: 100%;
+  min-height: 47px;
+  margin-top: 15px;
+  padding: 0 17px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: #aab7af !important;
+  border: 1px solid rgba(150, 190, 166, 0.13);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.018);
+  font-size: 13px !important;
+  font-weight: 650 !important;
+  text-align: left;
+  cursor: pointer;
+}
+
+.skyvps-signout:hover {
+  color: #f1f7f3 !important;
+  border-color: rgba(150, 190, 166, 0.27);
+}
+
+.skyvps-signout svg {
+  width: 17px;
+  height: 17px;
+}
+
+.skyvps-workspace {
+  min-width: 0;
+  width: calc(100% - 312px);
+  min-height: 100vh;
+  margin-left: 312px;
+}
+
+.skyvps-topbar {
+  position: sticky;
+  z-index: 15;
+  top: 0;
+  min-height: 72px;
+  padding: 0 6px 0 34px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border-bottom: 1px solid rgba(24, 176, 122, 0.32);
+  background: rgba(9, 20, 15, 0.94);
+  backdrop-filter: blur(14px);
+}
+
+.skyvps-page-title {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.skyvps-page-title-icon {
+  width: 35px;
+  height: 35px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  color: #9df0c5;
+  border: 1px solid rgba(73, 211, 145, 0.23);
+  border-radius: 11px;
+  background: rgba(35, 127, 82, 0.25);
+}
+
+.skyvps-page-title-icon svg {
+  width: 19px;
+  height: 19px;
+}
+
+.skyvps-page-title > span:last-child {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.skyvps-page-title strong {
+  overflow: hidden;
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: -0.6px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skyvps-page-title small {
+  overflow: hidden;
+  color: #98a49d;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skyvps-top-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.skyvps-icon-button {
+  position: relative;
+  width: 41px;
+  height: 41px;
+  flex: 0 0 auto;
+  display: inline-grid;
+  place-items: center;
+  color: #9da9a2 !important;
+  border: 1px solid rgba(155, 186, 166, 0.14);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.025);
+  cursor: pointer;
+  transition: color 140ms ease, background 140ms ease, border-color 140ms ease;
+}
+
+.skyvps-icon-button:hover {
+  color: #e6f5ec !important;
+  border-color: rgba(148, 206, 170, 0.3);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.skyvps-icon-button svg {
+  width: 18px;
+  height: 18px;
+  stroke-width: 1.9;
+}
+
+.skyvps-wallet {
+  height: 43px;
+  padding: 0 12px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #a7f1cf !important;
+  border: 1px solid rgba(137, 175, 149, 0.16);
+  border-radius: 13px;
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 13px !important;
+  cursor: pointer;
+}
+
+.skyvps-wallet svg {
+  width: 16px;
+  height: 16px;
+}
+
+.skyvps-wallet strong {
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.skyvps-status-dot {
+  width: 9px;
+  height: 9px;
+}
+
+.skyvps-add-button {
+  border-radius: 50%;
+}
+
+.skyvps-notification-count {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 3px;
+  display: grid;
+  place-items: center;
+  color: #08351f;
+  border: 1px solid #09140f;
+  border-radius: 999px;
+  background: #34d399;
+  font-size: 9px;
+  font-weight: 800;
+}
+
+.skyvps-top-avatar {
+  position: relative;
+  width: 39px;
+  height: 39px;
+  display: grid;
+  place-items: center;
+  color: #e9fff1 !important;
+  border: 1px solid rgba(84, 220, 146, 0.4);
+  border-radius: 50%;
+  background: linear-gradient(145deg, #14a971, #087a4e);
+  box-shadow: 0 0 15px rgba(22, 191, 141, 0.16);
+  font-weight: 800 !important;
+  cursor: pointer;
+}
+
+.skyvps-top-avatar > span {
+  position: absolute;
+  right: -1px;
+  bottom: 0;
+  width: 9px;
+  height: 9px;
+  border: 1px solid #09140f;
+}
+
+.skyvps-popover-wrap {
+  position: relative;
+}
+
+.skyvps-popover {
+  position: absolute;
+  z-index: 50;
+  top: calc(100% + 11px);
+  right: 0;
+  width: 260px;
+  padding: 16px;
+  border: 1px solid var(--sky-border-strong);
+  border-radius: 14px;
+  background: #12231b;
+  box-shadow: 0 18px 45px rgba(0, 0, 0, 0.35);
+}
+
+.skyvps-popover > strong {
+  font-size: 13px;
+}
+
+.skyvps-popover > p {
+  margin: 8px 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #9aa89f;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.skyvps-popover > button {
+  width: 100%;
+  min-height: 34px;
+  margin-top: 5px;
+  padding: 0 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #c9ded1 !important;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  font-size: 11px !important;
+  text-align: left;
+  cursor: pointer;
+}
+
+.skyvps-popover > button:hover {
+  background: rgba(255, 255, 255, 0.055);
+}
+
+.skyvps-popover > button svg {
+  width: 15px;
+  height: 15px;
+}
+
+.skyvps-popover > button svg:last-child:not(:first-child) {
+  margin-left: auto;
+}
+
+.skyvps-notifications {
+  width: 300px;
+}
+
+.skyvps-notifications > p {
+  padding: 7px 0;
+  border-bottom: 1px solid rgba(151, 183, 160, 0.08);
+}
+
+.skyvps-notification-indicator {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--sky-green);
+}
+
+.skyvps-main {
+  width: 100%;
+  max-width: 1640px;
+  margin: 0 auto;
+  padding: 28px 2px 48px 34px;
+}
+
+.skyvps-welcome-card {
+  min-height: 168px;
+  padding: 24px 25px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  border: 1px solid rgba(139, 176, 151, 0.13);
+  border-radius: 17px;
+  background: linear-gradient(110deg, rgba(255, 255, 255, 0.026), rgba(255, 255, 255, 0.018));
+}
+
+.skyvps-welcome-user {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.skyvps-welcome-avatar {
+  width: 54px;
+  height: 54px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  color: #e7fff2;
+  border: 1px solid rgba(73, 220, 145, 0.25);
+  border-radius: 14px;
+  background: linear-gradient(145deg, #05a878, #087d55);
+  box-shadow: 0 5px 13px rgba(16, 181, 119, 0.2);
+  font-size: 17px;
+  font-weight: 800;
+}
+
+.skyvps-greeting {
+  display: block;
+  margin: 2px 0 5px;
+  color: #8fd7b3;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+}
+
+.skyvps-welcome-user h1 {
+  margin: 0;
+  font-size: 28px;
+  font-weight: 800;
+  letter-spacing: -0.85px;
+  line-height: 1.15;
+}
+
+.skyvps-welcome-user p {
+  margin: 7px 0 9px;
+  color: #b9c3bd;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.skyvps-welcome-user p strong {
+  color: #d6ded9;
+}
+
+.skyvps-welcome-user p em {
+  color: #f0bb34;
+  font-style: normal;
+}
+
+.skyvps-welcome-separator {
+  color: #74837a;
+}
+
+.skyvps-date {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #909d95;
+  font-size: 11px;
+}
+
+.skyvps-date svg {
+  width: 13px;
+  height: 13px;
+}
+
+.skyvps-welcome-actions {
+  padding: 5px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid rgba(156, 184, 163, 0.1);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.skyvps-action-button {
+  min-height: 46px;
+  padding: 0 17px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: #d2d9d4 !important;
+  border: 1px solid rgba(153, 179, 160, 0.2);
+  border-radius: 13px;
+  background: rgba(255, 255, 255, 0.018);
+  font-size: 13px !important;
+  font-weight: 700 !important;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.skyvps-action-button:hover {
+  border-color: rgba(117, 204, 150, 0.42);
+  background: rgba(255, 255, 255, 0.055);
+}
+
+.skyvps-action-button svg {
+  width: 15px;
+  height: 15px;
+}
+
+.skyvps-action-primary {
+  color: white !important;
+  border-color: #14bd88;
+  background: linear-gradient(135deg, #19c891, #0bb386);
+  box-shadow: 0 7px 18px rgba(12, 193, 134, 0.18);
+}
+
+.skyvps-action-primary:hover {
+  border-color: #39dda7;
+  background: linear-gradient(135deg, #2ad49c, #16bf8c);
+}
+
+.skyvps-stats-grid {
+  margin-top: 22px;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.skyvps-stat-card,
+.skyvps-panel {
+  min-width: 0;
+  border: 1px solid rgba(153, 183, 161, 0.13);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.026);
+}
+
+.skyvps-stat-card {
+  min-height: 136px;
+  padding: 16px;
+}
+
+.skyvps-stat-heading {
+  margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #d6ded9;
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.skyvps-stat-icon,
+.skyvps-panel-icon {
+  width: 31px;
+  height: 31px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.055);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.045);
+}
+
+.skyvps-stat-icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+.stat-orders {
+  color: #bdebd4;
+  background-color: rgba(44, 127, 88, 0.21);
+}
+
+.stat-active {
+  color: #56d7a0;
+  background-color: rgba(15, 132, 88, 0.2);
+}
+
+.stat-spent {
+  color: #bf9cff;
+  background-color: rgba(141, 95, 203, 0.22);
+}
+
+.stat-pending {
+  color: #efc448;
+  background-color: rgba(172, 130, 21, 0.24);
+}
+
+.skyvps-stat-card > strong {
+  min-height: 29px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 21px;
+  font-weight: 800;
+  letter-spacing: -0.5px;
+  line-height: 1.2;
+}
+
+.skyvps-stat-card > small {
+  margin-top: 4px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: #89968e;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.skyvps-live-pill {
+  padding: 4px 7px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #80ddb1;
+  border-radius: 6px;
+  background: rgba(40, 147, 97, 0.23);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+
+.skyvps-live-pill i,
+.account-active i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #16c58c;
+}
+
+.skyvps-change-pill {
+  padding: 4px 8px;
+  color: #e6b7b4;
+  border-radius: 6px;
+  background: rgba(148, 90, 81, 0.21);
+  font-size: 9px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.skyvps-analytics-grid {
+  margin-top: 22px;
+  display: grid;
+  grid-template-columns: minmax(0, 2.05fr) minmax(310px, 1fr);
+  gap: 16px;
+}
+
+.skyvps-panel {
+  border-radius: 17px;
+  background: rgba(255, 255, 255, 0.024);
+}
+
+.skyvps-spending-panel,
+.skyvps-distribution-panel {
+  min-height: 314px;
+  padding: 17px 21px 16px;
+}
+
+.skyvps-panel-heading {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.skyvps-panel-icon {
+  width: 31px;
+  height: 31px;
+}
+
+.skyvps-panel-icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+.skyvps-panel-heading > div {
+  min-width: 0;
+}
+
+.skyvps-panel-heading h2 {
+  overflow: hidden;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 750;
+  letter-spacing: -0.25px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skyvps-panel-heading p {
+  margin: 3px 0 0;
+  color: #89968e;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.skyvps-chart-change {
+  margin-left: auto;
+  padding: 5px 9px;
+}
+
+.skyvps-chart {
+  position: relative;
+  height: 229px;
+  margin: 7px 4px 0 5px;
+  padding: 8px 5px 25px 44px;
+}
+
+.skyvps-chart-ylabels {
+  position: absolute;
+  inset: 7px auto 25px 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  color: #849188;
+  font-size: 9px;
+  font-weight: 600;
+}
+
+.skyvps-chart-svg {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.skyvps-chart-grid {
+  stroke: rgba(143, 166, 148, 0.18);
+  stroke-dasharray: 3 4;
+  stroke-width: 0.8;
+}
+
+.skyvps-chart-area {
+  fill: url(#skyvps-area-fill);
+  stroke: none;
+}
+
+.skyvps-chart-line {
+  fill: none;
+  stroke: #1acb94;
+  stroke-width: 2.2;
+  vector-effect: non-scaling-stroke;
+}
+
+.skyvps-chart-dot {
+  fill: #22d19d;
+  stroke: #10231a;
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.skyvps-chart-xlabels {
+  position: absolute;
+  inset: auto 4px 0 44px;
+  display: flex;
+  justify-content: space-between;
+  color: #8a968e;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.skyvps-donut-wrap {
+  min-height: 211px;
+  display: grid;
+  place-items: center;
+}
+
+.skyvps-donut {
+  width: 168px;
+  height: 168px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: conic-gradient(from -55deg, #ff9e06 0deg 142deg, #657791 144deg 356deg, #ff9e06 358deg);
+  transform: rotate(-15deg);
+}
+
+.skyvps-donut::before {
+  width: 116px;
+  height: 116px;
+  content: "";
+  grid-area: 1 / 1;
+  border-radius: 50%;
+  background: #0e1915;
+}
+
+.skyvps-donut > div {
+  z-index: 1;
+  grid-area: 1 / 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  transform: rotate(15deg);
+}
+
+.skyvps-donut strong {
+  font-size: 24px;
+  font-weight: 800;
+  line-height: 1.2;
+}
+
+.skyvps-donut span {
+  margin-top: 2px;
+  color: #9da8a1;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.skyvps-legend {
+  margin-top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 17px;
+  color: #a6b0a9;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.skyvps-legend > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.skyvps-legend i {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+
+.legend-pending {
+  background: #ff9e06;
+}
+
+.legend-other {
+  background: #657791;
+}
+
+.skyvps-legend b {
+  color: #e2e8e4;
+  font-weight: 700;
+}
+
+.skyvps-lower-grid {
+  margin-top: 16px;
+  display: grid;
+  grid-template-columns: minmax(0, 2.05fr) minmax(310px, 1fr);
+  gap: 16px;
+}
+
+.skyvps-recent-panel,
+.skyvps-account-panel {
+  min-height: 265px;
+  padding: 18px 21px;
+}
+
+.skyvps-view-all,
+.skyvps-more-button {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #77dbad !important;
+  border: 0;
+  background: transparent;
+  font-size: 11px !important;
+  font-weight: 700 !important;
+  cursor: pointer;
+}
+
+.skyvps-view-all svg,
+.skyvps-more-button svg {
+  width: 15px;
+  height: 15px;
+}
+
+.skyvps-order-row {
+  min-height: 67px;
+  margin-top: 9px;
+  padding: 9px 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border-top: 1px solid rgba(153, 183, 161, 0.1);
+}
+
+.skyvps-order-product {
+  width: 38px;
+  height: 38px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  color: #83d9aa;
+  border: 1px solid rgba(87, 181, 119, 0.16);
+  border-radius: 10px;
+  background: rgba(35, 116, 72, 0.17);
+}
+
+.skyvps-order-product svg {
+  width: 17px;
+  height: 17px;
+}
+
+.skyvps-order-copy {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.skyvps-order-copy strong {
+  overflow: hidden;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skyvps-order-copy small {
+  color: #89968e;
+  font-size: 9px;
+}
+
+.skyvps-order-status {
+  padding: 4px 7px;
+  color: #8ce4b5;
+  border-radius: 6px;
+  background: rgba(28, 133, 82, 0.2);
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.skyvps-order-status.status-pending {
+  color: #f0c852;
+  background: rgba(176, 132, 20, 0.2);
+}
+
+.skyvps-order-price {
+  min-width: 56px;
+  font-size: 11px;
+  text-align: right;
+}
+
+.skyvps-more-button {
+  color: #8f9b93 !important;
+}
+
+.skyvps-account-details {
+  margin: 15px 0 0;
+}
+
+.skyvps-account-details > div {
+  min-height: 39px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  border-bottom: 1px solid rgba(153, 183, 161, 0.08);
+  font-size: 10px;
+}
+
+.skyvps-account-details > div:last-child {
+  border-bottom: 0;
+}
+
+.skyvps-account-details dt {
+  color: #8d9991;
+}
+
+.skyvps-account-details dd {
+  overflow: hidden;
+  margin: 0;
+  color: #dce4de;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skyvps-account-details .account-active {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #72d9a8;
+}
+
+.skyvps-account-avatar {
+  width: 39px;
+  height: 39px;
+  font-size: 12px;
+}
+
+.skyvps-empty-page {
+  min-height: 450px;
+  padding: 48px 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--sky-border);
+  border-radius: 17px;
+  background: rgba(255, 255, 255, 0.02);
+  text-align: center;
+}
+
+.skyvps-empty-icon {
+  width: 55px;
+  height: 55px;
+  display: grid;
+  place-items: center;
+  color: #80dfb1;
+  border: 1px solid rgba(52, 202, 135, 0.2);
+  border-radius: 16px;
+  background: rgba(31, 139, 83, 0.16);
+}
+
+.skyvps-empty-icon svg {
+  width: 23px;
+  height: 23px;
+}
+
+.skyvps-empty-page > h1 {
+  margin: 16px 0 0;
+  font-size: 23px;
+}
+
+.skyvps-empty-page > p {
+  margin: 7px 0 18px;
+  color: var(--sky-muted);
+  font-size: 12px;
+}
+
+.skyvps-back-button {
+  min-height: 38px;
+  margin-top: 22px;
+  padding: 0 14px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #dbf6e6 !important;
+  border: 1px solid var(--sky-border-strong);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.035);
+  font-size: 11px !important;
+  cursor: pointer;
+}
+
+.skyvps-back-button svg {
+  width: 15px;
+  height: 15px;
+}
+
+.skyvps-plan-cards {
+  width: min(900px, 100%);
+  margin-top: 14px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 13px;
+  text-align: left;
+}
+
+.skyvps-plan-cards > div {
+  min-height: 180px;
+  padding: 17px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 9px;
+  border: 1px solid var(--sky-border);
+  border-radius: 13px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.skyvps-plan-cards > div > svg {
+  width: 19px;
+  height: 19px;
+  color: #74d9a7;
+}
+
+.skyvps-plan-cards strong {
+  font-size: 13px;
+}
+
+.skyvps-plan-cards span {
+  color: var(--sky-muted);
+  font-size: 10px;
+}
+
+.skyvps-plan-cards b {
+  margin-top: auto;
+  font-size: 12px;
+}
+
+.skyvps-plan-cards button {
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #77dfb1 !important;
+  border: 0;
+  background: transparent;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.skyvps-plan-cards button svg {
+  width: 13px;
+  height: 13px;
+}
+
+.skyvps-toast {
+  position: fixed;
+  z-index: 70;
+  right: 22px;
+  bottom: 22px;
+  max-width: min(440px, calc(100vw - 34px));
+  padding: 12px 13px 12px 16px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  color: #eaf4ed;
+  border: 1px solid rgba(88, 198, 137, 0.3);
+  border-radius: 12px;
+  background: #14281e;
+  box-shadow: 0 15px 40px rgba(0, 0, 0, 0.36);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.skyvps-toast button {
+  padding: 3px;
+  display: grid;
+  place-items: center;
+  color: #9eafa4 !important;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.skyvps-toast button svg {
+  width: 15px;
+  height: 15px;
+}
+
+.skyvps-mobile-menu,
+.skyvps-mobile-backdrop {
+  display: none;
+}
+
+.skyvps-dashboard--light {
+  --sky-bg: #f2f6f3;
+  --sky-sidebar: #e7f1ea;
+  --sky-surface: #fff;
+  --sky-surface-raised: #fff;
+  --sky-border: rgba(49, 91, 65, 0.15);
+  --sky-border-strong: rgba(49, 91, 65, 0.2);
+  --sky-text: #17261d;
+  --sky-muted: #65756b;
+  color: var(--sky-text);
+  background: var(--sky-bg);
+}
+
+.skyvps-dashboard--light .skyvps-sidebar {
+  border-color: rgba(49, 91, 65, 0.13);
+  background: linear-gradient(180deg, #eaf5ed, #e2efe6);
+}
+
+.skyvps-dashboard--light .skyvps-brand-copy strong,
+.skyvps-dashboard--light .skyvps-account-copy strong,
+.skyvps-dashboard--light .skyvps-signout,
+.skyvps-dashboard--light .skyvps-page-title strong,
+.skyvps-dashboard--light .skyvps-welcome-user h1,
+.skyvps-dashboard--light .skyvps-panel-heading h2,
+.skyvps-dashboard--light .skyvps-stat-card > strong {
+  color: #17261d;
+}
+
+.skyvps-dashboard--light .skyvps-workspace,
+.skyvps-dashboard--light .skyvps-topbar {
+  background-color: var(--sky-bg);
+}
+
+.skyvps-dashboard--light .skyvps-topbar {
+  border-color: rgba(22, 166, 112, 0.22);
+}
+
+.skyvps-dashboard--light .skyvps-welcome-card,
+.skyvps-dashboard--light .skyvps-stat-card,
+.skyvps-dashboard--light .skyvps-panel,
+.skyvps-dashboard--light .skyvps-empty-page {
+  border-color: rgba(49, 91, 65, 0.13);
+  background: #fff;
+}
+
+.skyvps-dashboard--light .skyvps-welcome-user p,
+.skyvps-dashboard--light .skyvps-stat-heading,
+.skyvps-dashboard--light .skyvps-account-details dd,
+.skyvps-dashboard--light .skyvps-order-copy strong {
+  color: #34483b;
+}
+
+.skyvps-dashboard--light .skyvps-donut::before {
+  background: #fff;
+}
+
+.skyvps-dashboard--light .skyvps-icon-button,
+.skyvps-dashboard--light .skyvps-action-button:not(.skyvps-action-primary) {
+  color: #526359 !important;
+  border-color: rgba(49, 91, 65, 0.16);
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.skyvps-dashboard--light .skyvps-popover {
+  border-color: rgba(49, 91, 65, 0.15);
+  background: #fff;
+}
+
+.skyvps-dashboard--light .skyvps-popover > strong,
+.skyvps-dashboard--light .skyvps-popover > button {
+  color: #26382d !important;
+}
+
+@media (max-width: 1200px) {
+  .skyvps-sidebar {
+    width: 270px;
+  }
+
+  .skyvps-workspace {
+    width: calc(100% - 270px);
+    margin-left: 270px;
+  }
+
+  .skyvps-main {
+    padding-right: 18px;
+    padding-left: 30px;
+  }
+
+  .skyvps-topbar {
+    padding-right: 19px;
+    padding-left: 19px;
+  }
+
+  .skyvps-analytics-grid,
+  .skyvps-lower-grid {
+    grid-template-columns: minmax(0, 1.8fr) minmax(270px, 1fr);
+  }
+
+  .skyvps-action-button {
+    padding-right: 12px;
+    padding-left: 12px;
+  }
+}
+
+@media (max-width: 960px) {
+  .skyvps-sidebar {
+    width: 280px;
+    transform: translateX(-101%);
+    transition: transform 180ms ease;
+  }
+
+  .skyvps-sidebar--open {
+    transform: translateX(0);
+  }
+
+  .skyvps-mobile-backdrop {
+    position: fixed;
+    z-index: 19;
+    inset: 0;
+    display: block;
+    border: 0;
+    background: rgba(0, 0, 0, 0.58);
+  }
+
+  .skyvps-workspace {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .skyvps-mobile-menu {
+    display: inline-grid;
+  }
+
+  .skyvps-topbar {
+    justify-content: flex-start;
+  }
+
+  .skyvps-top-actions {
+    margin-left: auto;
+  }
+}
+
+@media (max-width: 700px) {
+  .skyvps-topbar {
+    min-height: 70px;
+    padding: 0 13px;
+    gap: 10px;
+  }
+
+  .skyvps-page-title-icon {
+    display: none;
+  }
+
+  .skyvps-page-title strong {
+    font-size: 14px;
+  }
+
+  .skyvps-page-title small {
+    display: none;
+  }
+
+  .skyvps-top-actions {
+    gap: 3px;
+  }
+
+  .skyvps-icon-button {
+    width: 30px;
+    height: 34px;
+    border-radius: 10px;
+  }
+
+  .skyvps-icon-button svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .skyvps-wallet {
+    height: 36px;
+    padding: 0 5px;
+    gap: 5px;
+  }
+
+  .skyvps-wallet svg {
+    width: 13px;
+    height: 13px;
+  }
+
+  .skyvps-wallet strong {
+    font-size: 11px;
+  }
+
+  .skyvps-top-avatar {
+    width: 30px;
+    height: 30px;
+  }
+
+  .skyvps-main {
+    padding: 14px 12px 30px;
+  }
+
+  .skyvps-welcome-card {
+    min-height: 0;
+    padding: 18px 15px;
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 17px;
+  }
+
+  .skyvps-welcome-user {
+    gap: 12px;
+  }
+
+  .skyvps-welcome-avatar {
+    width: 45px;
+    height: 45px;
+    border-radius: 12px;
+  }
+
+  .skyvps-welcome-user h1 {
+    font-size: 23px;
+  }
+
+  .skyvps-welcome-user p {
+    font-size: 11px;
+  }
+
+  .skyvps-welcome-actions {
+    width: 100%;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    gap: 6px;
+  }
+
+  .skyvps-action-button {
+    min-height: 37px;
+    flex: 1;
+    padding: 0 7px;
+    gap: 5px;
+    border-radius: 9px;
+    font-size: 10px !important;
+  }
+
+  .skyvps-action-button svg {
+    width: 13px;
+    height: 13px;
+  }
+
+  .skyvps-stats-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 9px;
+    margin-top: 12px;
+  }
+
+  .skyvps-stat-card {
+    min-height: 115px;
+    padding: 12px;
+  }
+
+  .skyvps-stat-card > strong {
+    font-size: 19px;
+  }
+
+  .skyvps-analytics-grid,
+  .skyvps-lower-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 11px;
+    margin-top: 12px;
+  }
+
+  .skyvps-spending-panel,
+  .skyvps-distribution-panel {
+    min-height: 275px;
+    padding: 15px;
+  }
+
+  .skyvps-chart {
+    height: 194px;
+    margin-right: 0;
+  }
+
+  .skyvps-donut-wrap {
+    min-height: 190px;
+  }
+
+  .skyvps-recent-panel,
+  .skyvps-account-panel {
+    padding: 15px;
+  }
+
+  .skyvps-order-row {
+    gap: 8px;
+  }
+
+  .skyvps-order-status {
+    display: none;
+  }
+
+  .skyvps-order-price {
+    min-width: 48px;
+    font-size: 10px;
+  }
+
+  .skyvps-plan-cards {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skyvps-dashboard *,
+  .skyvps-dashboard *::before,
+  .skyvps-dashboard *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}

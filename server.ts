@@ -6,7 +6,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 import { DEFAULT_STORE_CONFIG, LIMITS } from './src/constants.ts';
-import { OrderRecord, StoreConfig, VaultItem } from './src/types.ts';
+import { OrderRecord, PackType, StoreConfig, VaultItem } from './src/types.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -86,11 +86,76 @@ function loadDb(): PersistedDatabase {
     if (fs.existsSync(sourceFile)) {
       const raw = fs.readFileSync(sourceFile, 'utf-8');
       const parsed = JSON.parse(raw) as Partial<PersistedDatabase>;
+      const savedStoreConfig: Partial<StoreConfig> = parsed.storeConfig || {};
+      const orders = Array.isArray(parsed.orders) ? parsed.orders : [];
+      const verifiedUtrIndex: Record<string, string> = {};
+      for (const order of orders) {
+        order.deliveredCredentials = sanitizeDeliveredCredentials(
+          order.deliveredCredentials || ''
+        );
+        if (order.status === 'verified_delivered' && !verifiedUtrIndex[order.utrNumber]) {
+          verifiedUtrIndex[order.utrNumber] = order.orderId;
+        }
+      }
+      const customerPerId =
+        normalizeStock(
+          savedStoreConfig.priceCustomPerId,
+          DEFAULT_STORE_CONFIG.priceCustomPerId
+        ) || DEFAULT_STORE_CONFIG.priceCustomPerId;
       return {
-        storeConfig: { ...DEFAULT_STORE_CONFIG, ...(parsed.storeConfig || {}) },
-        orders: Array.isArray(parsed.orders) ? parsed.orders : [],
+        storeConfig: {
+          ...DEFAULT_STORE_CONFIG,
+          ...savedStoreConfig,
+          priceCustomPerId: customerPerId,
+          price1Id: customerPerId,
+          price2Id: customerPerId * 2,
+          price5Id: customerPerId * 5,
+          price10Id: customerPerId * 10,
+          priceBulkPerId: customerPerId,
+          price7DayGuaranteePerId: normalizeStock(
+            savedStoreConfig.price7DayGuaranteePerId,
+            DEFAULT_STORE_CONFIG.price7DayGuaranteePerId
+          ) || DEFAULT_STORE_CONFIG.price7DayGuaranteePerId,
+          price1MonthGuaranteePerId: normalizeStock(
+            savedStoreConfig.price1MonthGuaranteePerId,
+            DEFAULT_STORE_CONFIG.price1MonthGuaranteePerId
+          ) || DEFAULT_STORE_CONFIG.price1MonthGuaranteePerId,
+          announcementText:
+            typeof savedStoreConfig.announcementText === 'string'
+              ? savedStoreConfig.announcementText.toUpperCase().includes('INSTANT UPI UTR VERIFICATION')
+                ? DEFAULT_STORE_CONFIG.announcementText
+                : savedStoreConfig.announcementText
+                    .replace(/\s*[·•-]?\s*PAYMENT CONFIRMATION REQUIRED/gi, '')
+                    .trim()
+              : DEFAULT_STORE_CONFIG.announcementText,
+          upiId: normalizeUpiId(savedStoreConfig.upiId, DEFAULT_STORE_CONFIG.upiId),
+          instantAutoVerify: false,
+          instantDeliveryNote: DEFAULT_STORE_CONFIG.instantDeliveryNote,
+          presetRentalCredentials: sanitizeDeliveredCredentials(
+            savedStoreConfig.presetRentalCredentials ||
+              DEFAULT_STORE_CONFIG.presetRentalCredentials ||
+              ''
+          ),
+          presetPermanentCredentials: sanitizeDeliveredCredentials(
+            savedStoreConfig.presetPermanentCredentials ||
+              DEFAULT_STORE_CONFIG.presetPermanentCredentials ||
+              ''
+          ),
+          stockDisplayAvailable: normalizeStock(
+            savedStoreConfig.stockDisplayAvailable,
+            normalizeStock(savedStoreConfig.stockAvailable, DEFAULT_STORE_CONFIG.stockDisplayAvailable)
+          ),
+          rentalStockDisplayAvailable: normalizeStock(
+            savedStoreConfig.rentalStockDisplayAvailable,
+            normalizeStock(
+              savedStoreConfig.rentalStockAvailable,
+              DEFAULT_STORE_CONFIG.rentalStockDisplayAvailable
+            )
+          ),
+        },
+        orders,
         vault: Array.isArray(parsed.vault) ? parsed.vault : buildInitialVault(),
-        utrIndex: parsed.utrIndex && typeof parsed.utrIndex === 'object' ? parsed.utrIndex : {},
+        utrIndex: verifiedUtrIndex,
       };
     }
   } catch (err) {
@@ -113,7 +178,57 @@ function saveDb(db: PersistedDatabase) {
     fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2), 'utf-8');
   } catch (err) {
     console.error('Failed to persist store data:', err);
+    throw err;
   }
+}
+
+function normalizeStock(value: unknown, fallback: number): number {
+  const stock = Number(value);
+  return Number.isFinite(stock)
+    ? Math.max(0, Math.min(100000, Math.floor(stock)))
+    : fallback;
+}
+
+function normalizeUpiId(value: unknown, fallback: string): string {
+  const upiId = String(value ?? '').trim();
+  return upiId.length >= LIMITS.UPI_ID_MIN &&
+    upiId.length <= LIMITS.UPI_ID_MAX &&
+    LIMITS.UPI_ID_REGEX.test(upiId)
+    ? upiId
+    : fallback;
+}
+
+function sanitizeDeliveredCredentials(credentials: string): string {
+  return credentials
+    .split('\n')
+    .map((line) =>
+      line
+        .split(/[|·]/)
+        .filter(
+          (part) =>
+            !/^\s*TxnPin\s*:/i.test(part) &&
+            !/^\s*24H Active Rental\s*$/i.test(part)
+        )
+        .map((part) => part.trim())
+        .filter(Boolean)
+        .join(' | ')
+    )
+    .filter(Boolean)
+    .join('\n');
+}
+
+function isPackType(value: unknown): value is PackType {
+  return [
+    'pack_1',
+    'pack_2',
+    'pack_5',
+    'pack_10',
+    'bulk',
+    'custom',
+    'rental_24h',
+    'guarantee_7days',
+    'guarantee_1month',
+  ].includes(String(value));
 }
 
 const db = loadDb();
@@ -197,35 +312,6 @@ function allocateCredentials(
 /**
  * Preview what credentials will be used for an order from Ready Vault without mutating state yet.
  */
-function previewVaultCredentials(quantity: number, isRental24h: boolean): string {
-  const targetPool = isRental24h ? 'rental_24h' : 'permanent';
-  const availableInPool = db.vault.filter(
-    (v) => !v.isAssigned && v.poolType === targetPool
-  );
-  const presetMaster = isRental24h
-    ? (db.storeConfig.presetRentalCredentials || '').trim()
-    : (db.storeConfig.presetPermanentCredentials || '').trim();
-  const presetLines = presetMaster
-    .split('\n')
-    .map((l) => l.trim())
-    .filter(Boolean);
-
-  const lines: string[] = [];
-  for (let i = 0; i < quantity; i++) {
-    const v = availableInPool[i];
-    if (v) {
-      lines.push(
-        `Username: ${v.irctcUsername} | Password: ${v.irctcPassword}${
-          v.accountNote ? ` | ${v.accountNote}` : ''
-        }`
-      );
-    } else if (presetLines.length > 0) {
-      lines.push(presetLines[i % presetLines.length]);
-    }
-  }
-  return lines.join('\n');
-}
-
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
@@ -443,18 +529,31 @@ async function startServer() {
   // Update Store Config
   app.put('/api/store', requireAdminAuth, (req, res) => {
     const body = req.body || {};
+    const upiId = String(body.upiId ?? db.storeConfig.upiId).trim();
+    if (
+      upiId.length < LIMITS.UPI_ID_MIN ||
+      upiId.length > LIMITS.UPI_ID_MAX ||
+      !LIMITS.UPI_ID_REGEX.test(upiId)
+    ) {
+      res.status(400).json({ error: 'Please enter a valid UPI ID.' });
+      return;
+    }
+    const customerPerId = Math.max(
+      1,
+      Math.min(100000, Math.floor(Number(body.priceCustomPerId) || 340))
+    );
     const updated: StoreConfig = {
       siteTitle: String(body.siteTitle || db.storeConfig.siteTitle || 'Roshanbrand')
         .trim()
         .slice(0, LIMITS.SITE_TITLE_MAX),
       announcementText: String(
-        body.announcementText || db.storeConfig.announcementText
+        body.announcementText ?? db.storeConfig.announcementText
       )
         .trim()
-        .slice(0, LIMITS.ANNOUNCEMENT_MAX),
-      upiId: String(body.upiId || db.storeConfig.upiId || 'roshanbrand.pay@okaxis')
+        .replace(/\s*[·•-]?\s*PAYMENT CONFIRMATION REQUIRED/gi, '')
         .trim()
-        .slice(0, LIMITS.UPI_ID_MAX),
+        .slice(0, LIMITS.ANNOUNCEMENT_MAX),
+      upiId,
       payeeName: String(
         body.payeeName || db.storeConfig.payeeName || 'Roshanbrand Official'
       )
@@ -467,34 +566,50 @@ async function startServer() {
       supportHandle: String(body.supportHandle ?? db.storeConfig.supportHandle)
         .trim()
         .slice(0, LIMITS.SUPPORT_HANDLE_MAX),
-      price1Id: Math.max(1, Math.min(100000, Math.floor(Number(body.price1Id) || 350))),
-      price2Id: Math.max(1, Math.min(100000, Math.floor(Number(body.price2Id) || 680))),
-      price5Id: Math.max(1, Math.min(200000, Math.floor(Number(body.price5Id) || 1700))),
-      price10Id: Math.max(1, Math.min(500000, Math.floor(Number(body.price10Id) || 3300))),
-      priceBulkPerId: Math.max(
-        1,
-        Math.min(100000, Math.floor(Number(body.priceBulkPerId) || 300))
-      ),
-      priceCustomPerId: Math.max(
-        1,
-        Math.min(100000, Math.floor(Number(body.priceCustomPerId) || 340))
-      ),
+      priceCustomPerId: customerPerId,
+      price1Id: customerPerId,
+      price2Id: customerPerId * 2,
+      price5Id: customerPerId * 5,
+      price10Id: customerPerId * 10,
+      priceBulkPerId: customerPerId,
       priceRental24h: Math.max(
         1,
         Math.min(100000, Math.floor(Number(body.priceRental24h) || 49))
       ),
-      stockAvailable: Math.max(
-        0,
-        Math.min(100000, Math.floor(Number(body.stockAvailable) ?? 145))
+      price7DayGuaranteePerId: Math.max(
+        1,
+        Math.min(
+          100000,
+          Math.floor(
+            Number(body.price7DayGuaranteePerId) ||
+              db.storeConfig.price7DayGuaranteePerId
+          )
+        )
       ),
-      rentalStockAvailable: Math.max(
-        0,
-        Math.min(100000, Math.floor(Number(body.rentalStockAvailable) ?? 68))
+      price1MonthGuaranteePerId: Math.max(
+        1,
+        Math.min(
+          100000,
+          Math.floor(
+            Number(body.price1MonthGuaranteePerId) ||
+              db.storeConfig.price1MonthGuaranteePerId
+          )
+        )
       ),
-      instantAutoVerify:
-        typeof body.instantAutoVerify === 'boolean'
-          ? body.instantAutoVerify
-          : db.storeConfig.instantAutoVerify,
+      stockAvailable: normalizeStock(body.stockAvailable, db.storeConfig.stockAvailable),
+      rentalStockAvailable: normalizeStock(
+        body.rentalStockAvailable,
+        db.storeConfig.rentalStockAvailable
+      ),
+      stockDisplayAvailable: normalizeStock(
+        body.stockDisplayAvailable,
+        db.storeConfig.stockDisplayAvailable
+      ),
+      rentalStockDisplayAvailable: normalizeStock(
+        body.rentalStockDisplayAvailable,
+        db.storeConfig.rentalStockDisplayAvailable
+      ),
+      instantAutoVerify: false,
       presetRentalCredentials: String(
         body.presetRentalCredentials ??
           db.storeConfig.presetRentalCredentials ??
@@ -509,21 +624,24 @@ async function startServer() {
       )
         .trim()
         .slice(0, LIMITS.CREDENTIALS_MAX),
-      instantDeliveryNote: String(
-        body.instantDeliveryNote || db.storeConfig.instantDeliveryNote
-      )
-        .trim()
-        .slice(0, LIMITS.DELIVERY_NOTE_MAX),
+      instantDeliveryNote: DEFAULT_STORE_CONFIG.instantDeliveryNote,
       updatedAt: new Date().toISOString(),
     };
 
+    const previousConfig = db.storeConfig;
     db.storeConfig = updated;
-    saveDb(db);
+    try {
+      saveDb(db);
+    } catch {
+      db.storeConfig = previousConfig;
+      res.status(500).json({ error: 'Settings could not be saved to persistent storage.' });
+      return;
+    }
     broadcastStateUpdate('config_updated', { storeConfig: db.storeConfig });
     res.json({ storeConfig: db.storeConfig });
   });
 
-  // Verify UPI UTR & Create Order (0ms Instant Execution)
+  // Record submitted UTRs as pending; payment receipt must be confirmed by an admin.
   app.post('/api/orders/verify-upi', (req, res) => {
     const body = req.body || {};
     const utrNumber = String(body.utrNumber || '')
@@ -531,13 +649,11 @@ async function startServer() {
       .replace(/\s+/g, '');
 
     if (
-      utrNumber.length < LIMITS.UTR_MIN ||
-      utrNumber.length > LIMITS.UTR_MAX ||
-      !LIMITS.ALPHANUM_UTR_REGEX.test(utrNumber)
+      !LIMITS.UTR_REGEX.test(utrNumber)
     ) {
       res.status(400).json({
         error:
-          'Kripya valid 12-digit UPI UTR / Transaction Reference ID dalein (digits/letters only).',
+          'Kripya valid 12-digit numeric UPI UTR dalein.',
       });
       return;
     }
@@ -554,15 +670,64 @@ async function startServer() {
       LIMITS.QUANTITY_MIN,
       Math.min(LIMITS.QUANTITY_MAX, Math.round(Number(body.quantity) || 1))
     );
-    const isRental24h = Boolean(body.isRental24h || body.packType === 'rental_24h');
-    const unitPrice = Math.max(
-      1,
-      Math.min(100000, Math.round(Number(body.unitPrice) || (isRental24h ? 49 : 350)))
-    );
-    const totalAmount = Math.max(
-      1,
-      Math.min(5000000, Math.round(Number(body.totalAmount) || quantity * unitPrice))
-    );
+    const packType = body.packType || (body.isRental24h ? 'rental_24h' : 'pack_1');
+    if (!isPackType(packType)) {
+      res.status(400).json({ error: 'Invalid package type.' });
+      return;
+    }
+
+    const isRental24h = packType === 'rental_24h';
+    let totalAmount: number;
+    switch (packType) {
+      case 'pack_1':
+        if (quantity !== 1) {
+          res.status(400).json({ error: 'The 1-ID package requires quantity 1.' });
+          return;
+        }
+        totalAmount = quantity * db.storeConfig.priceCustomPerId;
+        break;
+      case 'pack_2':
+        if (quantity !== 2) {
+          res.status(400).json({ error: 'The 2-ID package requires quantity 2.' });
+          return;
+        }
+        totalAmount = quantity * db.storeConfig.priceCustomPerId;
+        break;
+      case 'pack_5':
+        if (quantity !== 5) {
+          res.status(400).json({ error: 'The 5-ID package requires quantity 5.' });
+          return;
+        }
+        totalAmount = quantity * db.storeConfig.priceCustomPerId;
+        break;
+      case 'pack_10':
+        if (quantity !== 10) {
+          res.status(400).json({ error: 'The 10-ID package requires quantity 10.' });
+          return;
+        }
+        totalAmount = quantity * db.storeConfig.priceCustomPerId;
+        break;
+      case 'bulk':
+        totalAmount = quantity * db.storeConfig.priceCustomPerId;
+        break;
+      case 'custom':
+        totalAmount = quantity * db.storeConfig.priceCustomPerId;
+        break;
+      case 'rental_24h':
+        totalAmount = quantity * db.storeConfig.priceRental24h;
+        break;
+      case 'guarantee_7days':
+        totalAmount = quantity * db.storeConfig.price7DayGuaranteePerId;
+        break;
+      case 'guarantee_1month':
+        totalAmount = quantity * db.storeConfig.price1MonthGuaranteePerId;
+        break;
+    }
+    if (totalAmount > 5000000) {
+      res.status(400).json({ error: 'Order total exceeds the maximum allowed amount.' });
+      return;
+    }
+    const unitPrice = Math.round(totalAmount / quantity);
 
     const now = new Date();
     const nowIso = now.toISOString();
@@ -571,37 +736,12 @@ async function startServer() {
       .substring(2, 6)
       .toUpperCase()}`;
 
-    let status: OrderRecord['status'] = 'pending_verification';
-    let deliveredCredentials = '';
-    let adminNote = '';
-    let rentalExpiresAt: string | undefined = undefined;
-    let verifiedAt: string | undefined = undefined;
-
-    if (db.storeConfig.instantAutoVerify) {
-      status = 'verified_delivered';
-      deliveredCredentials = allocateCredentials(quantity, isRental24h, orderId);
-      verifiedAt = nowIso;
-
-      if (isRental24h) {
-        const expires = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-        rentalExpiresAt = expires.toISOString();
-        adminNote = `Instant UTR #${utrNumber} Verified · Pre-Set Ready Vault ID Dispatched (24H Active)`;
-        db.storeConfig.rentalStockAvailable = Math.max(
-          0,
-          (db.storeConfig.rentalStockAvailable || 68) - quantity
-        );
-      } else {
-        adminNote = `Instant UTR #${utrNumber} Verified · Pre-Set Ready Vault ID Dispatched`;
-        db.storeConfig.stockAvailable = Math.max(
-          0,
-          (db.storeConfig.stockAvailable || 145) - quantity
-        );
-      }
-    } else {
-      // Pre-fill Ready Vault credentials on the pending order so Admin can verify in 1 click without typing!
-      deliveredCredentials = previewVaultCredentials(quantity, isRental24h);
-      adminNote = 'Awaiting 1-Click UTR Verification in Admin Panel';
-    }
+    const status: OrderRecord['status'] = 'pending_verification';
+    const deliveredCredentials = '';
+    const paymentUpiId = db.storeConfig.upiId;
+    const adminNote = `Awaiting manual confirmation of payment received at ${paymentUpiId}.`;
+    const rentalExpiresAt: string | undefined = undefined;
+    const verifiedAt: string | undefined = undefined;
 
     const newOrder: OrderRecord = {
       orderId,
@@ -609,13 +749,14 @@ async function startServer() {
         body.packLabel ||
           (isRental24h ? '24-Hour Rental IRCTC ID' : `${quantity} IRCTC ID Pack`)
       ).slice(0, 80),
-      packType: body.packType || (isRental24h ? 'rental_24h' : 'pack_1'),
+      packType,
       isRental24h,
       rentalDurationHours: isRental24h ? 24 : undefined,
       rentalExpiresAt,
       quantity,
       unitPrice,
       totalAmount,
+      paymentUpiId,
       utrNumber,
       upiAppUsed: String(body.upiAppUsed || 'UPI QR').slice(0, 40),
       customerReference: String(body.customerReference || 'Direct UPI Buyer')
@@ -633,7 +774,6 @@ async function startServer() {
     };
 
     db.orders.unshift(newOrder);
-    db.utrIndex[utrNumber] = orderId;
     saveDb(db);
 
     // Push instant <50ms notification to Admin Panel & Customer screens
@@ -679,6 +819,11 @@ async function startServer() {
       res.status(404).json({ error: 'Order not found' });
       return;
     }
+    const verifiedOrderId = db.utrIndex[order.utrNumber];
+    if (verifiedOrderId && verifiedOrderId !== order.orderId) {
+      res.status(409).json({ error: 'This UTR has already been used for a verified order.' });
+      return;
+    }
 
     let creds = String(req.body?.deliveredCredentials || '').trim();
     // If Admin clicked 1-Click Verify without typing anything, automatically allocate from Ready ID Vault!
@@ -693,7 +838,10 @@ async function startServer() {
     const wasPending = order.status !== 'verified_delivered';
     const now = new Date();
     order.status = 'verified_delivered';
-    order.deliveredCredentials = creds.slice(0, LIMITS.CREDENTIALS_MAX);
+    order.deliveredCredentials = sanitizeDeliveredCredentials(creds).slice(
+      0,
+      LIMITS.CREDENTIALS_MAX
+    );
     order.updatedAt = now.toISOString();
     order.verifiedAt = order.verifiedAt || now.toISOString();
 
@@ -717,16 +865,17 @@ async function startServer() {
       if (order.isRental24h) {
         db.storeConfig.rentalStockAvailable = Math.max(
           0,
-          (db.storeConfig.rentalStockAvailable || 0) - order.quantity
+          db.storeConfig.rentalStockAvailable - order.quantity
         );
       } else {
         db.storeConfig.stockAvailable = Math.max(
           0,
-          (db.storeConfig.stockAvailable || 0) - order.quantity
+          db.storeConfig.stockAvailable - order.quantity
         );
       }
     }
 
+    db.utrIndex[order.utrNumber] = order.orderId;
     saveDb(db);
     broadcastStateUpdate('order_verified', { order });
     res.json({ order, storeConfig: db.storeConfig });
@@ -826,11 +975,11 @@ async function startServer() {
     if (addedCount > 0) {
       if (poolType === 'rental_24h') {
         db.storeConfig.rentalStockAvailable =
-          (db.storeConfig.rentalStockAvailable || 0) + addedCount;
+          db.storeConfig.rentalStockAvailable + addedCount;
         // Also update the default Pre-Set Rental ID to the latest added ID so it's always ready!
         db.storeConfig.presetRentalCredentials = formattedAddedLines[0];
       } else {
-        db.storeConfig.stockAvailable = (db.storeConfig.stockAvailable || 0) + addedCount;
+        db.storeConfig.stockAvailable += addedCount;
         db.storeConfig.presetPermanentCredentials = formattedAddedLines[0];
       }
       saveDb(db);

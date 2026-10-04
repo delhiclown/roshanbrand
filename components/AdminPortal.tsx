@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   AlertCircle,
   ArrowLeft,
@@ -19,12 +19,11 @@ import {
   ShieldCheck,
   Sparkles,
   Trash2,
-  Upload,
   XCircle,
   Zap,
 } from 'lucide-react';
-import { LIMITS } from '../constants';
-import { OrderRecord, StoreConfig, VaultItem } from '../types';
+import { LIMITS } from '../src/constants';
+import { OrderRecord, StoreConfig, VaultItem } from '../src/types';
 import { UpiQrBox } from './UpiQrBox';
 
 interface AdminPortalProps {
@@ -55,6 +54,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   const [addingVault, setAddingVault] = useState(false);
 
   const [formConfig, setFormConfig] = useState<StoreConfig>(storeConfig);
+  const previousStoreConfig = useRef(storeConfig);
   const [savingSettings, setSavingSettings] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState('');
   const [saveError, setSaveError] = useState('');
@@ -74,6 +74,24 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   const [authError, setAuthError] = useState('');
   const [authMessage, setAuthMessage] = useState('');
   const [securityMessage, setSecurityMessage] = useState('');
+
+  useEffect(() => {
+    const previousConfig = previousStoreConfig.current;
+    const nextFormConfig = { ...formConfig };
+    let formChanged = false;
+
+    for (const key of Object.keys(storeConfig) as (keyof StoreConfig)[]) {
+      if (Object.is(formConfig[key], previousConfig[key])) {
+        Object.assign(nextFormConfig, { [key]: storeConfig[key] });
+        formChanged ||= !Object.is(formConfig[key], storeConfig[key]);
+      }
+    }
+
+    previousStoreConfig.current = storeConfig;
+    if (formChanged) {
+      setFormConfig(nextFormConfig);
+    }
+  }, [storeConfig]);
 
   useEffect(() => {
     const checkAuth = async () => {
@@ -125,35 +143,6 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     navigator.clipboard.writeText(utr);
     setCopiedUtr(utr);
     setTimeout(() => setCopiedUtr(null), 1800);
-  };
-
-  const handleQrFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setSaveError('');
-    const file = e.target.files?.[0];
-    if (!file) return;
-    if (!file.type.startsWith('image/')) {
-      setSaveError('Please select a valid image file (PNG/JPG/WEBP).');
-      return;
-    }
-
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-      const dataUrl = typeof ev.target?.result === 'string' ? ev.target.result : '';
-      if (!dataUrl) {
-        setSaveError('QR image could not be read. Please try another image.');
-        return;
-      }
-      if (dataUrl.length > LIMITS.QR_URL_MAX) {
-        setSaveError('Image is too large. Please try a smaller QR screenshot.');
-        return;
-      }
-      setFormConfig((prev) => ({ ...prev, qrCodeUrl: dataUrl }));
-      e.target.value = '';
-    };
-    reader.onerror = () => {
-      setSaveError('QR image could not be read. Please try another image.');
-    };
-    reader.readAsDataURL(file);
   };
 
   const handleSaveSettings = async (e: React.FormEvent) => {
@@ -429,13 +418,13 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     {
       id: 'qr_settings',
       label: 'QR Code & UPI Setup',
-      subtitle: 'Upload QR, UPI ID & Auto-Verify',
+      subtitle: 'Fixed UPI ID & manual payment review',
       icon: <QrCode className="w-4 h-4" />,
     },
     {
       id: 'site_settings',
       label: 'Prices & Site Control',
-      subtitle: '₹49 Rental, 1/2/5/10/Bulk rates',
+      subtitle: 'Rental, ID packs, Bulk & Guarantee rates',
       icon: <Settings className="w-4 h-4" />,
     },
     {
@@ -478,7 +467,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
           {!passwordConfigured && (
             <div className="mb-4 rounded-lg border border-amber-400/30 bg-amber-950/30 p-3 text-xs leading-relaxed text-amber-100">
               Admin password is not configured. Set <code>ADMIN_PASSWORD</code> and
-              <code> ADMIN_RECOVERY_KEY</code> in the server's <code>.env</code> file, then restart.
+              <code> ADMIN_RECOVERY_KEY</code> in the backend environment (Render dashboard for hosted
+              deployments, or the server's <code>.env</code> file locally), then restart the backend.
             </div>
           )}
           {authMessage && (
@@ -819,7 +809,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                   {readyVaultCount}
                 </p>
                 <span className="text-[11px] text-indigo-300/90 font-semibold mt-1 inline-block">
-                  {storeConfig.instantAutoVerify ? 'Auto-Verify Active' : 'Manual Approval Mode'}
+                  Manual payment review only
                 </span>
               </div>
               <div className="w-10 h-10 rounded-xl bg-indigo-500/20 border border-indigo-400/40 text-indigo-300 flex items-center justify-center shrink-0">
@@ -942,8 +932,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                   <QrCode className="w-8 h-8 text-cyan-400 mx-auto opacity-80" />
                   <h3 className="text-sm font-extrabold text-white">No matching orders found</h3>
                   <p className="text-xs text-slate-400">
-                    When a customer scans your UPI QR code and submits their 12-digit UTR number,
-                    it appears here in real time.
+                    Submitted UTRs appear here as pending. Confirm the exact UTR and amount in the
+                    {storeConfig.upiId} account before you release any credentials.
                   </p>
                 </div>
               ) : (
@@ -1082,7 +1072,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                                   [order.orderId]: e.target.value,
                                 }))
                               }
-                              placeholder="Enter IRCTC ID & Password for customer (1 per line)&#10;Example: user_irctc01 | Pass@123 | TxnPin: 4455"
+                              placeholder="Enter IRCTC ID & Password for customer (1 per line)&#10;Example: user_irctc01 | Pass@123"
                               className="w-full px-3 py-2.5 rounded-xl bg-slate-900 border border-cyan-500/35 text-xs text-white font-mono placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-cyan-400/30 focus:border-cyan-400"
                             />
 
@@ -1096,7 +1086,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                                 <CheckCircle2 className="w-3.5 h-3.5" />
                                 {order.status === 'verified_delivered'
                                   ? 'Update Delivered Vault ID'
-                                  : '1-Click Verify UTR & Show Vault ID'}
+                                  : 'Confirm Received Payment & Deliver ID'}
                               </button>
 
                               {order.status !== 'rejected' && (
@@ -1139,11 +1129,11 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                 <div className="border-b border-cyan-500/25 pb-4">
                   <h2 className="font-display text-base font-black text-white flex items-center gap-2">
                     <QrCode className="w-5 h-5 text-cyan-400" />
-                    Payment QR Code &amp; Instant UPI Gateway Setup
+                    Payment QR Code &amp; Manual UPI Verification
                   </h2>
                   <p className="text-xs text-slate-300 mt-1">
-                    Upload your custom QR image OR enter your Merchant UPI ID for automatic dynamic
-                    amount QR generation (e.g. ₹49 for 24H Rental ID).
+                    UPI QR payments are sent to {formConfig.upiId}. Orders stay pending until you
+                    confirm the matching payment in that account.
                   </p>
                 </div>
 
@@ -1169,10 +1159,18 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     <input
                       type="text"
                       value={formConfig.upiId}
-                      onChange={(e) => setFormConfig({ ...formConfig, upiId: e.target.value })}
-                      placeholder="roshanbrand.pay@okaxis"
-                      className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-cyan-500/35 text-sm text-white font-mono focus:outline-none focus:ring-2 focus:ring-cyan-400/30 focus:border-cyan-400"
+                      required
+                      minLength={LIMITS.UPI_ID_MIN}
+                      maxLength={LIMITS.UPI_ID_MAX}
+                      pattern={LIMITS.UPI_ID_REGEX.source}
+                      onChange={(e) =>
+                        setFormConfig({ ...formConfig, upiId: e.target.value.trim() })
+                      }
+                      className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-cyan-500/35 text-sm text-cyan-200 font-mono"
                     />
+                    <p className="text-[11px] text-slate-400">
+                      Enter the UPI ID where customer payments should be received.
+                    </p>
                   </div>
 
                   <div className="space-y-1.5">
@@ -1189,61 +1187,16 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                   </div>
                 </div>
 
-                {/* Instant UPI Auto-Verification Toggle */}
-                <div className="p-4 rounded-xl bg-emerald-950/35 border border-emerald-400/40 flex items-center justify-between gap-4">
+                <div className="p-4 rounded-xl bg-amber-950/35 border border-amber-400/40 flex items-center justify-between gap-4">
                   <div className="space-y-0.5">
-                    <div className="flex items-center gap-2 text-xs font-extrabold text-emerald-300">
-                      <Zap className="w-4 h-4 text-emerald-400" />
-                      <span>Instant UPI UTR Auto-Verification &amp; Auto-Dispatch</span>
+                    <div className="flex items-center gap-2 text-xs font-extrabold text-amber-200">
+                      <ShieldCheck className="w-4 h-4 text-amber-300" />
+                      <span>Manual payment confirmation only</span>
                     </div>
                     <p className="text-[11px] text-slate-300 leading-relaxed">
-                      When enabled, valid 12-digit UPI UTR submissions are verified immediately and
-                      receive IRCTC credentials from the Ready Vault on screen without waiting.
+                      Match the exact UTR and amount against a successful credit received at{' '}
+                      {formConfig.upiId} before verifying. A submitted UTR alone is not payment proof.
                     </p>
-                  </div>
-
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setFormConfig((prev) => ({
-                        ...prev,
-                        instantAutoVerify: !prev.instantAutoVerify,
-                      }))
-                    }
-                    className={`px-3.5 py-2 rounded-xl text-xs font-extrabold transition-colors shrink-0 cursor-pointer ${
-                      formConfig.instantAutoVerify
-                        ? 'bg-emerald-500 text-slate-950'
-                        : 'bg-slate-800 text-slate-300 border border-slate-700'
-                    }`}
-                  >
-                    {formConfig.instantAutoVerify ? 'Enabled (Instant)' : 'Manual Only'}
-                  </button>
-                </div>
-
-                <div className="space-y-2">
-                  <label className="block text-xs font-extrabold text-cyan-300">
-                    Upload Custom QR Code Image (Optional)
-                  </label>
-                  <div className="flex flex-wrap items-center gap-3">
-                    <label className="px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-cyan-400/40 text-xs font-bold text-cyan-300 inline-flex items-center gap-2 cursor-pointer">
-                      <Upload className="w-4 h-4" />
-                      <span>Choose QR Image</span>
-                      <input
-                        type="file"
-                        accept="image/*"
-                        onChange={handleQrFileUpload}
-                        className="hidden"
-                      />
-                    </label>
-                    {formConfig.qrCodeUrl && (
-                      <button
-                        type="button"
-                        onClick={() => setFormConfig({ ...formConfig, qrCodeUrl: '' })}
-                        className="px-3 py-2 rounded-xl bg-rose-950/70 hover:bg-rose-900 text-rose-300 border border-rose-500/40 text-xs font-bold cursor-pointer"
-                      >
-                        Remove Custom QR (Use Dynamic UPI QR)
-                      </button>
-                    )}
                   </div>
                 </div>
 
@@ -1254,9 +1207,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                   <textarea
                     rows={2}
                     value={formConfig.instantDeliveryNote}
-                    onChange={(e) =>
-                      setFormConfig({ ...formConfig, instantDeliveryNote: e.target.value })
-                    }
+                    readOnly
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-cyan-500/35 text-xs text-white focus:outline-none focus:border-cyan-400"
                   />
                 </div>
@@ -1268,7 +1219,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                 >
                   <RefreshCw className={`w-4 h-4 ${savingSettings ? 'animate-spin' : ''}`} />
                   <span>
-                    {savingSettings ? 'Saving UPI Settings...' : 'Save UPI & QR Configuration'}
+                    {savingSettings ? 'Saving UPI Settings...' : 'Save UPI Configuration'}
                   </span>
                 </button>
               </form>
@@ -1281,7 +1232,6 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                   upiId={formConfig.upiId}
                   payeeName={formConfig.payeeName}
                   amount={formConfig.priceRental24h || 49}
-                  customQrUrl={formConfig.qrCodeUrl}
                   orderNote="Roshanbrand 24H Rental ID"
                 />
               </div>
@@ -1297,8 +1247,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                   Store Package Pricing &amp; Brand Configuration
                 </h2>
                 <p className="text-xs text-slate-300 mt-1">
-                  Control live pricing for 24-Hour Rental IRCTC IDs (₹49), single IDs, and bulk
-                  packages.
+                  Set one customer rate per ID; all standard and bulk package totals update
+                  automatically from the ID quantity.
                 </p>
               </div>
 
@@ -1313,7 +1263,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                 <h3 className="text-xs font-extrabold uppercase tracking-wider text-cyan-300 mb-3">
                   Package Rates (INR ₹)
                 </h3>
-                <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
                   <div className="p-3.5 rounded-xl bg-emerald-950/60 border border-emerald-400/50 space-y-1">
                     <label className="block text-[11px] font-bold text-emerald-300">
                       24H Rental (₹)
@@ -1334,76 +1284,75 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
 
                   <div className="p-3.5 rounded-xl bg-slate-950/90 border border-cyan-500/35 space-y-1">
                     <label className="block text-[11px] font-bold text-cyan-300">1 ID Pack (₹)</label>
-                    <input
-                      type="number"
-                      min={1}
-                      value={formConfig.price1Id}
-                      onChange={(e) =>
-                        setFormConfig({ ...formConfig, price1Id: Number(e.target.value) })
-                      }
-                      className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-cyan-500/35 text-sm font-black text-white font-mono"
-                    />
+                    <p className="px-2.5 py-1.5 rounded-lg bg-slate-900 border border-cyan-500/35 text-sm font-black text-white font-mono">
+                      ₹{formConfig.priceCustomPerId}
+                    </p>
                   </div>
 
                   <div className="p-3.5 rounded-xl bg-slate-950/90 border border-cyan-500/35 space-y-1">
                     <label className="block text-[11px] font-bold text-cyan-300">2 IDs Pack (₹)</label>
-                    <input
-                      type="number"
-                      min={1}
-                      value={formConfig.price2Id}
-                      onChange={(e) =>
-                        setFormConfig({ ...formConfig, price2Id: Number(e.target.value) })
-                      }
-                      className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-cyan-500/35 text-sm font-black text-white font-mono"
-                    />
+                    <p className="px-2.5 py-1.5 rounded-lg bg-slate-900 border border-cyan-500/35 text-sm font-black text-white font-mono">
+                      ₹{formConfig.priceCustomPerId * 2}
+                    </p>
                   </div>
 
                   <div className="p-3.5 rounded-xl bg-slate-950/90 border border-cyan-500/35 space-y-1">
                     <label className="block text-[11px] font-bold text-cyan-300">5 IDs Pack (₹)</label>
-                    <input
-                      type="number"
-                      min={1}
-                      value={formConfig.price5Id}
-                      onChange={(e) =>
-                        setFormConfig({ ...formConfig, price5Id: Number(e.target.value) })
-                      }
-                      className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-cyan-500/35 text-sm font-black text-white font-mono"
-                    />
+                    <p className="px-2.5 py-1.5 rounded-lg bg-slate-900 border border-cyan-500/35 text-sm font-black text-white font-mono">
+                      ₹{formConfig.priceCustomPerId * 5}
+                    </p>
                   </div>
 
                   <div className="p-3.5 rounded-xl bg-slate-950/90 border border-cyan-500/35 space-y-1">
                     <label className="block text-[11px] font-bold text-cyan-300">
                       10 IDs Pack (₹)
                     </label>
-                    <input
-                      type="number"
-                      min={1}
-                      value={formConfig.price10Id}
-                      onChange={(e) =>
-                        setFormConfig({ ...formConfig, price10Id: Number(e.target.value) })
-                      }
-                      className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-cyan-500/35 text-sm font-black text-white font-mono"
-                    />
+                    <p className="px-2.5 py-1.5 rounded-lg bg-slate-900 border border-cyan-500/35 text-sm font-black text-white font-mono">
+                      ₹{formConfig.priceCustomPerId * 10}
+                    </p>
                   </div>
 
-                  <div className="p-3.5 rounded-xl bg-slate-950/90 border border-cyan-500/35 space-y-1">
-                    <label className="block text-[11px] font-bold text-cyan-300">
-                      Bulk Per ID (₹)
+                  <div className="p-3.5 rounded-xl bg-emerald-950/50 border border-emerald-400/40 space-y-1">
+                    <label className="block text-[11px] font-bold text-emerald-300">
+                      7 Days Guarantee Per ID (₹)
                     </label>
                     <input
                       type="number"
                       min={1}
-                      value={formConfig.priceBulkPerId}
+                      max={100000}
+                      value={formConfig.price7DayGuaranteePerId}
                       onChange={(e) =>
-                        setFormConfig({ ...formConfig, priceBulkPerId: Number(e.target.value) })
+                        setFormConfig({
+                          ...formConfig,
+                          price7DayGuaranteePerId: Number(e.target.value),
+                        })
                       }
-                      className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-cyan-500/35 text-sm font-black text-white font-mono"
+                      className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-emerald-400/40 text-sm font-black text-white font-mono"
+                    />
+                  </div>
+
+                  <div className="p-3.5 rounded-xl bg-emerald-950/50 border border-emerald-400/40 space-y-1">
+                    <label className="block text-[11px] font-bold text-emerald-300">
+                      1 Month Guarantee Per ID (₹)
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={100000}
+                      value={formConfig.price1MonthGuaranteePerId}
+                      onChange={(e) =>
+                        setFormConfig({
+                          ...formConfig,
+                          price1MonthGuaranteePerId: Number(e.target.value),
+                        })
+                      }
+                      className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-emerald-400/40 text-sm font-black text-white font-mono"
                     />
                   </div>
 
                   <div className="p-3.5 rounded-xl bg-slate-950/90 border border-cyan-500/35 space-y-1">
                     <label className="block text-[11px] font-bold text-cyan-300">
-                      Custom Per ID (₹)
+                      Customer Per ID (₹)
                     </label>
                     <input
                       type="number"
@@ -1433,35 +1382,44 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
 
                 <div className="space-y-1.5">
                   <label className="block text-xs font-extrabold text-cyan-300">
-                    Permanent IDs Stock Counter
+                    Permanent IDs Display Counter
                   </label>
                   <input
                     type="number"
                     min={0}
-                    value={formConfig.stockAvailable}
+                    value={formConfig.stockDisplayAvailable}
                     onChange={(e) =>
-                      setFormConfig({ ...formConfig, stockAvailable: Number(e.target.value) })
+                      setFormConfig({
+                        ...formConfig,
+                        stockDisplayAvailable: Number(e.target.value),
+                      })
                     }
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-cyan-500/35 text-sm text-emerald-400 font-mono font-black"
                   />
+                  <p className="text-[11px] text-slate-400">
+                    Manual display count; orders and Vault changes will not alter it.
+                  </p>
                 </div>
 
                 <div className="space-y-1.5">
                   <label className="block text-xs font-extrabold text-emerald-300">
-                    24H Rental IDs Stock Counter
+                    24H Rental IDs Display Counter
                   </label>
                   <input
                     type="number"
                     min={0}
-                    value={formConfig.rentalStockAvailable}
+                    value={formConfig.rentalStockDisplayAvailable}
                     onChange={(e) =>
                       setFormConfig({
                         ...formConfig,
-                        rentalStockAvailable: Number(e.target.value),
+                        rentalStockDisplayAvailable: Number(e.target.value),
                       })
                     }
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-emerald-500/40 text-sm text-emerald-400 font-mono font-black"
                   />
+                  <p className="text-[11px] text-slate-400">
+                    Manual display count; orders and Vault changes will not alter it.
+                  </p>
                 </div>
 
                 <div className="space-y-1.5">
@@ -1489,6 +1447,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     onChange={(e) =>
                       setFormConfig({ ...formConfig, announcementText: e.target.value })
                     }
+                    placeholder="Leave blank to hide the banner"
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-cyan-500/35 text-sm text-white"
                   />
                 </div>
@@ -1552,7 +1511,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                           presetRentalCredentials: e.target.value,
                         })
                       }
-                      placeholder="Username: roshan_rent24_vip | Password: Tatkal@2499 | TxnPin: 4412"
+                      placeholder="Username: roshan_rent24_vip | Password: Tatkal@2499"
                       className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-emerald-400/40 text-xs text-white font-mono focus:outline-none focus:border-emerald-400"
                     />
                   </div>
@@ -1570,7 +1529,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                           presetPermanentCredentials: e.target.value,
                         })
                       }
-                      placeholder="Username: rb_irctc_vip801 | Password: RailPass@801 | TxnPin: 1928"
+                      placeholder="Username: rb_irctc_vip801 | Password: RailPass@801"
                       className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-cyan-500/35 text-xs text-white font-mono focus:outline-none focus:border-cyan-400"
                     />
                   </div>

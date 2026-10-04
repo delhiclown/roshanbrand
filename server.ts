@@ -6,7 +6,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 import { DEFAULT_STORE_CONFIG, LIMITS } from './src/constants.ts';
-import { OrderRecord, PackType, StoreConfig, VaultItem } from './src/types.ts';
+import { OrderRecord, PackType, StoreConfig, VaultItem, VaultPoolType } from './src/types.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -32,19 +32,19 @@ interface PersistedDatabase {
 function buildInitialVault(): VaultItem[] {
   const now = new Date().toISOString();
   const rentalAccounts = [
-    { u: 'roshan_rent24_101', p: 'Tatkal@2491', note: '24H Active Rental · TxnPin: 4412 · Aadhaar Verified' },
-    { u: 'roshan_rent24_102', p: 'Tatkal@2492', note: '24H Active Rental · TxnPin: 8821 · Aadhaar Verified' },
-    { u: 'roshan_rent24_103', p: 'Tatkal@2493', note: '24H Active Rental · TxnPin: 3190 · Aadhaar Verified' },
-    { u: 'roshan_rent24_104', p: 'Tatkal@2494', note: '24H Active Rental · TxnPin: 7745 · Aadhaar Verified' },
-    { u: 'roshan_rent24_105', p: 'Tatkal@2495', note: '24H Active Rental · TxnPin: 5562 · Aadhaar Verified' },
-    { u: 'roshan_rent24_106', p: 'Tatkal@2496', note: '24H Active Rental · TxnPin: 9014 · Aadhaar Verified' },
+    { u: 'roshan_rent24_101', p: 'Tatkal@2491', note: '24H Active Rental · Aadhaar Verified' },
+    { u: 'roshan_rent24_102', p: 'Tatkal@2492', note: '24H Active Rental · Aadhaar Verified' },
+    { u: 'roshan_rent24_103', p: 'Tatkal@2493', note: '24H Active Rental · Aadhaar Verified' },
+    { u: 'roshan_rent24_104', p: 'Tatkal@2494', note: '24H Active Rental · Aadhaar Verified' },
+    { u: 'roshan_rent24_105', p: 'Tatkal@2495', note: '24H Active Rental · Aadhaar Verified' },
+    { u: 'roshan_rent24_106', p: 'Tatkal@2496', note: '24H Active Rental · Aadhaar Verified' },
   ];
 
   const permanentAccounts = [
-    { u: 'rb_irctc_vip801', p: 'RailPass@801', note: 'Permanent Aadhaar Verified · TxnPin: 1928' },
-    { u: 'rb_irctc_vip802', p: 'RailPass@802', note: 'Permanent Aadhaar Verified · TxnPin: 6451' },
-    { u: 'rb_irctc_vip803', p: 'RailPass@803', note: 'Permanent Aadhaar Verified · TxnPin: 7309' },
-    { u: 'rb_irctc_vip804', p: 'RailPass@804', note: 'Permanent Aadhaar Verified · TxnPin: 5182' },
+    { u: 'rb_irctc_vip801', p: 'RailPass@801', note: 'Permanent Aadhaar Verified' },
+    { u: 'rb_irctc_vip802', p: 'RailPass@802', note: 'Permanent Aadhaar Verified' },
+    { u: 'rb_irctc_vip803', p: 'RailPass@803', note: 'Permanent Aadhaar Verified' },
+    { u: 'rb_irctc_vip804', p: 'RailPass@804', note: 'Permanent Aadhaar Verified' },
   ];
 
   const items: VaultItem[] = [];
@@ -106,6 +106,10 @@ function loadDb(): PersistedDatabase {
         storeConfig: {
           ...DEFAULT_STORE_CONFIG,
           ...savedStoreConfig,
+          priceRental24h: normalizePrice(
+            savedStoreConfig.priceRental24h,
+            DEFAULT_STORE_CONFIG.priceRental24h
+          ),
           priceCustomPerId: customerPerId,
           price1Id: customerPerId,
           price2Id: customerPerId * 2,
@@ -162,7 +166,12 @@ function loadDb(): PersistedDatabase {
           ),
         },
         orders,
-        vault: Array.isArray(parsed.vault) ? parsed.vault : buildInitialVault(),
+        vault: Array.isArray(parsed.vault)
+          ? parsed.vault.map((item) => ({
+              ...item,
+              accountNote: sanitizeVaultNote(String(item.accountNote || '')),
+            }))
+          : buildInitialVault(),
         utrIndex: verifiedUtrIndex,
       };
     }
@@ -197,6 +206,13 @@ function normalizeStock(value: unknown, fallback: number): number {
     : fallback;
 }
 
+function normalizePrice(value: unknown, fallback: number): number {
+  const price = Number(value);
+  return Number.isFinite(price) && price >= 1
+    ? Math.min(100000, Math.floor(price))
+    : fallback;
+}
+
 function normalizeUpiId(value: unknown, fallback: string): string {
   const upiId = String(value ?? '').trim();
   return upiId.length >= LIMITS.UPI_ID_MIN &&
@@ -204,6 +220,35 @@ function normalizeUpiId(value: unknown, fallback: string): string {
     LIMITS.UPI_ID_REGEX.test(upiId)
     ? upiId
     : fallback;
+}
+
+function getVaultPoolForPackType(packType: PackType): VaultPoolType {
+  if (packType === 'rental_24h') return 'rental_24h';
+  if (packType === 'guarantee_7days') return 'guarantee_7days';
+  if (packType === 'guarantee_1month') return 'guarantee_1month';
+  return 'permanent';
+}
+
+function getVaultPoolLabel(poolType: VaultPoolType): string {
+  switch (poolType) {
+    case 'rental_24h':
+      return '24H Rental';
+    case 'guarantee_7days':
+      return '7 Days Guarantee';
+    case 'guarantee_1month':
+      return '1 Month Guarantee';
+    default:
+      return 'Permanent';
+  }
+}
+
+function sanitizeVaultNote(note: string): string {
+  return note
+    .split(/[|·]/)
+    .filter((part) => !/^\s*(?:Txn)?Pin\s*:/i.test(part))
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .join(' · ');
 }
 
 function sanitizeDeliveredCredentials(credentials: string): string {
@@ -214,7 +259,7 @@ function sanitizeDeliveredCredentials(credentials: string): string {
         .split(/[|·]/)
         .filter(
           (part) =>
-            !/^\s*TxnPin\s*:/i.test(part) &&
+            !/^\s*(?:Txn)?Pin\s*:/i.test(part) &&
             !/^\s*24H Active Rental\s*$/i.test(part)
         )
         .map((part) => part.trim())
@@ -264,54 +309,34 @@ function broadcastStateUpdate(eventType: string, _payload?: unknown) {
  */
 function allocateCredentials(
   quantity: number,
-  isRental24h: boolean,
+  packType: PackType,
   orderId: string
-): string {
-  const targetPool = isRental24h ? 'rental_24h' : 'permanent';
+): string | null {
+  const targetPool = getVaultPoolForPackType(packType);
   const availableInPool = db.vault.filter(
-    (v) => !v.isAssigned && v.poolType === targetPool
+    (v) =>
+      !v.isAssigned &&
+      v.poolType === targetPool &&
+      (!v.reservedOrderId || v.reservedOrderId === orderId)
   );
-  const allInPool = db.vault.filter((v) => v.poolType === targetPool);
-
-  const presetMaster = isRental24h
-    ? (db.storeConfig.presetRentalCredentials || '').trim()
-    : (db.storeConfig.presetPermanentCredentials || '').trim();
-
-  const presetLines = presetMaster
-    .split('\n')
-    .map((l) => l.trim())
-    .filter(Boolean);
+  if (availableInPool.length < quantity) {
+    return null;
+  }
 
   const allocatedLines: string[] = [];
   const now = new Date().toISOString();
 
   for (let i = 0; i < quantity; i++) {
     const vaultItem = availableInPool[i];
-    if (vaultItem) {
-      vaultItem.isAssigned = true;
-      vaultItem.assignedOrderId = orderId;
-      vaultItem.updatedAt = now;
-      allocatedLines.push(
-        `Username: ${vaultItem.irctcUsername} | Password: ${vaultItem.irctcPassword}${
-          vaultItem.accountNote ? ` | ${vaultItem.accountNote}` : ''
-        }`
-      );
-    } else if (presetLines.length > 0) {
-      allocatedLines.push(presetLines[i % presetLines.length]);
-    } else if (allInPool.length > 0) {
-      const fallbackVault = allInPool[i % allInPool.length];
-      allocatedLines.push(
-        `Username: ${fallbackVault.irctcUsername} | Password: ${fallbackVault.irctcPassword}${
-          fallbackVault.accountNote ? ` | ${fallbackVault.accountNote}` : ''
-        }`
-      );
-    } else {
-      allocatedLines.push(
-        isRental24h
-          ? DEFAULT_STORE_CONFIG.presetRentalCredentials!
-          : DEFAULT_STORE_CONFIG.presetPermanentCredentials!
-      );
-    }
+    vaultItem.isAssigned = true;
+    vaultItem.assignedOrderId = orderId;
+    vaultItem.reservedOrderId = undefined;
+    vaultItem.updatedAt = now;
+    allocatedLines.push(
+      `Username: ${vaultItem.irctcUsername} | Password: ${vaultItem.irctcPassword}${
+        vaultItem.accountNote ? ` | ${vaultItem.accountNote}` : ''
+      }`
+    );
   }
 
   return allocatedLines.join('\n');
@@ -532,7 +557,23 @@ async function startServer() {
   // Public Store Config
   app.get('/api/store', (_req, res) => {
     res.setHeader('Cache-Control', 'no-store');
-    res.json({ storeConfig: db.storeConfig });
+    const vaultStock = {
+      permanent: db.vault.filter(
+        (item) => item.poolType === 'permanent' && !item.isAssigned && !item.reservedOrderId
+      ).length,
+      rental_24h: db.vault.filter(
+        (item) => item.poolType === 'rental_24h' && !item.isAssigned && !item.reservedOrderId
+      ).length,
+      guarantee_7days: db.vault.filter(
+        (item) =>
+          item.poolType === 'guarantee_7days' && !item.isAssigned && !item.reservedOrderId
+      ).length,
+      guarantee_1month: db.vault.filter(
+        (item) =>
+          item.poolType === 'guarantee_1month' && !item.isAssigned && !item.reservedOrderId
+      ).length,
+    };
+    res.json({ storeConfig: db.storeConfig, vaultStock });
   });
 
   // Update Store Config
@@ -581,9 +622,9 @@ async function startServer() {
       price5Id: customerPerId * 5,
       price10Id: customerPerId * 10,
       priceBulkPerId: customerPerId,
-      priceRental24h: Math.max(
-        1,
-        Math.min(100000, Math.floor(Number(body.priceRental24h) || 49))
+      priceRental24h: normalizePrice(
+        body.priceRental24h,
+        db.storeConfig.priceRental24h
       ),
       price7DayGuaranteePerId: Math.max(
         1,
@@ -702,7 +743,14 @@ async function startServer() {
           : packType === 'guarantee_1month'
             ? db.storeConfig.stock1MonthGuaranteeAvailable
             : db.storeConfig.stockDisplayAvailable;
-    if (quantity > availableStock) {
+    const targetPool = getVaultPoolForPackType(packType);
+    const availableVaultItems = db.vault.filter(
+      (item) =>
+        !item.isAssigned &&
+        item.poolType === targetPool &&
+        !item.reservedOrderId
+    );
+    if (quantity > availableStock || quantity > availableVaultItems.length) {
       res.status(409).json({ error: 'Not enough stock is available for this package.' });
       return;
     }
@@ -803,6 +851,10 @@ async function startServer() {
       updatedAt: nowIso,
     };
 
+    for (const item of availableVaultItems.slice(0, quantity)) {
+      item.reservedOrderId = orderId;
+      item.updatedAt = nowIso;
+    }
     db.orders.unshift(newOrder);
     saveDb(db);
 
@@ -856,13 +908,54 @@ async function startServer() {
     }
 
     let creds = String(req.body?.deliveredCredentials || '').trim();
-    // If Admin clicked 1-Click Verify without typing anything, automatically allocate from Ready ID Vault!
-    if (creds.length < 3) {
-      creds = allocateCredentials(
-        order.quantity,
-        Boolean(order.isRental24h),
-        order.orderId
-      );
+    const targetPool = getVaultPoolForPackType(order.packType);
+    if (creds) {
+      const credentialLines = creds.split('\n').map((line: string) => line.trim()).filter(Boolean);
+      const matchedItems = credentialLines.map((line: string) => {
+        const username = (line.split(/[|:,]/)[0] || '').replace(/^Username:\s*/i, '').trim();
+        return db.vault.find(
+          (item) =>
+            item.poolType === targetPool &&
+            item.irctcUsername === username &&
+            ((!item.isAssigned && (!item.reservedOrderId || item.reservedOrderId === order.orderId)) ||
+              item.assignedOrderId === order.orderId)
+        );
+      });
+      if (
+        credentialLines.length !== order.quantity ||
+        matchedItems.some((item) => !item) ||
+        new Set(matchedItems.map((item) => item?.vaultId)).size !== order.quantity
+      ) {
+        res.status(409).json({
+          error: `This order requires ${order.quantity} available ID(s) from the ${getVaultPoolLabel(targetPool)} pool only.`,
+        });
+        return;
+      }
+      const now = new Date().toISOString();
+      const actualCredentialLines: string[] = [];
+      for (const item of matchedItems) {
+        if (item) {
+          item.isAssigned = true;
+          item.assignedOrderId = order.orderId;
+          item.reservedOrderId = undefined;
+          item.updatedAt = now;
+          actualCredentialLines.push(
+            `Username: ${item.irctcUsername} | Password: ${item.irctcPassword}${
+              item.accountNote ? ` | ${item.accountNote}` : ''
+            }`
+          );
+        }
+      }
+      creds = actualCredentialLines.join('\n');
+    } else {
+      const allocated = allocateCredentials(order.quantity, order.packType, order.orderId);
+      if (allocated === null) {
+        res.status(409).json({
+          error: `Not enough unassigned IDs in the ${getVaultPoolLabel(targetPool)} pool. Add more IDs to that pool before delivery.`,
+        });
+        return;
+      }
+      creds = allocated;
     }
 
     const now = new Date();
@@ -880,15 +973,6 @@ async function startServer() {
     order.adminNote = order.isRental24h
       ? `Admin Verified UTR #${order.utrNumber} · Ready Vault 24H Rental ID Sent`
       : `Admin Verified UTR #${order.utrNumber} · Ready Vault ID Sent`;
-
-    // Mark matching vault usernames as assigned
-    for (const v of db.vault) {
-      if (!v.isAssigned && creds.includes(v.irctcUsername)) {
-        v.isAssigned = true;
-        v.assignedOrderId = order.orderId;
-        v.updatedAt = now.toISOString();
-      }
-    }
 
     db.utrIndex[order.utrNumber] = order.orderId;
     saveDb(db);
@@ -909,6 +993,12 @@ async function startServer() {
     order.adminNote =
       'Payment UTR could not be verified. Please contact support with payment screenshot.';
     order.updatedAt = new Date().toISOString();
+    for (const item of db.vault) {
+      if (item.reservedOrderId === order.orderId) {
+        item.reservedOrderId = undefined;
+        item.updatedAt = order.updatedAt;
+      }
+    }
     saveDb(db);
     broadcastStateUpdate('order_rejected', { order });
 
@@ -920,6 +1010,13 @@ async function startServer() {
     const { orderId } = req.params;
     const idx = db.orders.findIndex((o) => o.orderId === orderId);
     if (idx !== -1) {
+      const deletedOrder = db.orders[idx];
+      for (const item of db.vault) {
+        if (item.reservedOrderId === deletedOrder.orderId) {
+          item.reservedOrderId = undefined;
+          item.updatedAt = new Date().toISOString();
+        }
+      }
       const [removed] = db.orders.splice(idx, 1);
       if (removed && db.utrIndex[removed.utrNumber] === orderId) {
         delete db.utrIndex[removed.utrNumber];
@@ -934,8 +1031,24 @@ async function startServer() {
   app.post('/api/admin/vault', (req, res) => {
     const lines: string[] = Array.isArray(req.body?.lines) ? req.body.lines : [];
     const batchNote = String(req.body?.accountNote || '').trim();
-    const poolType: 'permanent' | 'rental_24h' =
-      req.body?.poolType === 'rental_24h' ? 'rental_24h' : 'permanent';
+    const poolTypes: VaultPoolType[] = [
+      'permanent',
+      'rental_24h',
+      'guarantee_7days',
+      'guarantee_1month',
+    ];
+    const requestedPoolType = req.body?.poolType;
+    if (
+      requestedPoolType !== undefined &&
+      !poolTypes.includes(requestedPoolType as VaultPoolType)
+    ) {
+      res.status(400).json({ error: 'Invalid vault pool type.' });
+      return;
+    }
+    const poolType: VaultPoolType =
+      requestedPoolType === undefined
+        ? 'permanent'
+        : (requestedPoolType as VaultPoolType);
 
     const now = new Date().toISOString();
     let addedCount = 0;
@@ -950,11 +1063,17 @@ async function startServer() {
         .filter(Boolean);
       const username = (parts[0] || line).slice(0, 80);
       const password = (parts[1] || 'Pass@123').slice(0, 80);
-      const extraNote = parts.slice(2).join(' | ');
+      const extraNote = sanitizeVaultNote(parts.slice(2).join(' | '));
       const combinedNote = [
-        batchNote,
+        sanitizeVaultNote(batchNote),
         extraNote,
-        poolType === 'rental_24h' ? '24H Active Rental' : 'Aadhaar Verified',
+        poolType === 'rental_24h'
+          ? '24H Active Rental'
+          : poolType === 'guarantee_7days'
+            ? '7 Days Guarantee'
+            : poolType === 'guarantee_1month'
+              ? '1 Month Guarantee'
+              : 'Aadhaar Verified',
       ]
         .filter(Boolean)
         .join(' · ')
@@ -993,7 +1112,7 @@ async function startServer() {
           db.storeConfig.rentalStockAvailable + addedCount;
         // Also update the default Pre-Set Rental ID to the latest added ID so it's always ready!
         db.storeConfig.presetRentalCredentials = formattedAddedLines[0];
-      } else {
+      } else if (poolType === 'permanent') {
         db.storeConfig.stockAvailable += addedCount;
         db.storeConfig.presetPermanentCredentials = formattedAddedLines[0];
       }

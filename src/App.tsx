@@ -30,7 +30,7 @@ import { Dashboard } from '../components/Dashboard';
 import { DeliveredOrderDetails } from '../components/DeliveredOrderDetails';
 import { buildDynamicUpiUri } from '../components/UpiQrBox';
 import { DEFAULT_STORE_CONFIG, LIMITS } from './constants';
-import { CheckoutDraft, OrderRecord, PackType, StoreConfig } from './types';
+import { CheckoutDraft, OrderRecord, PackType, StoreConfig, VaultPoolType } from './types';
 
 interface ProductOption {
   id: string;
@@ -50,6 +50,12 @@ export default function App() {
     window.location.pathname.startsWith('/dashboard') ? 'dashboard' : 'store'
   );
   const [storeConfig, setStoreConfig] = useState<StoreConfig>(DEFAULT_STORE_CONFIG);
+  const [vaultStock, setVaultStock] = useState<Record<VaultPoolType, number>>({
+    permanent: 0,
+    rental_24h: 0,
+    guarantee_7days: 0,
+    guarantee_1month: 0,
+  });
   const [storeConfigLoaded, setStoreConfigLoaded] = useState(false);
 
   // Open a product by default so checkout options are immediately visible.
@@ -100,7 +106,17 @@ export default function App() {
         if (!res.ok) return;
         const data = await res.json();
         if (data.storeConfig) {
+          const normalizeVaultStock = (value: unknown) =>
+            typeof value === 'number' && Number.isFinite(value)
+              ? Math.max(0, Math.floor(value))
+              : 0;
           setStoreConfig({ ...DEFAULT_STORE_CONFIG, ...data.storeConfig });
+          setVaultStock({
+            permanent: normalizeVaultStock(data.vaultStock?.permanent),
+            rental_24h: normalizeVaultStock(data.vaultStock?.rental_24h),
+            guarantee_7days: normalizeVaultStock(data.vaultStock?.guarantee_7days),
+            guarantee_1month: normalizeVaultStock(data.vaultStock?.guarantee_1month),
+          });
           setStoreConfigLoaded(true);
         }
       } catch {
@@ -235,13 +251,21 @@ export default function App() {
     LIMITS.QUANTITY_MIN,
     Math.min(LIMITS.QUANTITY_MAX, Number(quantity) || 1)
   );
-  const activeStockCount = activeProduct.isRental24h
+  const configuredActiveStock = activeProduct.isRental24h
     ? displayedRentalStock
     : activeProduct.isSevenDayGuarantee
       ? storeConfig.stock7DayGuaranteeAvailable
       : activeProduct.isOneMonthGuarantee
         ? storeConfig.stock1MonthGuaranteeAvailable
         : displayedPermanentStock;
+  const activeVaultStock = activeProduct.isRental24h
+    ? vaultStock.rental_24h
+    : activeProduct.isSevenDayGuarantee
+      ? vaultStock.guarantee_7days
+      : activeProduct.isOneMonthGuarantee
+        ? vaultStock.guarantee_1month
+        : vaultStock.permanent;
+  const activeStockCount = Math.min(configuredActiveStock, activeVaultStock);
   const hasEnoughStock = storeConfigLoaded && safeQty <= activeStockCount;
   const totalPayable = calculateTotal(
     safeQty,
@@ -741,13 +765,21 @@ export default function App() {
               {productOptions.map((option) => {
                 const isOpen = openCardId === option.id;
                 const unitPrice = Number(storeConfig[option.unitPriceKey]) || 49;
-                const stockCount = option.isRental24h
+                const configuredStockCount = option.isRental24h
                   ? displayedRentalStock
                   : option.isSevenDayGuarantee
                     ? storeConfig.stock7DayGuaranteeAvailable
                     : option.isOneMonthGuarantee
                       ? storeConfig.stock1MonthGuaranteeAvailable
                       : displayedPermanentStock;
+                const availableVaultStock = option.isRental24h
+                  ? vaultStock.rental_24h
+                  : option.isSevenDayGuarantee
+                    ? vaultStock.guarantee_7days
+                    : option.isOneMonthGuarantee
+                      ? vaultStock.guarantee_1month
+                      : vaultStock.permanent;
+                const stockCount = Math.min(configuredStockCount, availableVaultStock);
                 const isOutOfStock = stockCount <= 0;
 
                 return (

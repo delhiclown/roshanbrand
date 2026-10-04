@@ -23,7 +23,7 @@ import {
   Zap,
 } from 'lucide-react';
 import { LIMITS } from '../src/constants';
-import { OrderRecord, StoreConfig, VaultItem } from '../src/types';
+import { OrderRecord, StoreConfig, VaultItem, VaultPoolType } from '../src/types';
 import { UpiQrBox } from './UpiQrBox';
 
 interface AdminPortalProps {
@@ -33,6 +33,26 @@ interface AdminPortalProps {
 }
 
 type AdminTab = 'orders' | 'qr_settings' | 'site_settings' | 'inventory' | 'security';
+
+function getOrderVaultPool(order: OrderRecord): VaultPoolType {
+  if (order.packType === 'rental_24h') return 'rental_24h';
+  if (order.packType === 'guarantee_7days') return 'guarantee_7days';
+  if (order.packType === 'guarantee_1month') return 'guarantee_1month';
+  return 'permanent';
+}
+
+function getVaultPoolLabel(poolType: VaultPoolType): string {
+  switch (poolType) {
+    case 'rental_24h':
+      return '24H Rental';
+    case 'guarantee_7days':
+      return '7 Days Guarantee';
+    case 'guarantee_1month':
+      return '1 Month Guarantee';
+    default:
+      return 'Permanent';
+  }
+}
 
 export const AdminPortal: React.FC<AdminPortalProps> = ({
   storeConfig,
@@ -50,10 +70,22 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
 
   const [newVaultText, setNewVaultText] = useState('');
   const [newVaultNote, setNewVaultNote] = useState('');
-  const [newVaultPool, setNewVaultPool] = useState<'permanent' | 'rental_24h'>('rental_24h');
+  const [newVaultPool, setNewVaultPool] = useState<VaultPoolType>('rental_24h');
   const [addingVault, setAddingVault] = useState(false);
+  const [orderErrors, setOrderErrors] = useState<Record<string, string>>({});
 
   const [formConfig, setFormConfig] = useState<StoreConfig>(storeConfig);
+  const [rentalPriceInput, setRentalPriceInput] = useState(
+    String(storeConfig.priceRental24h)
+  );
+  const [stockInputs, setStockInputs] = useState({
+    stockDisplayAvailable: String(storeConfig.stockDisplayAvailable),
+    rentalStockDisplayAvailable: String(storeConfig.rentalStockDisplayAvailable),
+    stock7DayGuaranteeAvailable: String(storeConfig.stock7DayGuaranteeAvailable),
+    stock1MonthGuaranteeAvailable: String(storeConfig.stock1MonthGuaranteeAvailable),
+  });
+  const [dirtyStockInputs, setDirtyStockInputs] = useState<Record<string, boolean>>({});
+  const [supportHandleDirty, setSupportHandleDirty] = useState(false);
   const previousStoreConfig = useRef(storeConfig);
   const [savingSettings, setSavingSettings] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState('');
@@ -81,9 +113,29 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     let formChanged = false;
 
     for (const key of Object.keys(storeConfig) as (keyof StoreConfig)[]) {
+      if (key === 'supportHandle' && supportHandleDirty) {
+        continue;
+      }
+      if (dirtyStockInputs[key] && key in stockInputs) {
+        continue;
+      }
       if (Object.is(formConfig[key], previousConfig[key])) {
         Object.assign(nextFormConfig, { [key]: storeConfig[key] });
         formChanged ||= !Object.is(formConfig[key], storeConfig[key]);
+        if (key === 'priceRental24h') {
+          setRentalPriceInput(String(storeConfig.priceRental24h));
+        }
+        if (
+          key === 'stockDisplayAvailable' ||
+          key === 'rentalStockDisplayAvailable' ||
+          key === 'stock7DayGuaranteeAvailable' ||
+          key === 'stock1MonthGuaranteeAvailable'
+        ) {
+          setStockInputs((current) => ({
+            ...current,
+            [key]: String(storeConfig[key]),
+          }));
+        }
       }
     }
 
@@ -91,7 +143,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     if (formChanged) {
       setFormConfig(nextFormConfig);
     }
-  }, [storeConfig]);
+  }, [storeConfig, dirtyStockInputs, supportHandleDirty]);
 
   useEffect(() => {
     const checkAuth = async () => {
@@ -154,6 +206,24 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
 
   const handleSaveSettings = async (e?: React.FormEvent) => {
     e?.preventDefault();
+    const rentalPrice = Number(rentalPriceInput);
+    if (!Number.isInteger(rentalPrice) || rentalPrice < 1 || rentalPrice > 100000) {
+      setSaveError('24H Rental price must be a whole number between ₹1 and ₹100,000.');
+      setSaveSuccess('');
+      return;
+    }
+    const stockValues = Object.fromEntries(
+      Object.entries(stockInputs).map(([key, value]) => [key, Number(value)])
+    ) as Record<keyof typeof stockInputs, number>;
+    for (const [key, value] of Object.entries(stockValues)) {
+      if (!/^\d+$/.test(stockInputs[key as keyof typeof stockInputs]) ||
+          !Number.isInteger(value) || value < 0 || value > 100000) {
+        setSaveError('All stock values must be whole numbers between 0 and 100,000.');
+        setSaveSuccess('');
+        return;
+      }
+    }
+
     setSavingSettings(true);
     setSaveSuccess('');
     setSaveError('');
@@ -162,13 +232,26 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
       const res = await fetch('/api/store', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(formConfig),
+        body: JSON.stringify({
+          ...formConfig,
+          ...stockValues,
+          priceRental24h: rentalPrice,
+        }),
       });
       const data = await res.json();
       if (!res.ok) {
         setSaveError(data.error || 'Failed to update settings');
       } else {
         setFormConfig(data.storeConfig);
+        setRentalPriceInput(String(data.storeConfig.priceRental24h));
+        setStockInputs({
+          stockDisplayAvailable: String(data.storeConfig.stockDisplayAvailable),
+          rentalStockDisplayAvailable: String(data.storeConfig.rentalStockDisplayAvailable),
+          stock7DayGuaranteeAvailable: String(data.storeConfig.stock7DayGuaranteeAvailable),
+          stock1MonthGuaranteeAvailable: String(data.storeConfig.stock1MonthGuaranteeAvailable),
+        });
+        setDirtyStockInputs({});
+        setSupportHandleDirty(false);
         onConfigUpdated(data.storeConfig);
         setSaveSuccess(
           `Settings saved. 7 Days: ${data.storeConfig.stock7DayGuaranteeAvailable} IDs · 1 Month: ${data.storeConfig.stock1MonthGuaranteeAvailable} IDs.`
@@ -183,14 +266,22 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   };
 
   const handleAutoFillFromVault = (order: OrderRecord) => {
-    const targetPool = order.isRental24h ? 'rental_24h' : 'permanent';
+    const targetPool = getOrderVaultPool(order);
     const available = vault.filter(
-      (v) => !v.isAssigned && (v.poolType === targetPool || !v.poolType)
+      (v) =>
+        !v.isAssigned &&
+        v.poolType === targetPool &&
+        (!v.reservedOrderId || v.reservedOrderId === order.orderId)
     );
-    const fallbackAvailable = available.length > 0 ? available : vault.filter((v) => !v.isAssigned);
-    if (fallbackAvailable.length === 0) return;
+    if (available.length < order.quantity) {
+      setOrderErrors((prev) => ({
+        ...prev,
+        [order.orderId]: `This order needs ${order.quantity} ID(s) from the ${getVaultPoolLabel(targetPool)} pool; ${available.length} available.`,
+      }));
+      return;
+    }
 
-    const lines = fallbackAvailable
+    const lines = available
       .slice(0, order.quantity)
       .map(
         (v) =>
@@ -200,17 +291,15 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
       )
       .join('\n');
 
+    setOrderErrors((prev) => ({ ...prev, [order.orderId]: '' }));
     setCredDrafts((prev) => ({ ...prev, [order.orderId]: lines }));
   };
 
   const handleVerifyOrder = async (order: OrderRecord) => {
-    const fallbackPreset = order.isRental24h
-      ? storeConfig.presetRentalCredentials || ''
-      : storeConfig.presetPermanentCredentials || '';
     const credentials = (
       credDrafts[order.orderId] ??
       order.deliveredCredentials ??
-      fallbackPreset
+      ''
     ).trim();
 
     setBusyOrderId(order.orderId);
@@ -221,8 +310,20 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
         body: JSON.stringify({ deliveredCredentials: credentials }),
       });
       if (res.ok) {
+        setOrderErrors((prev) => ({ ...prev, [order.orderId]: '' }));
         await fetchAdminState();
+      } else {
+        const data = await res.json();
+        setOrderErrors((prev) => ({
+          ...prev,
+          [order.orderId]: data.error || 'Could not deliver credentials for this order.',
+        }));
       }
+    } catch {
+      setOrderErrors((prev) => ({
+        ...prev,
+        [order.orderId]: 'Could not connect to the server. Please try again.',
+      }));
     } finally {
       setBusyOrderId(null);
     }
@@ -396,7 +497,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   const verifiedRevenue = orders
     .filter((o) => o.status === 'verified_delivered')
     .reduce((sum, o) => sum + (o.totalAmount || 0), 0);
-  const readyVaultCount = vault.filter((v) => !v.isAssigned).length;
+  const readyVaultCount = vault.filter((v) => !v.isAssigned && !v.reservedOrderId).length;
 
   const filteredOrders = orders.filter((o) => {
     if (statusFilter !== 'all' && o.status !== statusFilter) return false;
@@ -948,12 +1049,16 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
               ) : (
                 <div className="space-y-4">
                   {filteredOrders.map((order) => {
-                    const fallbackPreset = order.isRental24h
-                      ? storeConfig.presetRentalCredentials || ''
-                      : storeConfig.presetPermanentCredentials || '';
+                    const orderPool = getOrderVaultPool(order);
+                    const orderPoolAvailable = vault.filter(
+                      (item) =>
+                        !item.isAssigned &&
+                        item.poolType === orderPool &&
+                        (!item.reservedOrderId || item.reservedOrderId === order.orderId)
+                    ).length;
                     const draftText =
                       credDrafts[order.orderId] === undefined
-                        ? order.deliveredCredentials || fallbackPreset
+                        ? order.deliveredCredentials || ''
                         : credDrafts[order.orderId];
 
                     return (
@@ -1060,14 +1165,14 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                                 IRCTC ID &amp; Password ({order.quantity} ID
                                 {order.quantity > 1 ? 's' : ''})
                               </label>
-                              {readyVaultCount > 0 && (
+                              {orderPoolAvailable > 0 && (
                                 <button
                                   type="button"
                                   onClick={() => handleAutoFillFromVault(order)}
                                   className="text-[11px] font-bold text-cyan-300 hover:text-white bg-blue-950/90 px-2.5 py-1 rounded-lg border border-cyan-400/40 flex items-center gap-1 transition-colors cursor-pointer"
                                 >
                                   <Sparkles className="w-3 h-3 text-cyan-400" />
-                                  <span>Auto-Fill from Vault</span>
+                                  <span>Auto-Fill from Vault ({orderPoolAvailable})</span>
                                 </button>
                               )}
                             </div>
@@ -1084,6 +1189,11 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                               placeholder="Enter IRCTC ID & Password for customer (1 per line)&#10;Example: user_irctc01 | Pass@123"
                               className="w-full px-3 py-2.5 rounded-xl bg-slate-900 border border-cyan-500/35 text-xs text-white font-mono placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-cyan-400/30 focus:border-cyan-400"
                             />
+                            {orderErrors[order.orderId] && (
+                              <p className="text-xs text-rose-300" role="alert">
+                                {orderErrors[order.orderId]}
+                              </p>
+                            )}
 
                             <div className="flex flex-wrap items-center gap-2 pt-1">
                               <button
@@ -1283,15 +1393,24 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                       24H Rental (₹)
                     </label>
                     <input
-                      type="number"
+                      type="text"
+                      inputMode="numeric"
                       min={1}
-                      value={formConfig.priceRental24h}
-                      onChange={(e) =>
-                        setFormConfig({
-                          ...formConfig,
-                          priceRental24h: Number(e.target.value),
-                        })
-                      }
+                      max={100000}
+                      value={rentalPriceInput}
+                      onChange={(e) => {
+                        const value = e.target.value;
+                        setRentalPriceInput(value);
+                        if (/^\d+$/.test(value)) {
+                          const price = Number(value);
+                          if (price >= 1 && price <= 100000) {
+                            setFormConfig((current) => ({
+                              ...current,
+                              priceRental24h: price,
+                            }));
+                          }
+                        }
+                      }}
                       className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-emerald-400/50 text-sm font-black text-white font-mono"
                     />
                   </div>
@@ -1399,15 +1518,27 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     Permanent IDs Display Counter
                   </label>
                   <input
-                    type="number"
+                    type="text"
+                    inputMode="numeric"
                     min={0}
-                    value={formConfig.stockDisplayAvailable}
-                    onChange={(e) =>
-                      setFormConfig({
-                        ...formConfig,
-                        stockDisplayAvailable: Number(e.target.value),
-                      })
-                    }
+                    value={stockInputs.stockDisplayAvailable}
+                    onChange={(e) => {
+                      const value = e.target.value;
+                      setStockInputs((current) => ({
+                        ...current,
+                        stockDisplayAvailable: value,
+                      }));
+                      setDirtyStockInputs((current) => ({
+                        ...current,
+                        stockDisplayAvailable: true,
+                      }));
+                      if (/^\d+$/.test(value) && Number(value) <= 100000) {
+                        setFormConfig((current) => ({
+                          ...current,
+                          stockDisplayAvailable: Number(value),
+                        }));
+                      }
+                    }}
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-cyan-500/35 text-sm text-emerald-400 font-mono font-black"
                   />
                   <p className="text-[11px] text-slate-400">
@@ -1420,15 +1551,27 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     24H Rental IDs Display Counter
                   </label>
                   <input
-                    type="number"
+                    type="text"
+                    inputMode="numeric"
                     min={0}
-                    value={formConfig.rentalStockDisplayAvailable}
-                    onChange={(e) =>
-                      setFormConfig({
-                        ...formConfig,
-                        rentalStockDisplayAvailable: Number(e.target.value),
-                      })
-                    }
+                    value={stockInputs.rentalStockDisplayAvailable}
+                    onChange={(e) => {
+                      const value = e.target.value;
+                      setStockInputs((current) => ({
+                        ...current,
+                        rentalStockDisplayAvailable: value,
+                      }));
+                      setDirtyStockInputs((current) => ({
+                        ...current,
+                        rentalStockDisplayAvailable: true,
+                      }));
+                      if (/^\d+$/.test(value) && Number(value) <= 100000) {
+                        setFormConfig((current) => ({
+                          ...current,
+                          rentalStockDisplayAvailable: Number(value),
+                        }));
+                      }
+                    }}
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-emerald-500/40 text-sm text-emerald-400 font-mono font-black"
                   />
                   <p className="text-[11px] text-slate-400">
@@ -1441,15 +1584,27 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     7 Days Guarantee IDs Stock
                   </label>
                   <input
-                    type="number"
+                    type="text"
+                    inputMode="numeric"
                     min={0}
-                    value={formConfig.stock7DayGuaranteeAvailable}
-                    onChange={(e) =>
-                      setFormConfig({
-                        ...formConfig,
-                        stock7DayGuaranteeAvailable: Number(e.target.value),
-                      })
-                    }
+                    value={stockInputs.stock7DayGuaranteeAvailable}
+                    onChange={(e) => {
+                      const value = e.target.value;
+                      setStockInputs((current) => ({
+                        ...current,
+                        stock7DayGuaranteeAvailable: value,
+                      }));
+                      setDirtyStockInputs((current) => ({
+                        ...current,
+                        stock7DayGuaranteeAvailable: true,
+                      }));
+                      if (/^\d+$/.test(value) && Number(value) <= 100000) {
+                        setFormConfig((current) => ({
+                          ...current,
+                          stock7DayGuaranteeAvailable: Number(value),
+                        }));
+                      }
+                    }}
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-cyan-500/35 text-sm text-emerald-400 font-mono font-black"
                   />
                   <p className="text-[11px] text-slate-400">
@@ -1462,15 +1617,27 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     1 Month Guarantee IDs Stock
                   </label>
                   <input
-                    type="number"
+                    type="text"
+                    inputMode="numeric"
                     min={0}
-                    value={formConfig.stock1MonthGuaranteeAvailable}
-                    onChange={(e) =>
-                      setFormConfig({
-                        ...formConfig,
-                        stock1MonthGuaranteeAvailable: Number(e.target.value),
-                      })
-                    }
+                    value={stockInputs.stock1MonthGuaranteeAvailable}
+                    onChange={(e) => {
+                      const value = e.target.value;
+                      setStockInputs((current) => ({
+                        ...current,
+                        stock1MonthGuaranteeAvailable: value,
+                      }));
+                      setDirtyStockInputs((current) => ({
+                        ...current,
+                        stock1MonthGuaranteeAvailable: true,
+                      }));
+                      if (/^\d+$/.test(value) && Number(value) <= 100000) {
+                        setFormConfig((current) => ({
+                          ...current,
+                          stock1MonthGuaranteeAvailable: Number(value),
+                        }));
+                      }
+                    }}
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-emerald-500/40 text-sm text-emerald-400 font-mono font-black"
                   />
                   <p className="text-[11px] text-slate-400">
@@ -1485,9 +1652,14 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                   <input
                     type="text"
                     value={formConfig.supportHandle}
-                    onChange={(e) =>
-                      setFormConfig({ ...formConfig, supportHandle: e.target.value })
-                    }
+                    onChange={(e) => {
+                      const value = e.target.value;
+                      setSupportHandleDirty(true);
+                      setFormConfig((current) => ({
+                        ...current,
+                        supportHandle: value,
+                      }));
+                    }}
                     placeholder="@RoshanbrandSupport"
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-cyan-500/35 text-sm text-white"
                   />
@@ -1617,7 +1789,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                   </h2>
                   <p className="text-xs text-slate-300 mt-1">
                     Paste ready IRCTC IDs (one account per line:{' '}
-                    <code className="text-cyan-300">username | password | pin</code>). Used for
+                    <code className="text-cyan-300">username | password</code>). Used for
                     instant UPI auto-dispatch!
                   </p>
                 </div>
@@ -1627,28 +1799,27 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     Select Vault Pool
                   </label>
                   <div className="grid grid-cols-2 gap-2">
-                    <button
-                      type="button"
-                      onClick={() => setNewVaultPool('rental_24h')}
-                      className={`py-2 px-3 rounded-xl text-xs font-extrabold border cursor-pointer transition-colors ${
-                        newVaultPool === 'rental_24h'
-                          ? 'bg-emerald-600 text-white border-emerald-300'
-                          : 'bg-slate-950 text-slate-300 border-cyan-500/30'
-                      }`}
-                    >
-                      24H Rental ID Pool (₹49)
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setNewVaultPool('permanent')}
-                      className={`py-2 px-3 rounded-xl text-xs font-extrabold border cursor-pointer transition-colors ${
-                        newVaultPool === 'permanent'
-                          ? 'bg-blue-600 text-white border-cyan-300'
-                          : 'bg-slate-950 text-slate-300 border-cyan-500/30'
-                      }`}
-                    >
-                      Permanent ID Pool
-                    </button>
+                    {(
+                      [
+                        ['rental_24h', '24H Rental ID Pool'],
+                        ['permanent', 'Permanent ID Pool'],
+                        ['guarantee_7days', '7 Days Guarantee Pool'],
+                        ['guarantee_1month', '1 Month Guarantee Pool'],
+                      ] as const
+                    ).map(([poolType, label]) => (
+                      <button
+                        key={poolType}
+                        type="button"
+                        onClick={() => setNewVaultPool(poolType)}
+                        className={`py-2 px-3 rounded-xl text-xs font-extrabold border cursor-pointer transition-colors ${
+                          newVaultPool === poolType
+                            ? 'bg-blue-600 text-white border-cyan-300'
+                            : 'bg-slate-950 text-slate-300 border-cyan-500/30'
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
                   </div>
                 </div>
 
@@ -1660,7 +1831,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     rows={6}
                     value={newVaultText}
                     onChange={(e) => setNewVaultText(e.target.value)}
-                    placeholder="roshan_rent24_01 | Pass@9911 | Pin: 1234&#10;roshan_rent24_02 | Pass@9912 | Pin: 5678"
+                    placeholder="roshan_rent24_01 | Pass@9911&#10;roshan_rent24_02 | Pass@9912"
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-cyan-500/35 text-xs text-white font-mono placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-cyan-400/30"
                   />
                 </div>
@@ -1707,6 +1878,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                         className={`p-3.5 rounded-xl border flex items-center justify-between gap-3 ${
                           item.isAssigned
                             ? 'bg-slate-950/50 border-slate-800 opacity-60'
+                            : item.reservedOrderId
+                              ? 'bg-amber-950/30 border-amber-500/40'
                             : 'bg-slate-950/90 border-cyan-500/35'
                         }`}
                       >
@@ -1716,6 +1889,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                               className={`w-2 h-2 rounded-full ${
                                 item.isAssigned
                                   ? 'bg-slate-600'
+                                  : item.reservedOrderId
+                                    ? 'bg-amber-400'
                                   : 'bg-emerald-400 shadow-[0_0_8px_#34d399]'
                               }`}
                             />
@@ -1723,7 +1898,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                               {item.irctcUsername} | {item.irctcPassword}
                             </p>
                             <span className="text-[10px] font-bold text-cyan-300">
-                              · {item.poolType === 'rental_24h' ? '24H Rental' : 'Permanent'}
+                              · {getVaultPoolLabel(item.poolType)}
                             </span>
                           </div>
                           <div className="flex items-center gap-2 mt-1 text-[11px] text-slate-400">
@@ -1731,6 +1906,11 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                             {item.isAssigned && (
                               <span className="text-cyan-400 font-mono font-semibold">
                                 Delivered in Order: {item.assignedOrderId}
+                              </span>
+                            )}
+                            {!item.isAssigned && item.reservedOrderId && (
+                              <span className="text-amber-300 font-mono font-semibold">
+                                Reserved for Order: {item.reservedOrderId}
                               </span>
                             )}
                           </div>

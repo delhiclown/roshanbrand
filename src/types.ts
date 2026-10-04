@@ -11,6 +11,12 @@ export type PackType =
 
 export type OrderStatus = 'pending_verification' | 'verified_delivered' | 'rejected';
 
+export type VaultPoolType =
+  | 'permanent'
+  | 'rental_24h'
+  | 'guarantee_7days'
+  | 'guarantee_1month';
+
 export interface StoreConfig {
   siteTitle: string;
   announcementText: string;
@@ -68,9 +74,10 @@ export interface VaultItem {
   irctcUsername: string;
   irctcPassword: string;
   accountNote: string;
-  poolType: 'permanent' | 'rental_24h';
+  poolType: VaultPoolType;
   isAssigned: boolean;
   assignedOrderId: string;
+  reservedOrderId?: string;
   createdAt: string;
   updatedAt: string;
 }

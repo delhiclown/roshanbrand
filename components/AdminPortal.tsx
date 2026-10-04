@@ -145,8 +145,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     setTimeout(() => setCopiedUtr(null), 1800);
   };
 
-  const handleSaveSettings = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleSaveSettings = async (e?: React.FormEvent) => {
+    e?.preventDefault();
     setSavingSettings(true);
     setSaveSuccess('');
     setSaveError('');
@@ -163,7 +163,9 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
       } else {
         setFormConfig(data.storeConfig);
         onConfigUpdated(data.storeConfig);
-        setSaveSuccess('Settings updated live on Roshanbrand store!');
+        setSaveSuccess(
+          `Settings saved. 7 Days: ${data.storeConfig.stock7DayGuaranteeAvailable} IDs · 1 Month: ${data.storeConfig.stock1MonthGuaranteeAvailable} IDs.`
+        );
         setTimeout(() => setSaveSuccess(''), 3500);
       }
     } catch (err) {
@@ -1143,7 +1145,6 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     <span>{saveSuccess}</span>
                   </div>
                 )}
-
                 {saveError && (
                   <div className="p-3.5 rounded-xl bg-rose-950/70 border border-rose-500/50 text-xs text-rose-300 font-bold flex items-center gap-2">
                     <AlertCircle className="w-4 h-4 shrink-0 text-rose-400" />
@@ -1256,6 +1257,12 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                 <div className="p-3.5 rounded-xl bg-emerald-950/70 border border-emerald-400/50 text-xs text-emerald-300 font-bold flex items-center gap-2">
                   <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-400" />
                   <span>{saveSuccess}</span>
+                </div>
+              )}
+              {saveError && (
+                <div className="p-3.5 rounded-xl bg-rose-950/70 border border-rose-500/50 text-xs text-rose-300 font-bold flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0 text-rose-400" />
+                  <span>{saveError}</span>
                 </div>
               )}
 
@@ -1495,18 +1502,33 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                 </div>
               </div>
 
-              <button
-                type="submit"
-                disabled={savingSettings}
-                className="w-full py-3.5 rounded-xl text-white font-extrabold text-sm store-pay-pill flex items-center justify-center gap-2 cursor-pointer"
-              >
-                <RefreshCw className={`w-4 h-4 ${savingSettings ? 'animate-spin' : ''}`} />
-                <span>
-                  {savingSettings
-                    ? 'Saving All Store Settings...'
-                    : 'Save All Pricing & Store Settings'}
-                </span>
-              </button>
+              <div className="flex flex-col sm:flex-row gap-3">
+                <button
+                  type="button"
+                  disabled={savingSettings}
+                  onClick={() => void handleSaveSettings()}
+                  className="flex-1 py-3.5 rounded-xl text-white font-extrabold text-sm store-pay-pill flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+                >
+                  <RefreshCw className={`w-4 h-4 ${savingSettings ? 'animate-spin' : ''}`} />
+                  <span>
+                    {savingSettings
+                      ? 'Saving Stock...'
+                      : 'Save Guarantee Stock Counts'}
+                  </span>
+                </button>
+                <button
+                  type="submit"
+                  disabled={savingSettings}
+                  className="flex-1 py-3.5 rounded-xl text-white font-extrabold text-sm store-pay-pill flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+                >
+                  <RefreshCw className={`w-4 h-4 ${savingSettings ? 'animate-spin' : ''}`} />
+                  <span>
+                    {savingSettings
+                      ? 'Saving All Store Settings...'
+                      : 'Save All Pricing & Store Settings'}
+                  </span>
+                </button>
+              </div>
             </form>
           )}
 

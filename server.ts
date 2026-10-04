@@ -531,6 +531,7 @@ async function startServer() {
 
   // Public Store Config
   app.get('/api/store', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
     res.json({ storeConfig: db.storeConfig });
   });
 

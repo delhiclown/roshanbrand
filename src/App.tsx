@@ -96,7 +96,7 @@ export default function App() {
   useEffect(() => {
     const loadStore = async () => {
       try {
-        const res = await fetch('/api/store');
+        const res = await fetch('/api/store', { cache: 'no-store' });
         if (!res.ok) return;
         const data = await res.json();
         if (data.storeConfig) {
@@ -108,6 +108,7 @@ export default function App() {
       }
     };
     loadStore();
+    const refreshTimer = window.setInterval(loadStore, 5000);
 
     const events = new EventSource('/api/events');
     events.onmessage = (event) => {
@@ -121,7 +122,10 @@ export default function App() {
       }
     };
 
-    return () => events.close();
+    return () => {
+      window.clearInterval(refreshTimer);
+      events.close();
+    };
   }, []);
 
   // Poll tracked order if present

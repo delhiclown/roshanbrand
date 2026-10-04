@@ -110,14 +110,14 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     checkAuth();
   }, []);
 
-  const fetchAdminState = async () => {
+  const fetchAdminState = async (syncConfig = false) => {
     try {
       const res = await fetch('/api/admin/state');
       if (!res.ok) return;
       const data = await res.json();
       setOrders(data.orders || []);
       setVault(data.vault || []);
-      if (data.storeConfig) {
+      if (syncConfig && data.storeConfig) {
         onConfigUpdated(data.storeConfig);
       }
     } catch {
@@ -127,12 +127,19 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
 
   useEffect(() => {
     if (!isAuthenticated) return;
-    fetchAdminState();
+    fetchAdminState(true);
     const es = new EventSource('/api/events');
-    es.onmessage = () => {
-      fetchAdminState();
+    es.onmessage = (event) => {
+      let syncConfig = false;
+      try {
+        const message = JSON.parse(event.data) as { type?: string };
+        syncConfig = message.type === 'config_updated';
+      } catch {
+        // Refresh orders and vault even if an event payload is malformed.
+      }
+      fetchAdminState(syncConfig);
     };
-    const timer = setInterval(fetchAdminState, 1000);
+    const timer = setInterval(() => fetchAdminState(), 1000);
     return () => {
       es.close();
       clearInterval(timer);

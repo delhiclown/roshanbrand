@@ -1502,33 +1502,18 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                 </div>
               </div>
 
-              <div className="flex flex-col sm:flex-row gap-3">
-                <button
-                  type="button"
-                  disabled={savingSettings}
-                  onClick={() => void handleSaveSettings()}
-                  className="flex-1 py-3.5 rounded-xl text-white font-extrabold text-sm store-pay-pill flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
-                >
-                  <RefreshCw className={`w-4 h-4 ${savingSettings ? 'animate-spin' : ''}`} />
-                  <span>
-                    {savingSettings
-                      ? 'Saving Stock...'
-                      : 'Save Guarantee Stock Counts'}
-                  </span>
-                </button>
-                <button
-                  type="submit"
-                  disabled={savingSettings}
-                  className="flex-1 py-3.5 rounded-xl text-white font-extrabold text-sm store-pay-pill flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
-                >
-                  <RefreshCw className={`w-4 h-4 ${savingSettings ? 'animate-spin' : ''}`} />
-                  <span>
-                    {savingSettings
-                      ? 'Saving All Store Settings...'
-                      : 'Save All Pricing & Store Settings'}
-                  </span>
-                </button>
-              </div>
+              <button
+                type="submit"
+                disabled={savingSettings}
+                className="w-full py-3.5 rounded-xl text-white font-extrabold text-sm store-pay-pill flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+              >
+                <RefreshCw className={`w-4 h-4 ${savingSettings ? 'animate-spin' : ''}`} />
+                <span>
+                  {savingSettings
+                    ? 'Saving All Store Settings...'
+                    : 'Save All Pricing & Store Settings'}
+                </span>
+              </button>
             </form>
           )}
 

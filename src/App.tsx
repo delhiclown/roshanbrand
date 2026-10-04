@@ -235,6 +235,14 @@ export default function App() {
     LIMITS.QUANTITY_MIN,
     Math.min(LIMITS.QUANTITY_MAX, Number(quantity) || 1)
   );
+  const activeStockCount = activeProduct.isRental24h
+    ? displayedRentalStock
+    : activeProduct.isSevenDayGuarantee
+      ? storeConfig.stock7DayGuaranteeAvailable
+      : activeProduct.isOneMonthGuarantee
+        ? storeConfig.stock1MonthGuaranteeAvailable
+        : displayedPermanentStock;
+  const hasEnoughStock = storeConfigLoaded && safeQty <= activeStockCount;
   const totalPayable = calculateTotal(
     safeQty,
     selectedTier,
@@ -309,6 +317,11 @@ export default function App() {
   );
 
   useEffect(() => {
+    if (!hasEnoughStock) {
+      setInlineQrDataUrl('');
+      return;
+    }
+
     let active = true;
     QRCode.toDataURL(dynamicInlineUpiUri, {
       width: 220,
@@ -328,7 +341,7 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, [dynamicInlineUpiUri]);
+  }, [dynamicInlineUpiUri, hasEnoughStock]);
 
   const handleSelectTier = (tier: string, qty: number) => {
     setSelectedTier(tier);
@@ -361,6 +374,8 @@ export default function App() {
   };
 
   const handleOpenCheckout = () => {
+    if (!hasEnoughStock) return;
+
     setCheckoutDraft({
       packType: resolvedPackType,
       packLabel: resolvedPackLabel,
@@ -1173,7 +1188,7 @@ export default function App() {
                           {/* Total & Dynamic Amount QR + Pay CTA */}
                           <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3.5 pt-3 border-t border-cyan-500/25">
                             <div className="flex items-center gap-3">
-                              {inlineQrDataUrl && (
+                              {hasEnoughStock && inlineQrDataUrl && (
                                 <button
                                   type="button"
                                   onClick={handleOpenCheckout}
@@ -1201,25 +1216,37 @@ export default function App() {
                                     {safeQty > 1 ? 's' : ''} · ₹{effectiveUnitPrice}/ID)
                                   </span>
                                 </div>
-                                <p className="text-[11px] text-emerald-300 font-medium mt-0.5">
-                                  Dynamic QR Auto-Generated for{' '}
-                                  <strong className="font-mono">
-                                    ₹{totalPayable.toFixed(2)}
-                                  </strong>{' '}
-                                  ({storeConfig.upiId})
-                                </p>
+                                {hasEnoughStock && (
+                                  <p className="text-[11px] text-emerald-300 font-medium mt-0.5">
+                                    Dynamic QR Auto-Generated for{' '}
+                                    <strong className="font-mono">
+                                      ₹{totalPayable.toFixed(2)}
+                                    </strong>{' '}
+                                    ({storeConfig.upiId})
+                                  </p>
+                                )}
                               </div>
                             </div>
 
+                            {!hasEnoughStock && storeConfigLoaded && (
+                              <p className="text-xs font-bold text-rose-400" role="alert">
+                                {activeStockCount > 0
+                                  ? `Out of stock for ${safeQty} IDs. Only ${activeStockCount} ID${activeStockCount === 1 ? '' : 's'} available.`
+                                  : 'Out of stock'}
+                              </p>
+                            )}
+
                             <button
                               type="button"
-                              disabled={isOutOfStock}
+                              disabled={!hasEnoughStock}
                               onClick={handleOpenCheckout}
                               className="store-pay-pill py-3 px-6 rounded-xl font-extrabold text-white text-xs sm:text-sm disabled:opacity-50 flex items-center justify-center gap-2 cursor-pointer whitespace-nowrap"
                             >
                               <QrCode className="w-4 h-4" />
                               <span>
-                                Pay ₹{totalPayable} via UPI QR
+                                {hasEnoughStock
+                                  ? `Pay ₹${totalPayable} via UPI QR`
+                                  : 'Out of stock'}
                               </span>
                             </button>
                           </div>

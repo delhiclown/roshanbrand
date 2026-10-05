@@ -247,32 +247,30 @@ export default function App() {
 
   const activeProduct =
     productOptions.find((p) => p.id === openCardId) || productOptions[0];
+  const getAvailableStock = (option: ProductOption) => {
+    const configuredStock = option.isRental24h
+      ? displayedRentalStock
+      : option.isSevenDayGuarantee
+        ? storeConfig.stock7DayGuaranteeAvailable
+        : option.isOneMonthGuarantee
+          ? storeConfig.stock1MonthGuaranteeAvailable
+          : displayedPermanentStock;
+
+    return option.isSevenDayGuarantee
+      ? Math.min(configuredStock, vaultStock.guarantee_7days)
+      : option.isOneMonthGuarantee
+        ? Math.min(configuredStock, vaultStock.guarantee_1month)
+        : configuredStock;
+  };
+  const activeStockCount = getAvailableStock(activeProduct);
   const safeQty = Math.max(
     LIMITS.QUANTITY_MIN,
     Math.min(LIMITS.QUANTITY_MAX, Number(quantity) || 1)
   );
-  const configuredActiveStock = activeProduct.isRental24h
-    ? displayedRentalStock
-    : activeProduct.isSevenDayGuarantee
-      ? storeConfig.stock7DayGuaranteeAvailable
-      : activeProduct.isOneMonthGuarantee
-        ? storeConfig.stock1MonthGuaranteeAvailable
-        : displayedPermanentStock;
-  const activeVaultStock = activeProduct.isRental24h
-    ? vaultStock.rental_24h
-    : activeProduct.isSevenDayGuarantee
-      ? vaultStock.guarantee_7days
-      : activeProduct.isOneMonthGuarantee
-        ? vaultStock.guarantee_1month
-        : vaultStock.permanent;
-  const isVaultStockLimited =
-    activeProduct.isSevenDayGuarantee || activeProduct.isOneMonthGuarantee;
-  const activeStockCount = isVaultStockLimited
-    ? Math.min(configuredActiveStock, activeVaultStock)
-    : configuredActiveStock;
   const hasEnoughStock =
     storeConfigLoaded &&
-    (isVaultStockLimited ? safeQty <= activeStockCount : activeStockCount > 0);
+    activeStockCount > 0 &&
+    safeQty <= activeStockCount;
   const totalPayable = calculateTotal(
     safeQty,
     selectedTier,
@@ -281,6 +279,37 @@ export default function App() {
     activeProduct.isOneMonthGuarantee
   );
   const effectiveUnitPrice = Math.max(1, Math.round(totalPayable / safeQty));
+
+  useEffect(() => {
+    if (
+      !storeConfigLoaded ||
+      activeStockCount <= 0 ||
+      quantity <= activeStockCount
+    ) {
+      return;
+    }
+
+    const clampedQty = Math.min(LIMITS.QUANTITY_MAX, activeStockCount);
+    setQuantity(clampedQty);
+    if (activeProduct.isRental24h) {
+      setSelectedTier(String(clampedQty));
+    } else if (
+      !activeProduct.isSevenDayGuarantee &&
+      !activeProduct.isOneMonthGuarantee &&
+      selectedTier !== 'bulk' &&
+      selectedTier !== 'custom'
+    ) {
+      setSelectedTier(
+        [1, 2, 5, 10].includes(clampedQty) ? String(clampedQty) : 'custom'
+      );
+    }
+  }, [
+    storeConfigLoaded,
+    activeStockCount,
+    quantity,
+    activeProduct,
+    selectedTier,
+  ]);
 
   const resolvedPackType: PackType = activeProduct.isRental24h
     ? 'rental_24h'
@@ -347,7 +376,12 @@ export default function App() {
   );
 
   useEffect(() => {
-    if (!hasEnoughStock) {
+    if (
+      !storeConfigLoaded ||
+      activeStockCount <= 0 ||
+      safeQty > activeStockCount ||
+      !hasEnoughStock
+    ) {
       setInlineQrDataUrl('');
       return;
     }
@@ -371,17 +405,36 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, [dynamicInlineUpiUri, hasEnoughStock]);
+  }, [
+    dynamicInlineUpiUri,
+    hasEnoughStock,
+    storeConfigLoaded,
+    activeStockCount,
+    safeQty,
+  ]);
 
   const handleSelectTier = (tier: string, qty: number) => {
     setSelectedTier(tier);
-    setQuantity(qty);
+    setQuantity(
+      Math.max(
+        LIMITS.QUANTITY_MIN,
+        Math.min(
+          LIMITS.QUANTITY_MAX,
+          activeStockCount > 0 ? activeStockCount : LIMITS.QUANTITY_MIN,
+          qty
+        )
+      )
+    );
   };
 
   const handleStepQty = (delta: number) => {
     const next = Math.max(
       LIMITS.QUANTITY_MIN,
-      Math.min(LIMITS.QUANTITY_MAX, safeQty + delta)
+      Math.min(
+        LIMITS.QUANTITY_MAX,
+        activeStockCount > 0 ? activeStockCount : LIMITS.QUANTITY_MIN,
+        safeQty + delta
+      )
     );
     setQuantity(next);
     if (activeProduct.isRental24h) {
@@ -404,7 +457,7 @@ export default function App() {
   };
 
   const handleOpenCheckout = () => {
-    if (!hasEnoughStock) return;
+    if (!hasEnoughStock || safeQty > activeStockCount) return;
 
     setCheckoutDraft({
       packType: resolvedPackType,
@@ -771,15 +824,10 @@ export default function App() {
               {productOptions.map((option) => {
                 const isOpen = openCardId === option.id;
                 const unitPrice = Number(storeConfig[option.unitPriceKey]) || 49;
-                const configuredStockCount = option.isRental24h
-                  ? displayedRentalStock
-                  : option.isSevenDayGuarantee
-                    ? storeConfig.stock7DayGuaranteeAvailable
-                    : option.isOneMonthGuarantee
-                      ? storeConfig.stock1MonthGuaranteeAvailable
-                      : displayedPermanentStock;
-                const stockCount = configuredStockCount;
+                const stockCount = getAvailableStock(option);
                 const isOutOfStock = stockCount <= 0;
+                const isOptionQtyAvailable = (qty: number) =>
+                  storeConfigLoaded && stockCount > 0 && qty <= stockCount;
 
                 return (
                   <li
@@ -839,7 +887,9 @@ export default function App() {
                         </p>
                         <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 mt-2">
                           <span className="text-lg font-black text-white tabular-nums">
-                            ₹{unitPrice}
+                            {storeConfigLoaded && isOutOfStock
+                              ? 'Out of Stock'
+                              : `₹${unitPrice}`}
                           </span>
                           <span
                             className={`text-[11px] font-semibold ${
@@ -867,7 +917,7 @@ export default function App() {
                             {!storeConfigLoaded
                               ? 'Loading stock…'
                               : isOutOfStock
-                                ? 'Out of stock'
+                                ? 'Out of Stock'
                                 : `${stockCount} ID${stockCount === 1 ? '' : 's'} in stock`}
                           </span>
                           {option.isRental24h && (
@@ -888,7 +938,9 @@ export default function App() {
                             isOpen ? 'store-product-cta--active' : ''
                           }`}
                         >
-                          <span>{isOpen ? 'Close' : 'Buy'}</span>
+                          <span>
+                            {isOpen ? 'Close' : isOutOfStock ? 'Out of Stock' : 'Buy'}
+                          </span>
                           <ChevronRight
                             className={`w-3.5 h-3.5 transition-transform duration-200 ${
                               isOpen ? 'rotate-90' : ''
@@ -920,8 +972,13 @@ export default function App() {
                                   <button
                                     key={num}
                                     type="button"
+                                    disabled={!isOptionQtyAvailable(num)}
                                     onClick={() => handleSelectTier(String(num), num)}
-                                    className={`qty-chip-card cursor-pointer ${
+                                    className={`qty-chip-card ${
+                                      isOptionQtyAvailable(num)
+                                        ? 'cursor-pointer'
+                                        : 'cursor-not-allowed opacity-50'
+                                    } ${
                                       safeQty === num ? 'qty-chip-card--selected' : ''
                                     }`}
                                   >
@@ -933,22 +990,27 @@ export default function App() {
                                         safeQty === num ? 'text-cyan-100' : 'text-emerald-400'
                                       }`}
                                     >
-                                      ₹{num * (storeConfig.priceRental24h || 49)}
+                                      {isOptionQtyAvailable(num)
+                                        ? `₹${num * (storeConfig.priceRental24h || 49)}`
+                                        : 'Out of Stock'}
                                     </span>
                                   </button>
                                 ))}
                                 <button
                                   type="button"
+                                  disabled={isOutOfStock || !storeConfigLoaded}
                                   onClick={() => handleSelectTier('custom', 4)}
                                   className={`qty-chip-card cursor-pointer ${
                                     ![1, 2, 3, 5, 10].includes(safeQty)
                                       ? 'qty-chip-card--selected'
                                       : ''
-                                  }`}
+                                  } ${isOutOfStock || !storeConfigLoaded ? 'cursor-not-allowed opacity-50' : ''}`}
                                 >
                                   <span className="text-xs font-extrabold">Custom Qty</span>
                                   <span className="text-[10px] font-bold text-emerald-400">
-                                    ₹{storeConfig.priceRental24h}/24H
+                                    {isOutOfStock || !storeConfigLoaded
+                                      ? 'Out of Stock'
+                                      : `₹${storeConfig.priceRental24h}/24H`}
                                   </span>
                                 </button>
                               </div>
@@ -970,8 +1032,13 @@ export default function App() {
                                   <button
                                     key={num}
                                     type="button"
+                                    disabled={!isOptionQtyAvailable(num)}
                                     onClick={() => handleSelectTier(String(num), num)}
-                                    className={`qty-chip-card cursor-pointer ${
+                                    className={`qty-chip-card ${
+                                      isOptionQtyAvailable(num)
+                                        ? 'cursor-pointer'
+                                        : 'cursor-not-allowed opacity-50'
+                                    } ${
                                       selectedTier === String(num) && safeQty === num
                                         ? 'qty-chip-card--selected'
                                         : ''
@@ -981,24 +1048,29 @@ export default function App() {
                                       {num} ID{num > 1 ? 's' : ''}
                                     </span>
                                     <span className="text-[10px] font-bold tabular-nums text-emerald-400">
-                                      ₹{num * (option.isOneMonthGuarantee
-                                        ? storeConfig.price1MonthGuaranteePerId
-                                        : storeConfig.price7DayGuaranteePerId)}
+                                      {isOptionQtyAvailable(num)
+                                        ? `₹${num * (option.isOneMonthGuarantee
+                                            ? storeConfig.price1MonthGuaranteePerId
+                                            : storeConfig.price7DayGuaranteePerId)}`
+                                        : 'Out of Stock'}
                                     </span>
                                   </button>
                                 ))}
                                 <button
                                   type="button"
+                                  disabled={isOutOfStock || !storeConfigLoaded}
                                   onClick={() => handleSelectTier('custom', 3)}
                                   className={`qty-chip-card cursor-pointer ${
                                     selectedTier === 'custom' ? 'qty-chip-card--selected' : ''
-                                  }`}
+                                  } ${isOutOfStock || !storeConfigLoaded ? 'cursor-not-allowed opacity-50' : ''}`}
                                 >
                                   <span className="text-xs font-extrabold">Custom Qty</span>
                                   <span className="text-[10px] font-bold text-emerald-400">
-                                    ₹{option.isOneMonthGuarantee
-                                      ? storeConfig.price1MonthGuaranteePerId
-                                      : storeConfig.price7DayGuaranteePerId}/ID
+                                    {isOutOfStock || !storeConfigLoaded
+                                      ? 'Out of Stock'
+                                      : `₹${option.isOneMonthGuarantee
+                                          ? storeConfig.price1MonthGuaranteePerId
+                                          : storeConfig.price7DayGuaranteePerId}/ID`}
                                   </span>
                                 </button>
                               </div>
@@ -1017,8 +1089,13 @@ export default function App() {
                               <div className="grid grid-cols-3 sm:grid-cols-6 gap-2.5">
                                 <button
                                   type="button"
+                                  disabled={!isOptionQtyAvailable(1)}
                                   onClick={() => handleSelectTier('1', 1)}
-                                  className={`qty-chip-card cursor-pointer ${
+                                  className={`qty-chip-card ${
+                                    isOptionQtyAvailable(1)
+                                      ? 'cursor-pointer'
+                                      : 'cursor-not-allowed opacity-50'
+                                  } ${
                                     selectedTier === '1' && safeQty === 1
                                       ? 'qty-chip-card--selected'
                                       : ''
@@ -1034,14 +1111,21 @@ export default function App() {
                                         : 'text-cyan-400'
                                     }`}
                                   >
-                                    ₹{storeConfig.priceCustomPerId}
+                                    {isOptionQtyAvailable(1)
+                                      ? `₹${storeConfig.priceCustomPerId}`
+                                      : 'Out of Stock'}
                                   </span>
                                 </button>
 
                                 <button
                                   type="button"
+                                  disabled={!isOptionQtyAvailable(2)}
                                   onClick={() => handleSelectTier('2', 2)}
-                                  className={`qty-chip-card cursor-pointer ${
+                                  className={`qty-chip-card ${
+                                    isOptionQtyAvailable(2)
+                                      ? 'cursor-pointer'
+                                      : 'cursor-not-allowed opacity-50'
+                                  } ${
                                     selectedTier === '2' && safeQty === 2
                                       ? 'qty-chip-card--selected'
                                       : ''
@@ -1057,14 +1141,21 @@ export default function App() {
                                         : 'text-cyan-400'
                                     }`}
                                   >
-                                    ₹{2 * storeConfig.priceCustomPerId}
+                                    {isOptionQtyAvailable(2)
+                                      ? `₹${2 * storeConfig.priceCustomPerId}`
+                                      : 'Out of Stock'}
                                   </span>
                                 </button>
 
                                 <button
                                   type="button"
+                                  disabled={!isOptionQtyAvailable(5)}
                                   onClick={() => handleSelectTier('5', 5)}
-                                  className={`qty-chip-card cursor-pointer ${
+                                  className={`qty-chip-card ${
+                                    isOptionQtyAvailable(5)
+                                      ? 'cursor-pointer'
+                                      : 'cursor-not-allowed opacity-50'
+                                  } ${
                                     selectedTier === '5' && safeQty === 5
                                       ? 'qty-chip-card--selected'
                                       : ''
@@ -1080,14 +1171,21 @@ export default function App() {
                                         : 'text-cyan-400'
                                     }`}
                                   >
-                                    ₹{5 * storeConfig.priceCustomPerId}
+                                    {isOptionQtyAvailable(5)
+                                      ? `₹${5 * storeConfig.priceCustomPerId}`
+                                      : 'Out of Stock'}
                                   </span>
                                 </button>
 
                                 <button
                                   type="button"
+                                  disabled={!isOptionQtyAvailable(10)}
                                   onClick={() => handleSelectTier('10', 10)}
-                                  className={`qty-chip-card cursor-pointer ${
+                                  className={`qty-chip-card ${
+                                    isOptionQtyAvailable(10)
+                                      ? 'cursor-pointer'
+                                      : 'cursor-not-allowed opacity-50'
+                                  } ${
                                     selectedTier === '10' && safeQty === 10
                                       ? 'qty-chip-card--selected'
                                       : ''
@@ -1103,16 +1201,19 @@ export default function App() {
                                         : 'text-cyan-400'
                                     }`}
                                   >
-                                    ₹{10 * storeConfig.priceCustomPerId}
+                                    {isOptionQtyAvailable(10)
+                                      ? `₹${10 * storeConfig.priceCustomPerId}`
+                                      : 'Out of Stock'}
                                   </span>
                                 </button>
 
                                 <button
                                   type="button"
+                                  disabled={isOutOfStock || !storeConfigLoaded}
                                   onClick={() => handleSelectTier('bulk', 20)}
                                   className={`qty-chip-card cursor-pointer ${
                                     selectedTier === 'bulk' ? 'qty-chip-card--selected' : ''
-                                  }`}
+                                  } ${isOutOfStock || !storeConfigLoaded ? 'cursor-not-allowed opacity-50' : ''}`}
                                 >
                                   <span className="text-xs font-extrabold">Bulk IDs</span>
                                   <span
@@ -1122,16 +1223,19 @@ export default function App() {
                                         : 'text-cyan-400'
                                     }`}
                                   >
-                                    ₹{storeConfig.priceCustomPerId}/ID
+                                    {isOutOfStock || !storeConfigLoaded
+                                      ? 'Out of Stock'
+                                      : `₹${storeConfig.priceCustomPerId}/ID`}
                                   </span>
                                 </button>
 
                                 <button
                                   type="button"
+                                  disabled={isOutOfStock || !storeConfigLoaded}
                                   onClick={() => handleSelectTier('custom', 3)}
                                   className={`qty-chip-card cursor-pointer ${
                                     selectedTier === 'custom' ? 'qty-chip-card--selected' : ''
-                                  }`}
+                                  } ${isOutOfStock || !storeConfigLoaded ? 'cursor-not-allowed opacity-50' : ''}`}
                                 >
                                   <span className="text-xs font-extrabold">Custom Qty</span>
                                   <span
@@ -1141,7 +1245,9 @@ export default function App() {
                                         : 'text-cyan-400'
                                     }`}
                                   >
-                                    Any number
+                                    {isOutOfStock || !storeConfigLoaded
+                                      ? 'Out of Stock'
+                                      : 'Any number'}
                                   </span>
                                 </button>
                               </div>
@@ -1158,7 +1264,7 @@ export default function App() {
                                 <button
                                   type="button"
                                   onClick={() => handleStepQty(-1)}
-                                  disabled={safeQty <= 1}
+                                  disabled={!storeConfigLoaded || activeStockCount <= 0 || safeQty <= 1}
                                   className="w-8 h-8 rounded-lg border border-cyan-500/40 bg-slate-900 text-cyan-300 font-bold text-sm flex items-center justify-center hover:bg-slate-800 disabled:opacity-40 shadow-[0_2px_0_#040714] cursor-pointer"
                                 >
                                   <Minus className="w-3.5 h-3.5" />
@@ -1166,8 +1272,9 @@ export default function App() {
                                 <input
                                   type="number"
                                   min={LIMITS.QUANTITY_MIN}
-                                  max={LIMITS.QUANTITY_MAX}
-                                  value={quantity}
+                                  max={Math.min(LIMITS.QUANTITY_MAX, activeStockCount)}
+                                  value={safeQty}
+                                  disabled={!storeConfigLoaded || activeStockCount <= 0}
                                   onChange={(e) => {
                                     const parsed = parseInt(e.target.value, 10);
                                     if (isNaN(parsed)) {
@@ -1175,7 +1282,11 @@ export default function App() {
                                     } else {
                                       const clamped = Math.max(
                                         LIMITS.QUANTITY_MIN,
-                                        Math.min(LIMITS.QUANTITY_MAX, parsed)
+                                        Math.min(
+                                          LIMITS.QUANTITY_MAX,
+                                          activeStockCount,
+                                          parsed
+                                        )
                                       );
                                       setQuantity(clamped);
                                       if (!option.isRental24h) {
@@ -1190,7 +1301,11 @@ export default function App() {
                                 <button
                                   type="button"
                                   onClick={() => handleStepQty(1)}
-                                  disabled={safeQty >= LIMITS.QUANTITY_MAX}
+                                  disabled={
+                                    !storeConfigLoaded ||
+                                    activeStockCount <= 0 ||
+                                    safeQty >= Math.min(LIMITS.QUANTITY_MAX, activeStockCount)
+                                  }
                                   className="w-8 h-8 rounded-lg border border-cyan-500/40 bg-slate-900 text-cyan-300 font-bold text-sm flex items-center justify-center hover:bg-slate-800 disabled:opacity-40 shadow-[0_2px_0_#040714] cursor-pointer"
                                 >
                                   <Plus className="w-3.5 h-3.5" />
@@ -1263,7 +1378,7 @@ export default function App() {
                               <p className="text-xs font-bold text-rose-400" role="alert">
                                 {activeStockCount > 0
                                   ? `Out of stock for ${safeQty} IDs. Only ${activeStockCount} ID${activeStockCount === 1 ? '' : 's'} available.`
-                                  : 'Out of stock'}
+                                  : 'Out of Stock'}
                               </p>
                             )}
 
@@ -1277,7 +1392,7 @@ export default function App() {
                               <span>
                                 {hasEnoughStock
                                   ? `Pay ₹${totalPayable} via UPI QR`
-                                  : 'Out of stock'}
+                                  : 'Out of Stock'}
                               </span>
                             </button>
                           </div>

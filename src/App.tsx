@@ -265,8 +265,14 @@ export default function App() {
       : activeProduct.isOneMonthGuarantee
         ? vaultStock.guarantee_1month
         : vaultStock.permanent;
-  const activeStockCount = Math.min(configuredActiveStock, activeVaultStock);
-  const hasEnoughStock = storeConfigLoaded && safeQty <= activeStockCount;
+  const isVaultStockLimited =
+    activeProduct.isSevenDayGuarantee || activeProduct.isOneMonthGuarantee;
+  const activeStockCount = isVaultStockLimited
+    ? Math.min(configuredActiveStock, activeVaultStock)
+    : configuredActiveStock;
+  const hasEnoughStock =
+    storeConfigLoaded &&
+    (isVaultStockLimited ? safeQty <= activeStockCount : activeStockCount > 0);
   const totalPayable = calculateTotal(
     safeQty,
     selectedTier,
@@ -772,17 +778,7 @@ export default function App() {
                     : option.isOneMonthGuarantee
                       ? storeConfig.stock1MonthGuaranteeAvailable
                       : displayedPermanentStock;
-                const availableVaultStock = option.isRental24h
-                  ? vaultStock.rental_24h
-                  : option.isSevenDayGuarantee
-                    ? vaultStock.guarantee_7days
-                    : option.isOneMonthGuarantee
-                      ? vaultStock.guarantee_1month
-                      : vaultStock.permanent;
-                const stockCount =
-                  option.isSevenDayGuarantee || option.isOneMonthGuarantee
-                    ? configuredStockCount
-                    : Math.min(configuredStockCount, availableVaultStock);
+                const stockCount = configuredStockCount;
                 const isOutOfStock = stockCount <= 0;
 
                 return (

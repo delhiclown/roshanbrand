@@ -16,7 +16,8 @@ View your app in AI Studio: https://ai.studio/apps/29d744aa-58e5-4984-afcc-c6959
 1. Install dependencies:
    `npm install`
 2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
+3. Set `DATABASE_URL` in `.env` to a PostgreSQL connection string (Render Postgres or Supabase; include `sslmode=require` if required).
+4. Run the app:
    `npm run dev`
 
 ## Admin Access
@@ -25,7 +26,7 @@ Set `ADMIN_PASSWORD` and `ADMIN_RECOVERY_KEY` in a local `.env` file before star
 
 ## Deploy on Render and Vercel
 
-Create a Render Blueprint from this repository using `render.yaml`. Set `ADMIN_PASSWORD` and `ADMIN_RECOVERY_KEY` as private environment variables in the Render dashboard. The service uses a persistent disk at `/var/data` for orders, inventory, store settings, and the admin password hash. On first startup, existing `data/roshanbrand_store.json` is copied as the initial store database. Store updates are written atomically, and the server will fail to start rather than replace an unreadable saved database with seed defaults.
+Create a PostgreSQL database on Render or Supabase and set its connection string as the private `DATABASE_URL` environment variable in Render. Set `ADMIN_PASSWORD` and `ADMIN_RECOVERY_KEY` as private environment variables as well. Store config, orders, and vault data are persisted in the PostgreSQL `roshanbrand_state` table. The table is created automatically. On the first start against an empty database, existing `/var/data/roshanbrand_store.json` data (or the bundled seed file if it is absent) is imported once; subsequent starts load the existing database row without replacing it with defaults. The `/var/data` persistent disk remains in use for the admin password hash and legacy data import.
 
 The `start` script builds the Vite frontend before starting the server, so deployments that invoke `bun run start` directly still create the required `dist/index.html`.
 

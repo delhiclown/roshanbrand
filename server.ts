@@ -4,6 +4,7 @@ import { randomBytes, scrypt, timingSafeEqual, createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { Pool } from 'pg';
 import { createServer as createViteServer } from 'vite';
 import { DEFAULT_STORE_CONFIG, LIMITS } from './src/constants.ts';
 import { OrderRecord, PackType, StoreConfig, VaultItem, VaultPoolType } from './src/types.ts';
@@ -16,6 +17,10 @@ const DATA_DIR = process.env.DATA_DIR || DEFAULT_DATA_DIR;
 const DATA_FILE = path.join(DATA_DIR, 'roshanbrand_store.json');
 const SEED_DATA_FILE = path.join(DEFAULT_DATA_DIR, 'roshanbrand_store.json');
 const ADMIN_AUTH_FILE = path.join(DATA_DIR, 'admin_auth.json');
+const postgresPool = new Pool({ connectionString: process.env.DATABASE_URL });
+let persistenceQueue: Promise<void> = Promise.resolve();
+let lastPersistedState = '';
+let persistenceVersion = 0;
 
 interface AdminAuthRecord {
   salt: string;
@@ -188,24 +193,75 @@ function loadDb(): PersistedDatabase {
   };
 }
 
-function saveDb(db: PersistedDatabase) {
-  const temporaryFile = `${DATA_FILE}.${process.pid}.tmp`;
+async function initializePersistence(db: PersistedDatabase): Promise<void> {
+  if (!process.env.DATABASE_URL) {
+    throw new Error('DATABASE_URL is required to start the server.');
+  }
+
+  await postgresPool.query(`
+    CREATE TABLE IF NOT EXISTS roshanbrand_state (
+      id SMALLINT PRIMARY KEY CHECK (id = 1),
+      state JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  const existing = await postgresPool.query<{ state: PersistedDatabase }>(
+    'SELECT state FROM roshanbrand_state WHERE id = 1'
+  );
+  if (existing.rows[0]) {
+    Object.assign(db, existing.rows[0].state);
+    lastPersistedState = JSON.stringify(db);
+    return;
+  }
+
+  // Import the previous file-backed state only when the persistent DB is empty.
+  await postgresPool.query(
+    `INSERT INTO roshanbrand_state (id, state)
+     VALUES (1, $1::jsonb)
+     ON CONFLICT (id) DO NOTHING`,
+    [JSON.stringify(db)]
+  );
+  const initialized = await postgresPool.query<{ state: PersistedDatabase }>(
+    'SELECT state FROM roshanbrand_state WHERE id = 1'
+  );
+  if (!initialized.rows[0]) {
+    throw new Error('Could not initialize persistent application state.');
+  }
+  Object.assign(db, initialized.rows[0].state);
+  lastPersistedState = JSON.stringify(db);
+}
+
+function saveDb(db: PersistedDatabase): Promise<void> {
+  const state = JSON.stringify(db);
+  const version = ++persistenceVersion;
+  const write = persistenceQueue.then(() =>
+    postgresPool.query(
+      `INSERT INTO roshanbrand_state (id, state, updated_at)
+       VALUES (1, $1::jsonb, NOW())
+       ON CONFLICT (id)
+       DO UPDATE SET state = EXCLUDED.state, updated_at = EXCLUDED.updated_at`,
+      [state]
+    ).then(() => {
+      lastPersistedState = state;
+    })
+  );
+  persistenceQueue = write.catch((error: unknown) => {
+    console.error('Failed to persist application state to PostgreSQL:', error);
+    if (version === persistenceVersion && lastPersistedState) {
+      Object.assign(db, JSON.parse(lastPersistedState) as PersistedDatabase);
+    }
+  });
+  return write;
+}
+
+async function persistDbOrRespond(res: express.Response): Promise<boolean> {
   try {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-    }
-    fs.writeFileSync(temporaryFile, JSON.stringify(db, null, 2), 'utf-8');
-    fs.renameSync(temporaryFile, DATA_FILE);
-  } catch (err) {
-    try {
-      if (fs.existsSync(temporaryFile)) {
-        fs.unlinkSync(temporaryFile);
-      }
-    } catch (cleanupError) {
-      console.error('Failed to remove temporary store data file:', cleanupError);
-    }
-    console.error('Failed to persist store data:', err);
-    throw err;
+    await saveDb(db);
+    return true;
+  } catch {
+    res.status(500).json({ error: 'Application data could not be saved to PostgreSQL.' });
+    return false;
   }
 }
 
@@ -295,7 +351,6 @@ function isPackType(value: unknown): value is PackType {
 }
 
 const db = loadDb();
-saveDb(db);
 
 // Real-time SSE clients for instant <50ms Admin & Customer sync
 const sseClients = new Set<express.Response>();
@@ -359,6 +414,7 @@ async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
 
+  await initializePersistence(db);
   app.use(express.json({ limit: '2mb' }));
 
   const sessions = new Map<string, number>();
@@ -587,7 +643,7 @@ async function startServer() {
   });
 
   // Update Store Config
-  app.put('/api/store', requireAdminAuth, (req, res) => {
+  app.put('/api/store', requireAdminAuth, async (req, res) => {
     const body = req.body || {};
     const upiId = String(body.upiId ?? db.storeConfig.upiId).trim();
     if (
@@ -696,13 +752,11 @@ async function startServer() {
       updatedAt: new Date().toISOString(),
     };
 
-    const previousConfig = db.storeConfig;
     db.storeConfig = updated;
     try {
-      saveDb(db);
+      await saveDb(db);
     } catch {
-      db.storeConfig = previousConfig;
-      res.status(500).json({ error: 'Settings could not be saved to persistent storage.' });
+      res.status(500).json({ error: 'Settings could not be saved to PostgreSQL.' });
       return;
     }
     broadcastStateUpdate('config_updated', { storeConfig: db.storeConfig });
@@ -710,7 +764,7 @@ async function startServer() {
   });
 
   // Record submitted UTRs as pending; payment receipt must be confirmed by an admin.
-  app.post('/api/orders/verify-upi', (req, res) => {
+  app.post('/api/orders/verify-upi', async (req, res) => {
     const body = req.body || {};
     const utrNumber = String(body.utrNumber || '')
       .trim()
@@ -866,7 +920,7 @@ async function startServer() {
       item.updatedAt = nowIso;
     }
     db.orders.unshift(newOrder);
-    saveDb(db);
+    if (!(await persistDbOrRespond(res))) return;
 
     // Push instant <50ms notification to Admin Panel & Customer screens
     broadcastStateUpdate('order_created', { order: newOrder });
@@ -904,7 +958,7 @@ async function startServer() {
   });
 
   // Admin 1-Click Verify / Update Order Credentials (Automatically uses Ready ID Vault if not manually overridden)
-  app.post('/api/admin/orders/:orderId/verify', (req, res) => {
+  app.post('/api/admin/orders/:orderId/verify', async (req, res) => {
     const { orderId } = req.params;
     const order = db.orders.find((o) => o.orderId === orderId);
     if (!order) {
@@ -985,13 +1039,13 @@ async function startServer() {
       : `Admin Verified UTR #${order.utrNumber} · Ready Vault ID Sent`;
 
     db.utrIndex[order.utrNumber] = order.orderId;
-    saveDb(db);
+    if (!(await persistDbOrRespond(res))) return;
     broadcastStateUpdate('order_verified', { order });
     res.json({ order, storeConfig: db.storeConfig });
   });
 
   // Admin Reject Order
-  app.post('/api/admin/orders/:orderId/reject', (req, res) => {
+  app.post('/api/admin/orders/:orderId/reject', async (req, res) => {
     const { orderId } = req.params;
     const order = db.orders.find((o) => o.orderId === orderId);
     if (!order) {
@@ -1009,14 +1063,14 @@ async function startServer() {
         item.updatedAt = order.updatedAt;
       }
     }
-    saveDb(db);
+    if (!(await persistDbOrRespond(res))) return;
     broadcastStateUpdate('order_rejected', { order });
 
     res.json({ order });
   });
 
   // Admin Delete Order
-  app.delete('/api/admin/orders/:orderId', (req, res) => {
+  app.delete('/api/admin/orders/:orderId', async (req, res) => {
     const { orderId } = req.params;
     const idx = db.orders.findIndex((o) => o.orderId === orderId);
     if (idx !== -1) {
@@ -1031,14 +1085,14 @@ async function startServer() {
       if (removed && db.utrIndex[removed.utrNumber] === orderId) {
         delete db.utrIndex[removed.utrNumber];
       }
-      saveDb(db);
+      if (!(await persistDbOrRespond(res))) return;
       broadcastStateUpdate('order_deleted', { orderId });
     }
     res.json({ ok: true });
   });
 
   // Admin Add Vault Items
-  app.post('/api/admin/vault', (req, res) => {
+  app.post('/api/admin/vault', async (req, res) => {
     const lines: string[] = Array.isArray(req.body?.lines) ? req.body.lines : [];
     const batchNote = String(req.body?.accountNote || '').trim();
     const poolTypes: VaultPoolType[] = [
@@ -1126,7 +1180,7 @@ async function startServer() {
         db.storeConfig.stockAvailable += addedCount;
         db.storeConfig.presetPermanentCredentials = formattedAddedLines[0];
       }
-      saveDb(db);
+      if (!(await persistDbOrRespond(res))) return;
       broadcastStateUpdate('vault_updated', {});
     }
 
@@ -1134,12 +1188,12 @@ async function startServer() {
   });
 
   // Admin Delete Vault Item
-  app.delete('/api/admin/vault/:vaultId', (req, res) => {
+  app.delete('/api/admin/vault/:vaultId', async (req, res) => {
     const { vaultId } = req.params;
     const idx = db.vault.findIndex((v) => v.vaultId === vaultId);
     if (idx !== -1) {
       db.vault.splice(idx, 1);
-      saveDb(db);
+      if (!(await persistDbOrRespond(res))) return;
       broadcastStateUpdate('vault_updated', {});
     }
     res.json({ ok: true });
@@ -1165,4 +1219,8 @@ async function startServer() {
   });
 }
 
-startServer();
+startServer().catch(async (error: unknown) => {
+  console.error('Failed to start server:', error);
+  await postgresPool.end();
+  process.exitCode = 1;
+});

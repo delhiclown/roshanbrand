@@ -10,3 +10,4 @@ data/admin_auth.json
 
 .vercel
 .env*
+!.env.example

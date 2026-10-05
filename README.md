@@ -25,7 +25,7 @@ Set `ADMIN_PASSWORD` and `ADMIN_RECOVERY_KEY` in a local `.env` file before star
 
 ## Deploy on Render and Vercel
 
-Create a Render Blueprint from this repository using `render.yaml`. Set `ADMIN_PASSWORD` and `ADMIN_RECOVERY_KEY` as private environment variables in the Render dashboard. The service uses a persistent disk at `/var/data` for orders, inventory, store settings, and the admin password hash. On first startup, existing `data/roshanbrand_store.json` is copied as the initial store database.
+Create a Render Blueprint from this repository using `render.yaml`. Set `ADMIN_PASSWORD` and `ADMIN_RECOVERY_KEY` as private environment variables in the Render dashboard. The service uses a persistent disk at `/var/data` for orders, inventory, store settings, and the admin password hash. On first startup, existing `data/roshanbrand_store.json` is copied as the initial store database. Store updates are written atomically, and the server will fail to start rather than replace an unreadable saved database with seed defaults.
 
 The `start` script builds the Vite frontend before starting the server, so deployments that invoke `bun run start` directly still create the required `dist/index.html`.
 

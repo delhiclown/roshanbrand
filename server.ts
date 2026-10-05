@@ -81,9 +81,9 @@ function buildInitialVault(): VaultItem[] {
 }
 
 function loadDb(): PersistedDatabase {
-  try {
-    const sourceFile = fs.existsSync(DATA_FILE) ? DATA_FILE : SEED_DATA_FILE;
-    if (fs.existsSync(sourceFile)) {
+  const sourceFile = fs.existsSync(DATA_FILE) ? DATA_FILE : SEED_DATA_FILE;
+  if (fs.existsSync(sourceFile)) {
+    try {
       const raw = fs.readFileSync(sourceFile, 'utf-8');
       const parsed = JSON.parse(raw) as Partial<PersistedDatabase>;
       const savedStoreConfig: Partial<StoreConfig> = parsed.storeConfig || {};
@@ -174,9 +174,10 @@ function loadDb(): PersistedDatabase {
           : buildInitialVault(),
         utrIndex: verifiedUtrIndex,
       };
+    } catch (err) {
+      console.error('Failed to read store data file; refusing to initialize defaults:', err);
+      throw err;
     }
-  } catch (err) {
-    console.error('Failed to read store data file, initializing fresh DB:', err);
   }
 
   return {
@@ -188,12 +189,21 @@ function loadDb(): PersistedDatabase {
 }
 
 function saveDb(db: PersistedDatabase) {
+  const temporaryFile = `${DATA_FILE}.${process.pid}.tmp`;
   try {
     if (!fs.existsSync(DATA_DIR)) {
       fs.mkdirSync(DATA_DIR, { recursive: true });
     }
-    fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2), 'utf-8');
+    fs.writeFileSync(temporaryFile, JSON.stringify(db, null, 2), 'utf-8');
+    fs.renameSync(temporaryFile, DATA_FILE);
   } catch (err) {
+    try {
+      if (fs.existsSync(temporaryFile)) {
+        fs.unlinkSync(temporaryFile);
+      }
+    } catch (cleanupError) {
+      console.error('Failed to remove temporary store data file:', cleanupError);
+    }
     console.error('Failed to persist store data:', err);
     throw err;
   }

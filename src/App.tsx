@@ -779,7 +779,10 @@ export default function App() {
                     : option.isOneMonthGuarantee
                       ? vaultStock.guarantee_1month
                       : vaultStock.permanent;
-                const stockCount = Math.min(configuredStockCount, availableVaultStock);
+                const stockCount =
+                  option.isSevenDayGuarantee || option.isOneMonthGuarantee
+                    ? configuredStockCount
+                    : Math.min(configuredStockCount, availableVaultStock);
                 const isOutOfStock = stockCount <= 0;
 
                 return (

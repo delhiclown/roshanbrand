@@ -15,6 +15,32 @@
   background-size: 100% 100%, 44px 44px, 44px 44px;
 }
 
+.stock-notice-backdrop {
+  animation: stock-notice-backdrop-in 180ms ease-out both;
+}
+
+.stock-notice-panel {
+  padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
+  animation: stock-notice-slide-up 320ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+@keyframes stock-notice-backdrop-in {
+  from { background-color: rgba(2, 6, 23, 0); }
+  to { background-color: rgba(2, 6, 23, 0.45); }
+}
+
+@keyframes stock-notice-slide-up {
+  from { transform: translateY(36px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stock-notice-backdrop,
+  .stock-notice-panel {
+    animation-duration: 1ms;
+  }
+}
+
 .app-scene {
   z-index: 0;
   pointer-events: none;

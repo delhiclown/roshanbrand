@@ -36,6 +36,7 @@ import {
 } from './types';
 
 const orderAccessStorageKey = (orderId: string) => `roshanbrand_order_access_${orderId}`;
+const cookieAuthenticatedOrder = 'http-only-cookie';
 
 interface ProductOption {
   id: string;
@@ -91,13 +92,6 @@ export default function App() {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [supportOpen, setSupportOpen] = useState<boolean>(false);
   const [inlineQrDataUrl, setInlineQrDataUrl] = useState<string>('');
-  const [cookieConsent, setCookieConsent] = useState<'accepted' | 'dismissed' | 'unknown'>(() => {
-    try {
-      return (localStorage.getItem('roshanbrand_cookie_consent') as 'accepted' | 'dismissed' | null) || 'unknown';
-    } catch {
-      return 'unknown';
-    }
-  });
   const displayedPermanentStock = storeConfig.stockDisplayAvailable;
   const displayedRentalStock = storeConfig.rentalStockDisplayAvailable;
   const availableRentalStock = Math.max(
@@ -164,7 +158,17 @@ export default function App() {
     events.onmessage = (event) => {
       try {
         const message = JSON.parse(event.data) as { type?: string };
-        if (message.type === 'config_updated') {
+        if (
+          [
+            'config_updated',
+            'order_created',
+            'order_rejected',
+            'order_deleted',
+            'order_verified',
+            'vault_updated',
+            'guarantee_claim_replaced',
+          ].includes(message.type || '')
+        ) {
           loadStore();
         }
       } catch {
@@ -212,22 +216,29 @@ export default function App() {
           } catch {
             accessToken = '';
           }
-          if (accessToken) {
-            setTrackedOrderAccessToken(accessToken);
-            const accessResponse = await fetch('/api/orders/access', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ orderId: order.orderId, accessToken }),
-            });
-            if (accessResponse.ok) {
-              const accessData = await accessResponse.json();
-              order = accessData.order;
-              setGuaranteeClaims(accessData.guaranteeClaims || []);
-            }
+          const accessResponse = await fetch('/api/orders/access', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              orderId: order.orderId,
+              ...(accessToken ? { accessToken } : {}),
+            }),
+          });
+          try {
+            localStorage.removeItem(orderAccessStorageKey(order.orderId));
+          } catch {
+            // The access key is no longer written to browser storage.
+          }
+          if (accessResponse.ok) {
+            const accessData = await accessResponse.json();
+            order = accessData.order;
+            setTrackedOrderAccessToken(accessToken || cookieAuthenticatedOrder);
+            setGuaranteeClaims(accessData.guaranteeClaims || []);
           } else {
             setTrackedOrderAccessToken('');
             setGuaranteeClaims([]);
           }
+          if (!active) return;
           setTrackedOrder(order);
           setTrackError('');
         } else {
@@ -540,14 +551,8 @@ export default function App() {
     });
   };
 
-  const handleOrderCreated = (order: OrderRecord) => {
-    try {
-      setTrackedOrderAccessToken(
-        localStorage.getItem(orderAccessStorageKey(order.orderId)) || ''
-      );
-    } catch {
-      setTrackedOrderAccessToken('');
-    }
+  const handleOrderCreated = (order: OrderRecord, accessToken = '') => {
+    setTrackedOrderAccessToken(accessToken);
     setGuaranteeClaims([]);
     setTrackedOrderId(order.orderId);
     setSearchInput(order.orderId);
@@ -580,7 +585,7 @@ export default function App() {
           return;
         }
         try {
-          localStorage.setItem(orderAccessStorageKey(data.order.orderId), accessToken);
+          localStorage.removeItem(orderAccessStorageKey(data.order.orderId));
         } catch {
           // The access key remains available in the field for this visit.
         }
@@ -682,43 +687,8 @@ export default function App() {
     );
   }
 
-  const handleCookieConsent = (decision: 'accepted' | 'dismissed') => {
-    setCookieConsent(decision);
-    try {
-      localStorage.setItem('roshanbrand_cookie_consent', decision);
-    } catch {
-      // ignore unavailable storage
-    }
-  };
-
   return (
     <div className="app-shell relative min-h-dvh flex flex-col text-slate-100">
-      {cookieConsent === 'unknown' && (
-        <div className="sticky top-0 z-40 border-b border-cyan-500/30 bg-slate-950/95 backdrop-blur-sm">
-          <div className="mx-auto flex max-w-5xl flex-col gap-3 px-4 py-3 text-sm text-slate-200 sm:flex-row sm:items-center sm:justify-between">
-            <p className="leading-relaxed">
-              This site stores order tracking and session data in your browser to show status and
-              private access details. By continuing, you accept local cookie storage.
-            </p>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => handleCookieConsent('accepted')}
-                className="rounded-lg bg-cyan-500 px-3 py-1.5 font-semibold text-slate-950 transition hover:bg-cyan-400"
-              >
-                Accept
-              </button>
-              <button
-                type="button"
-                onClick={() => handleCookieConsent('dismissed')}
-                className="rounded-lg border border-slate-600 px-3 py-1.5 font-semibold text-slate-200 transition hover:border-slate-400 hover:bg-slate-800"
-              >
-                Dismiss
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
       <div className="app-scene" aria-hidden="true">
         <div className="app-scene-blob app-scene-blob--cyan" />
         <div className="app-scene-blob app-scene-blob--violet" />
@@ -1569,17 +1539,17 @@ export default function App() {
         </div>
       </main>
 
-      {/* Support Modal */}
+      {/* Rental stock notice */}
       {rentalStockNoticeOpen && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-4 backdrop-blur-md"
+          className="stock-notice-backdrop fixed inset-0 z-50 flex items-center justify-center bg-slate-950/45 p-4"
           onClick={() => setRentalStockNoticeOpen(false)}
         >
           <section
             role="dialog"
             aria-modal="true"
             aria-labelledby="rental-stock-notice-title"
-            className="relative z-10 w-full max-w-sm overflow-hidden rounded-[28px] border border-cyan-300/25 bg-[#070c1d] text-white shadow-[0_24px_100px_rgba(0,0,0,0.65),0_0_60px_rgba(34,211,238,0.14)]"
+            className="stock-notice-panel relative z-10 w-full max-w-sm overflow-hidden rounded-[28px] border border-cyan-300/25 bg-[#070c1d] text-white shadow-[0_24px_80px_rgba(0,0,0,0.45),0_0_45px_rgba(34,211,238,0.12)]"
             onClick={(event) => event.stopPropagation()}
           >
             <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_top_left,rgba(8,145,178,0.14),transparent_55%)]" />
@@ -1594,8 +1564,11 @@ export default function App() {
             </button>
 
             <div className="relative p-6 sm:p-7">
+              <div className="mb-5 text-center text-[11px] font-bold uppercase tracking-[0.2em] text-cyan-300/80">
+                24-hour rental IDs
+              </div>
               <div
-                className={`flex h-11 w-11 items-center justify-center rounded-2xl border ${
+                className={`mx-auto flex h-12 w-12 items-center justify-center rounded-2xl border ${
                   availableRentalStock > 0
                     ? 'border-cyan-300/30 bg-cyan-400/10 text-cyan-300'
                     : 'border-rose-300/25 bg-rose-400/10 text-rose-300'

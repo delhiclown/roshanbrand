@@ -17,14 +17,12 @@ import { LIMITS } from '../src/constants';
 import { CheckoutDraft, OrderRecord, StoreConfig } from '../src/types';
 import { UpiQrBox } from './UpiQrBox';
 
-const orderAccessStorageKey = (orderId: string) => `roshanbrand_order_access_${orderId}`;
-
 interface CheckoutModalProps {
   draft: CheckoutDraft | null;
   activeOrder: OrderRecord | null;
   storeConfig: StoreConfig;
   onClose: () => void;
-  onOrderCreated: (order: OrderRecord) => void;
+  onOrderCreated: (order: OrderRecord, accessToken?: string) => void;
 }
 
 /**
@@ -132,7 +130,6 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         }
         setOrderAccessToken(returnedAccessToken);
         try {
-          localStorage.setItem(orderAccessStorageKey(order.orderId), returnedAccessToken);
           const recent = JSON.parse(
             localStorage.getItem('roshanbrand_recent_orders') || '[]'
           ) as string[];
@@ -141,12 +138,13 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
             15
           );
           localStorage.setItem('roshanbrand_recent_orders', JSON.stringify(updated));
+          localStorage.removeItem(`roshanbrand_order_access_${order.orderId}`);
         } catch {
-          // ignore storage errors
+          // Order access keys are kept in memory and an HttpOnly cookie.
         }
 
         setCompletedOrder(order);
-        onOrderCreated(order);
+        onOrderCreated(order, returnedAccessToken);
       } catch (err) {
         setErrorMsg(
           err instanceof Error
@@ -183,23 +181,20 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         if (!active || !lookupResponse.ok) return;
         const lookupData = await lookupResponse.json();
         let order: OrderRecord = lookupData.order;
-        const accessToken =
-          orderAccessToken ||
-          localStorage.getItem(orderAccessStorageKey(completedOrder.orderId)) ||
-          '';
-        if (accessToken) {
-          const accessResponse = await fetch('/api/orders/access', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ orderId: completedOrder.orderId, accessToken }),
-          });
-          if (!active || !accessResponse.ok) return;
-          const accessData = await accessResponse.json();
-          order = accessData.order;
-        }
+        const accessResponse = await fetch('/api/orders/access', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            orderId: completedOrder.orderId,
+            ...(orderAccessToken ? { accessToken: orderAccessToken } : {}),
+          }),
+        });
+        if (!active || !accessResponse.ok) return;
+        const accessData = await accessResponse.json();
+        order = accessData.order;
         if (order && order.status !== completedOrder.status) {
           setCompletedOrder(order);
-          onOrderCreated(order);
+          onOrderCreated(order, orderAccessToken);
         }
       } catch {
         // ignore
@@ -236,7 +231,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         credentialsExpired: true,
       };
       setCompletedOrder(expiredOrder);
-      onOrderCreated(expiredOrder);
+      onOrderCreated(expiredOrder, orderAccessToken);
     };
     const delay = expiry - Date.now();
     if (delay <= 0) {

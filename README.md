@@ -20,7 +20,7 @@ View your app in AI Studio: https://ai.studio/apps/29d744aa-58e5-4984-afcc-c6959
 4. Run the app:
    `npm run dev`
 
-Orders receive a private access key. Save it from the order confirmation if you need to view delivered credentials on another device. The public order lookup shows status only and never returns credentials. Orders created before access keys were introduced need support assistance to recover.
+Orders receive a private access key. Save it from the order confirmation if you need to view delivered credentials on another device. On the same browser, the key is kept in an HttpOnly cookie rather than browser-accessible storage. The public order lookup shows status only and never returns credentials. Orders created before access keys were introduced need support assistance to recover.
 
 ## Admin Access
 
@@ -28,7 +28,7 @@ Set `ADMIN_PASSWORD` and `ADMIN_RECOVERY_KEY` in a local `.env` file before star
 
 ## Deploy on Render and Vercel
 
-Create a PostgreSQL database on Render or Supabase and set its connection string as the private `DATABASE_URL` environment variable in Render. Set `ADMIN_PASSWORD` and `ADMIN_RECOVERY_KEY` as private environment variables as well. Store config, orders, and vault data are persisted in the PostgreSQL `roshanbrand_state` table. The table is created automatically. On the first start against an empty database, existing `/var/data/roshanbrand_store.json` data (or the bundled seed file if it is absent) is imported once; subsequent starts load the existing database row without replacing it with defaults. The `/var/data` persistent disk remains in use for the admin password hash and legacy data import.
+Create a PostgreSQL database on Render or Supabase and set its connection string as the private `DATABASE_URL` environment variable in Render. Production startup requires this setting; JSON-file persistence is only available for local development. Set `ADMIN_PASSWORD` and `ADMIN_RECOVERY_KEY` as private environment variables as well. Store config, orders, and vault data are persisted in the PostgreSQL `roshanbrand_state` table. The table is created automatically. On the first start against an empty database, existing `/var/data/roshanbrand_store.json` data (or the bundled seed file if it is absent) is imported once; subsequent starts load the existing database row without replacing it with defaults. The `/var/data` persistent disk remains in use for the admin password hash and legacy data import.
 
 The `start` script builds the Vite frontend before starting the server, so deployments that invoke `bun run start` directly still create the required `dist/index.html`.
 

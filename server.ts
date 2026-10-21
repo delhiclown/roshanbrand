@@ -32,57 +32,11 @@ interface PersistedDatabase {
   orders: OrderRecord[];
   vault: VaultItem[];
   utrIndex: Record<string, string>;
+  orderAccessTokens: Record<string, string>;
 }
 
 function buildInitialVault(): VaultItem[] {
-  const now = new Date().toISOString();
-  const rentalAccounts = [
-    { u: 'roshan_rent24_101', p: 'Tatkal@2491', note: '24H Active Rental · Aadhaar Verified' },
-    { u: 'roshan_rent24_102', p: 'Tatkal@2492', note: '24H Active Rental · Aadhaar Verified' },
-    { u: 'roshan_rent24_103', p: 'Tatkal@2493', note: '24H Active Rental · Aadhaar Verified' },
-    { u: 'roshan_rent24_104', p: 'Tatkal@2494', note: '24H Active Rental · Aadhaar Verified' },
-    { u: 'roshan_rent24_105', p: 'Tatkal@2495', note: '24H Active Rental · Aadhaar Verified' },
-    { u: 'roshan_rent24_106', p: 'Tatkal@2496', note: '24H Active Rental · Aadhaar Verified' },
-  ];
-
-  const permanentAccounts = [
-    { u: 'rb_irctc_vip801', p: 'RailPass@801', note: 'Permanent Aadhaar Verified' },
-    { u: 'rb_irctc_vip802', p: 'RailPass@802', note: 'Permanent Aadhaar Verified' },
-    { u: 'rb_irctc_vip803', p: 'RailPass@803', note: 'Permanent Aadhaar Verified' },
-    { u: 'rb_irctc_vip804', p: 'RailPass@804', note: 'Permanent Aadhaar Verified' },
-  ];
-
-  const items: VaultItem[] = [];
-
-  rentalAccounts.forEach((acc, i) => {
-    items.push({
-      vaultId: `VAULT_RENT_${1000 + i}`,
-      irctcUsername: acc.u,
-      irctcPassword: acc.p,
-      accountNote: acc.note,
-      poolType: 'rental_24h',
-      isAssigned: false,
-      assignedOrderId: '',
-      createdAt: now,
-      updatedAt: now,
-    });
-  });
-
-  permanentAccounts.forEach((acc, i) => {
-    items.push({
-      vaultId: `VAULT_PERM_${2000 + i}`,
-      irctcUsername: acc.u,
-      irctcPassword: acc.p,
-      accountNote: acc.note,
-      poolType: 'permanent',
-      isAssigned: false,
-      assignedOrderId: '',
-      createdAt: now,
-      updatedAt: now,
-    });
-  });
-
-  return items;
+  return [];
 }
 
 function loadDb(): PersistedDatabase {
@@ -93,6 +47,10 @@ function loadDb(): PersistedDatabase {
       const parsed = JSON.parse(raw) as Partial<PersistedDatabase>;
       const savedStoreConfig: Partial<StoreConfig> = parsed.storeConfig || {};
       const orders = Array.isArray(parsed.orders) ? parsed.orders : [];
+      const orderAccessTokens =
+        parsed.orderAccessTokens && typeof parsed.orderAccessTokens === 'object'
+          ? parsed.orderAccessTokens
+          : {};
       const verifiedUtrIndex: Record<string, string> = {};
       for (const order of orders) {
         order.deliveredCredentials = sanitizeDeliveredCredentials(
@@ -178,6 +136,7 @@ function loadDb(): PersistedDatabase {
             }))
           : buildInitialVault(),
         utrIndex: verifiedUtrIndex,
+        orderAccessTokens,
       };
     } catch (err) {
       console.error('Failed to read store data file; refusing to initialize defaults:', err);
@@ -190,6 +149,7 @@ function loadDb(): PersistedDatabase {
     orders: [],
     vault: buildInitialVault(),
     utrIndex: {},
+    orderAccessTokens: {},
   };
 }
 
@@ -211,6 +171,7 @@ async function initializePersistence(db: PersistedDatabase): Promise<void> {
   );
   if (existing.rows[0]) {
     Object.assign(db, existing.rows[0].state);
+    db.orderAccessTokens ||= {};
     lastPersistedState = JSON.stringify(db);
     return;
   }
@@ -229,6 +190,7 @@ async function initializePersistence(db: PersistedDatabase): Promise<void> {
     throw new Error('Could not initialize persistent application state.');
   }
   Object.assign(db, initialized.rows[0].state);
+  db.orderAccessTokens ||= {};
   lastPersistedState = JSON.stringify(db);
 }
 
@@ -639,7 +601,26 @@ async function startServer() {
           item.poolType === 'guarantee_1month' && !item.isAssigned && !item.reservedOrderId
       ).length,
     };
-    res.json({ storeConfig: db.storeConfig, vaultStock });
+    const storeConfig = {
+      ...db.storeConfig,
+      stockDisplayAvailable: Math.min(
+        db.storeConfig.stockDisplayAvailable,
+        vaultStock.permanent
+      ),
+      rentalStockDisplayAvailable: Math.min(
+        db.storeConfig.rentalStockDisplayAvailable,
+        vaultStock.rental_24h
+      ),
+      stock7DayGuaranteeAvailable: Math.min(
+        db.storeConfig.stock7DayGuaranteeAvailable,
+        vaultStock.guarantee_7days
+      ),
+      stock1MonthGuaranteeAvailable: Math.min(
+        db.storeConfig.stock1MonthGuaranteeAvailable,
+        vaultStock.guarantee_1month
+      ),
+    };
+    res.json({ storeConfig, vaultStock });
   });
 
   // Update Store Config
@@ -765,6 +746,7 @@ async function startServer() {
 
   // Record submitted UTRs as pending; payment receipt must be confirmed by an admin.
   app.post('/api/orders/verify-upi', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
     const body = req.body || {};
     const utrNumber = String(body.utrNumber || '')
       .trim()
@@ -780,57 +762,25 @@ async function startServer() {
       return;
     }
 
-    const turnstileSecretKey = process.env.TURNSTILE_SECRET_KEY;
-    if (!turnstileSecretKey) {
-      console.error('Turnstile verification is unavailable: TURNSTILE_SECRET_KEY is not set.');
-      res.status(503).json({ error: 'Human verification is unavailable. Please contact support.' });
+    const accessToken = String(body.accessToken || '').trim();
+    if (!/^[a-f0-9]{64}$/i.test(accessToken)) {
+      res.status(400).json({ error: 'A valid private order access key is required.' });
       return;
     }
 
-    const captchaToken = String(body.captchaToken || '').trim();
-    if (!captchaToken) {
-      res.status(400).json({ error: 'Please complete the human verification.' });
-      return;
-    }
-
-    try {
-      const verificationBody = new URLSearchParams({
-        secret: turnstileSecretKey,
-        response: captchaToken,
-      });
-      if (req.ip) verificationBody.set('remoteip', req.ip);
-
-      const verificationResponse = await fetch(
-        'https://challenges.cloudflare.com/turnstile/v0/siteverify',
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: verificationBody,
-        }
-      );
-
-      if (!verificationResponse.ok) {
-        console.error(`Turnstile verification returned HTTP ${verificationResponse.status}.`);
-        res.status(502).json({ error: 'Human verification failed. Please try again.' });
+    const existingOrder = db.orders.find((order) => order.utrNumber === utrNumber);
+    if (existingOrder) {
+      const expectedHash = db.orderAccessTokens[existingOrder.orderId];
+      const suppliedHash = createHash('sha256').update(accessToken).digest();
+      const expectedDigest = expectedHash ? Buffer.from(expectedHash, 'hex') : Buffer.alloc(0);
+      if (
+        expectedHash &&
+        suppliedHash.length === expectedDigest.length &&
+        timingSafeEqual(suppliedHash, expectedDigest)
+      ) {
+        res.status(200).json({ order: existingOrder, accessToken });
         return;
       }
-
-      const verification = (await verificationResponse.json()) as {
-        success?: boolean;
-        'error-codes'?: string[];
-      };
-      if (!verification.success) {
-        console.warn('Turnstile verification rejected a token:', verification['error-codes'] || []);
-        res.status(400).json({ error: 'Human verification failed. Please verify again.' });
-        return;
-      }
-    } catch (error) {
-      console.error('Turnstile verification request failed.', error);
-      res.status(502).json({ error: 'Human verification could not be checked. Please try again.' });
-      return;
-    }
-
-    if (db.utrIndex[utrNumber]) {
       res.status(409).json({
         error:
           'Yeh UTR number pehle se submit ho chuka hai. Kripya apna UTR check karein ya Track Order me dekhein.',
@@ -923,10 +873,7 @@ async function startServer() {
 
     const now = new Date();
     const nowIso = now.toISOString();
-    const orderId = `RB_${Date.now()}_${Math.random()
-      .toString(36)
-      .substring(2, 6)
-      .toUpperCase()}`;
+    const orderId = `RB_${Date.now()}_${randomBytes(6).toString('hex').toUpperCase()}`;
 
     const status: OrderRecord['status'] = 'pending_verification';
     const deliveredCredentials = '';
@@ -970,16 +917,18 @@ async function startServer() {
       item.updatedAt = nowIso;
     }
     db.orders.unshift(newOrder);
+    db.orderAccessTokens[orderId] = createHash('sha256').update(accessToken).digest('hex');
     if (!(await persistDbOrRespond(res))) return;
 
     // Push instant <50ms notification to Admin Panel & Customer screens
     broadcastStateUpdate('order_created', { order: newOrder });
 
-    res.status(201).json({ order: newOrder, storeConfig: db.storeConfig });
+    res.status(201).json({ order: newOrder, accessToken, storeConfig: db.storeConfig });
   });
 
   // Lookup Order by Order ID or 12-Digit UTR Number
   app.get('/api/orders/lookup', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
     const q = String(req.query.q || '').trim();
     if (!q) {
       res.status(400).json({ error: 'Please provide an Order ID or UTR number.' });
@@ -995,7 +944,46 @@ async function startServer() {
       return;
     }
 
-    res.json({ order: found });
+    res.json({
+      order: {
+        ...found,
+        utrNumber: '',
+        customerReference: '',
+        customSpec: '',
+        deliveredCredentials: '',
+        adminNote:
+          found.status === 'rejected'
+            ? 'Payment review could not be completed. Please contact support.'
+            : '',
+      },
+    });
+  });
+
+  app.post('/api/orders/access', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const orderId = String(req.body?.orderId || '').trim();
+    const accessToken = String(req.body?.accessToken || '').trim();
+    const expectedHash = db.orderAccessTokens[orderId];
+    const suppliedHash = createHash('sha256').update(accessToken).digest();
+    const expectedDigest = expectedHash ? Buffer.from(expectedHash, 'hex') : Buffer.alloc(0);
+
+    if (
+      !expectedHash ||
+      !/^[a-f0-9]{64}$/i.test(accessToken) ||
+      suppliedHash.length !== expectedDigest.length ||
+      !timingSafeEqual(suppliedHash, expectedDigest)
+    ) {
+      res.status(401).json({ error: 'The order access key is invalid.' });
+      return;
+    }
+
+    const order = db.orders.find((item) => item.orderId === orderId);
+    if (!order) {
+      res.status(404).json({ error: 'Order not found.' });
+      return;
+    }
+
+    res.json({ order });
   });
 
   // Admin Portal State
@@ -1135,6 +1123,7 @@ async function startServer() {
       if (removed && db.utrIndex[removed.utrNumber] === orderId) {
         delete db.utrIndex[removed.utrNumber];
       }
+      delete db.orderAccessTokens[orderId];
       if (!(await persistDbOrRespond(res))) return;
       broadcastStateUpdate('order_deleted', { orderId });
     }

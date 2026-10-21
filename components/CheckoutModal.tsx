@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   AlertCircle,
   Check,
@@ -17,57 +17,7 @@ import { LIMITS } from '../src/constants';
 import { CheckoutDraft, OrderRecord, StoreConfig } from '../src/types';
 import { UpiQrBox } from './UpiQrBox';
 
-interface TurnstileApi {
-  render: (
-    container: HTMLElement,
-    options: {
-      sitekey: string;
-      theme: 'dark';
-      callback: (token: string) => void;
-      'error-callback': () => void;
-      'expired-callback': () => void;
-    }
-  ) => string;
-  reset: (widgetId?: string) => void;
-  remove: (widgetId: string) => void;
-}
-
-declare global {
-  interface Window {
-    turnstile?: TurnstileApi;
-  }
-}
-
-const TURNSTILE_SCRIPT_URL =
-  'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
-let turnstileScriptPromise: Promise<TurnstileApi> | null = null;
-
-function loadTurnstile(): Promise<TurnstileApi> {
-  if (window.turnstile) return Promise.resolve(window.turnstile);
-  if (turnstileScriptPromise) return turnstileScriptPromise;
-
-  turnstileScriptPromise = new Promise((resolve, reject) => {
-    const script = document.createElement('script');
-    script.src = TURNSTILE_SCRIPT_URL;
-    script.async = true;
-    script.defer = true;
-    script.onload = () => {
-      if (window.turnstile) {
-        resolve(window.turnstile);
-      } else {
-        turnstileScriptPromise = null;
-        reject(new Error('Cloudflare Turnstile did not initialize.'));
-      }
-    };
-    script.onerror = () => {
-      turnstileScriptPromise = null;
-      reject(new Error('Cloudflare Turnstile could not be loaded.'));
-    };
-    document.head.appendChild(script);
-  });
-
-  return turnstileScriptPromise;
-}
+const orderAccessStorageKey = (orderId: string) => `roshanbrand_order_access_${orderId}`;
 
 interface CheckoutModalProps {
   draft: CheckoutDraft | null;
@@ -103,68 +53,8 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [completedOrder, setCompletedOrder] = useState<OrderRecord | null>(activeOrder);
-  const [captchaToken, setCaptchaToken] = useState('');
-  const [captchaStatus, setCaptchaStatus] = useState<'loading' | 'ready' | 'missing' | 'error'>(
-    'loading'
-  );
-  const [captchaError, setCaptchaError] = useState<string | null>(null);
-  const captchaContainerRef = useRef<HTMLDivElement>(null);
-  const captchaWidgetRef = useRef<string | null>(null);
-
-  useEffect(() => {
-    if (!draft || completedOrder) return;
-
-    const siteKey = import.meta.env.VITE_TURNSTILE_SITE_KEY;
-    if (!siteKey) {
-      setCaptchaStatus('missing');
-      setCaptchaError('Captcha is not configured. Please contact support.');
-      return;
-    }
-
-    let cancelled = false;
-    setCaptchaStatus('loading');
-    setCaptchaError(null);
-
-    loadTurnstile()
-      .then((turnstile) => {
-        if (cancelled || !captchaContainerRef.current) return;
-
-        captchaWidgetRef.current = turnstile.render(captchaContainerRef.current, {
-          sitekey: siteKey,
-          theme: 'dark',
-          callback: (token) => {
-            setCaptchaToken(token);
-            setCaptchaError(null);
-          },
-          'error-callback': () => {
-            setCaptchaToken('');
-            setCaptchaError('Captcha verification failed. Please try again.');
-          },
-          'expired-callback': () => {
-            setCaptchaToken('');
-            setCaptchaError('Captcha expired. Please verify again.');
-          },
-        });
-        setCaptchaStatus('ready');
-      })
-      .catch((error: unknown) => {
-        if (cancelled) return;
-        setCaptchaStatus('error');
-        setCaptchaError(
-          error instanceof Error
-            ? error.message
-            : 'Captcha could not be loaded. Please refresh and try again.'
-        );
-      });
-
-    return () => {
-      cancelled = true;
-      if (captchaWidgetRef.current && window.turnstile) {
-        window.turnstile.remove(captchaWidgetRef.current);
-        captchaWidgetRef.current = null;
-      }
-    };
-  }, [draft, completedOrder]);
+  const [orderAccessToken, setOrderAccessToken] = useState('');
+  const [orderAccessTokenUtr, setOrderAccessTokenUtr] = useState('');
 
   const submitUtrForReview = useCallback(
     async (rawUtrToVerify: string) => {
@@ -179,14 +69,16 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         return;
       }
 
-      if (!captchaToken) {
-        setErrorMsg('Please complete the human verification before submitting your UTR.');
-        return;
-      }
-
       setSubmitting(true);
 
       try {
+        const accessToken =
+          (orderAccessTokenUtr === cleanedUtr && orderAccessToken) ||
+          Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) =>
+            byte.toString(16).padStart(2, '0')
+          ).join('');
+        setOrderAccessToken(accessToken);
+        setOrderAccessTokenUtr(cleanedUtr);
         const response = await fetch('/api/orders/verify-upi', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -198,7 +90,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
             unitPrice: draft.unitPrice,
             totalAmount: draft.totalAmount,
             utrNumber: cleanedUtr,
-            captchaToken,
+            accessToken,
             upiAppUsed,
             customerReference: customerRef.trim() || 'Direct UPI Buyer',
             customSpec: customSpec.trim(),
@@ -208,13 +100,17 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         const data = await response.json();
         if (!response.ok) {
           setErrorMsg(data.error || 'UTR submission failed. Please check your UTR number.');
-          setCaptchaToken('');
-          window.turnstile?.reset(captchaWidgetRef.current || undefined);
           return;
         }
 
         const order: OrderRecord = data.order;
+        const returnedAccessToken = String(data.accessToken || '');
+        if (returnedAccessToken !== accessToken) {
+          throw new Error('Order was created, but its secure access key was not returned.');
+        }
+        setOrderAccessToken(returnedAccessToken);
         try {
+          localStorage.setItem(orderAccessStorageKey(order.orderId), returnedAccessToken);
           const recent = JSON.parse(
             localStorage.getItem('roshanbrand_recent_orders') || '[]'
           ) as string[];
@@ -235,8 +131,6 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
             ? err.message
             : 'Network error while submitting your UTR. Please try again.'
         );
-        setCaptchaToken('');
-        window.turnstile?.reset(captchaWidgetRef.current || undefined);
       } finally {
         setSubmitting(false);
       }
@@ -245,7 +139,8 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
       draft,
       submitting,
       completedOrder,
-      captchaToken,
+      orderAccessToken,
+      orderAccessTokenUtr,
       upiAppUsed,
       customerRef,
       customSpec,
@@ -260,14 +155,29 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
     let active = true;
     const checkLiveStatus = async () => {
       try {
-        const res = await fetch(
+        const lookupResponse = await fetch(
           `/api/orders/lookup?q=${encodeURIComponent(completedOrder.orderId)}`
         );
-        if (!active || !res.ok) return;
-        const data = await res.json();
-        if (data.order && data.order.status !== completedOrder.status) {
-          setCompletedOrder(data.order);
-          onOrderCreated(data.order);
+        if (!active || !lookupResponse.ok) return;
+        const lookupData = await lookupResponse.json();
+        let order: OrderRecord = lookupData.order;
+        const accessToken =
+          orderAccessToken ||
+          localStorage.getItem(orderAccessStorageKey(completedOrder.orderId)) ||
+          '';
+        if (accessToken) {
+          const accessResponse = await fetch('/api/orders/access', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ orderId: completedOrder.orderId, accessToken }),
+          });
+          if (!active || !accessResponse.ok) return;
+          const accessData = await accessResponse.json();
+          order = accessData.order;
+        }
+        if (order && order.status !== completedOrder.status) {
+          setCompletedOrder(order);
+          onOrderCreated(order);
         }
       } catch {
         // ignore
@@ -285,7 +195,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
       es.close();
       clearInterval(interval);
     };
-  }, [completedOrder, onOrderCreated]);
+  }, [completedOrder, onOrderCreated, orderAccessToken]);
 
   if (!draft && !completedOrder) return null;
 
@@ -512,6 +422,25 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                     UTR submit karna payment proof nahi hai. Apne payment app ki receipt sambhal kar rakhein.
                   </p>
                 )}
+                {orderAccessToken && (
+                  <div className="rounded-lg border border-amber-300/30 bg-slate-950/50 p-3 space-y-2">
+                    <p className="text-[11px] font-bold text-amber-100">
+                      Save this private order access key to view your order on another device.
+                    </p>
+                    <div className="flex items-center gap-2">
+                      <code className="min-w-0 flex-1 break-all text-[10px] text-slate-200">
+                        {orderAccessToken}
+                      </code>
+                      <button
+                        type="button"
+                        onClick={() => copyText(orderAccessToken, 'access-key')}
+                        className="shrink-0 rounded-lg border border-amber-300/40 px-2.5 py-1.5 text-[11px] font-bold text-amber-100"
+                      >
+                        {copiedKey === 'access-key' ? 'Copied' : 'Copy key'}
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 
@@ -632,26 +561,6 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                     </p>
                   </div>
 
-                  <div className="space-y-1.5">
-                    <div
-                      ref={captchaContainerRef}
-                      className="min-h-[65px] overflow-hidden rounded-lg"
-                      aria-label="Human verification"
-                    />
-                    {captchaError && (
-                      <p
-                        className={`text-[11px] ${
-                          captchaStatus === 'missing' || captchaStatus === 'error'
-                            ? 'text-red-300'
-                            : 'text-amber-300'
-                        }`}
-                        role="status"
-                      >
-                        {captchaError}
-                      </p>
-                    )}
-                  </div>
-
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <div>
                       <label className="block text-xs font-semibold text-slate-300 mb-1">
@@ -696,8 +605,8 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
 
                 <button
                   type="submit"
-                  disabled={submitting || !captchaToken}
-                  className="w-full py-3 px-5 text-sm font-extrabold text-white store-pay-pill rounded-xl flex items-center justify-center gap-2 disabled:opacity-50 cursor-not-allowed"
+                  disabled={submitting}
+                  className="w-full py-3 px-5 text-sm font-extrabold text-white store-pay-pill rounded-xl flex items-center justify-center gap-2 disabled:opacity-50 cursor-pointer"
                 >
                   {submitting ? (
                     <>

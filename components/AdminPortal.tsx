@@ -1542,7 +1542,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-cyan-500/35 text-sm text-emerald-400 font-mono font-black"
                   />
                   <p className="text-[11px] text-slate-400">
-                    Manually set customer availability. This value stays fixed after orders.
+                    Customer availability is capped by unassigned IDs in the matching vault pool.
                   </p>
                 </div>
 
@@ -1575,7 +1575,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-emerald-500/40 text-sm text-emerald-400 font-mono font-black"
                   />
                   <p className="text-[11px] text-slate-400">
-                    Manually set customer availability. This value stays fixed after orders.
+                    Customer availability is capped by unassigned IDs in the matching vault pool.
                   </p>
                 </div>
 
@@ -1608,7 +1608,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-cyan-500/35 text-sm text-emerald-400 font-mono font-black"
                   />
                   <p className="text-[11px] text-slate-400">
-                    Manually set customer availability. This value stays fixed after orders.
+                    Customer availability is capped by unassigned IDs in the matching vault pool.
                   </p>
                 </div>
 
@@ -1641,7 +1641,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-emerald-500/40 text-sm text-emerald-400 font-mono font-black"
                   />
                   <p className="text-[11px] text-slate-400">
-                    Manually set customer availability. This value stays fixed after orders.
+                    Customer availability is capped by unassigned IDs in the matching vault pool.
                   </p>
                 </div>
 
@@ -1728,7 +1728,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div className="space-y-1.5">
                     <label className="block text-xs font-extrabold text-emerald-300">
-                      Pre-Set 24-Hour Rental IRCTC ID (₹49 Plan)
+                      Pre-Set 24-Hour Rental IRCTC ID Credentials
                     </label>
                     <textarea
                       rows={3}

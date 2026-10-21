@@ -17,9 +17,10 @@ View your app in AI Studio: https://ai.studio/apps/29d744aa-58e5-4984-afcc-c6959
    `npm install`
 2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
 3. Set `DATABASE_URL` in `.env` to a PostgreSQL connection string (Render Postgres or Supabase; include `sslmode=require` if required).
-4. Configure Cloudflare Turnstile: set `VITE_TURNSTILE_SITE_KEY` for the frontend and `TURNSTILE_SECRET_KEY` for the backend. Locally, put the site key in `.env.local` (or `.env`) and the secret key in `.env`. Both values are required for UTR submission.
-5. Run the app:
+4. Run the app:
    `npm run dev`
+
+Orders receive a private access key. Save it from the order confirmation if you need to view delivered credentials on another device. The public order lookup shows status only and never returns credentials. Orders created before access keys were introduced need support assistance to recover.
 
 ## Admin Access
 
@@ -33,6 +34,6 @@ The `start` script builds the Vite frontend before starting the server, so deplo
 
 If the frontend is deployed on Vercel, keep the backend on Render. `vercel.json` forwards every `/api/*` request to `https://roshanbrand.onrender.com`, so store, orders, events, and admin login requests reach the backend without cross-origin cookie issues. Deploy this repository to Vercel with the Vite build output (`dist`), and keep the Render service and its environment variables configured. Set the custom domain on Vercel only if Vercel is serving the frontend; the Render service URL must remain available as the API backend.
 
-Configure `VITE_TURNSTILE_SITE_KEY` as a frontend build environment variable on Vercel (or Render for a Render-only deployment). Configure `TURNSTILE_SECRET_KEY` only on the Render backend; never expose the secret in frontend variables.
-
 For a Render-only deployment, point the custom domain directly to the Render service; the Vercel rewrite is not used.
+
+Stock shown in the storefront is capped by both the configured display limit and the number of unassigned credentials in that product's vault pool. Add real credentials to the Admin Vault before making a product available; a fresh database starts with an empty vault.

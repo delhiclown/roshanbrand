@@ -26,11 +26,12 @@ import {
 } from 'lucide-react';
 import { AdminPortal } from '../components/AdminPortal';
 import { CheckoutModal } from '../components/CheckoutModal';
-import { Dashboard } from '../components/Dashboard';
 import { DeliveredOrderDetails } from '../components/DeliveredOrderDetails';
 import { buildDynamicUpiUri } from '../components/UpiQrBox';
 import { DEFAULT_STORE_CONFIG, LIMITS } from './constants';
 import { CheckoutDraft, OrderRecord, PackType, StoreConfig, VaultPoolType } from './types';
+
+const orderAccessStorageKey = (orderId: string) => `roshanbrand_order_access_${orderId}`;
 
 interface ProductOption {
   id: string;
@@ -46,9 +47,7 @@ interface ProductOption {
 }
 
 export default function App() {
-  const [viewMode, setViewMode] = useState<'store' | 'admin' | 'dashboard'>(() =>
-    window.location.pathname.startsWith('/dashboard') ? 'dashboard' : 'store'
-  );
+  const [viewMode, setViewMode] = useState<'store' | 'admin'>('store');
   const [storeConfig, setStoreConfig] = useState<StoreConfig>(DEFAULT_STORE_CONFIG);
   const [vaultStock, setVaultStock] = useState<Record<VaultPoolType, number>>({
     permanent: 0,
@@ -76,6 +75,7 @@ export default function App() {
     }
   });
   const [searchInput, setSearchInput] = useState<string>('');
+  const [orderAccessInput, setOrderAccessInput] = useState<string>('');
   const [trackedOrder, setTrackedOrder] = useState<OrderRecord | null>(null);
   const [trackDropdownOpen, setTrackDropdownOpen] = useState<boolean>(false);
   const [trackError, setTrackError] = useState<string>('');
@@ -91,9 +91,14 @@ export default function App() {
     storeConfig.stock1MonthGuaranteeAvailable;
 
   useEffect(() => {
-    if (trackedOrder?.status !== 'verified_delivered') return;
+    if (
+      trackedOrder?.status !== 'verified_delivered' ||
+      !trackedOrder.deliveredCredentials
+    ) {
+      return;
+    }
     const previousTitle = document.title;
-    document.title = 'SkyVPS - Order Details';
+    document.title = 'Roshanbrand — Order Details';
     return () => {
       document.title = previousTitle;
     };
@@ -159,8 +164,26 @@ export default function App() {
         const res = await fetch(`/api/orders/lookup?q=${encodeURIComponent(q)}`);
         if (!active) return;
         if (res.ok) {
-          const data = await res.json();
-          setTrackedOrder(data.order);
+          const lookupData = await res.json();
+          let order: OrderRecord = lookupData.order;
+          let accessToken = '';
+          try {
+            accessToken = localStorage.getItem(orderAccessStorageKey(order.orderId)) || '';
+          } catch {
+            accessToken = '';
+          }
+          if (accessToken) {
+            const accessResponse = await fetch('/api/orders/access', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ orderId: order.orderId, accessToken }),
+            });
+            if (accessResponse.ok) {
+              const accessData = await accessResponse.json();
+              order = accessData.order;
+            }
+          }
+          setTrackedOrder(order);
           setTrackError('');
         } else {
           setTrackedOrder(null);
@@ -188,8 +211,8 @@ export default function App() {
     {
       id: 'irctc-verified',
       title: 'IRCTC ID — Aadhaar Verified',
-      subtitle: '100% Working · Fast Tatkal & Normal Booking Ready',
-      tag: 'Best Seller',
+      subtitle: 'Account credentials · Check booking and product terms before purchase',
+      tag: 'Standard',
       unitPriceKey: 'priceCustomPerId',
       defaultQty: 1,
       packType: 'pack_1',
@@ -219,7 +242,7 @@ export default function App() {
       title: 'Buy Rental IRCTC ID for 24 Hours',
       subtitle:
         '24-Hour Active Rental Access · Payment Confirmation Required · Tatkal & Emergency Booking Ready',
-      tag: '24H Rental · ₹49',
+      tag: '24H Rental',
       unitPriceKey: 'priceRental24h',
       defaultQty: 1,
       packType: 'rental_24h',
@@ -250,12 +273,12 @@ export default function App() {
     productOptions.find((p) => p.id === openCardId) || productOptions[0];
   const getAvailableStock = (option: ProductOption) =>
     option.isRental24h
-      ? displayedRentalStock
+      ? Math.min(displayedRentalStock, vaultStock.rental_24h)
       : option.isSevenDayGuarantee
-        ? storeConfig.stock7DayGuaranteeAvailable
+        ? Math.min(storeConfig.stock7DayGuaranteeAvailable, vaultStock.guarantee_7days)
         : option.isOneMonthGuarantee
-          ? storeConfig.stock1MonthGuaranteeAvailable
-          : displayedPermanentStock;
+          ? Math.min(storeConfig.stock1MonthGuaranteeAvailable, vaultStock.guarantee_1month)
+          : Math.min(displayedPermanentStock, vaultStock.permanent);
   const activeStockCount = getAvailableStock(activeProduct);
   const safeQty = Math.max(
     LIMITS.QUANTITY_MIN,
@@ -483,6 +506,41 @@ export default function App() {
     const q = searchInput.trim();
     if (!q) return;
     setTrackError('');
+    const accessToken = orderAccessInput.trim();
+    if (accessToken) {
+      try {
+        const lookupResponse = await fetch(`/api/orders/lookup?q=${encodeURIComponent(q)}`);
+        const lookupData = await lookupResponse.json();
+        if (!lookupResponse.ok) {
+          setTrackError(lookupData.error || 'No order found with this UTR or Order ID.');
+          return;
+        }
+        const orderId = String(lookupData.order.orderId);
+        const response = await fetch('/api/orders/access', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ orderId, accessToken }),
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          setTrackError(data.error || 'Order ID or access key is incorrect.');
+          return;
+        }
+        try {
+          localStorage.setItem(orderAccessStorageKey(data.order.orderId), accessToken);
+        } catch {
+          // The access key remains available in the field for this visit.
+        }
+        setTrackedOrder(data.order);
+        setTrackedOrderId(data.order.orderId);
+        setSearchInput(data.order.orderId);
+        setOrderAccessInput('');
+        return;
+      } catch {
+        setTrackError('Unable to check this access key. Please try again.');
+        return;
+      }
+    }
     setTrackedOrderId(q);
   };
 
@@ -534,17 +592,13 @@ export default function App() {
     );
   }
 
-  if (viewMode === 'dashboard') {
-    return <Dashboard />;
-  }
-
-  if (trackedOrder?.status === 'verified_delivered') {
+  if (trackedOrder?.status === 'verified_delivered' && trackedOrder.deliveredCredentials) {
     return (
       <div className="delivered-order-shell">
         <header className="delivered-order-topbar">
-          <a className="delivered-order-brand" href="/dashboard">
-            <span>SV</span>
-            <strong>SkyVPS</strong>
+          <a className="delivered-order-brand" href="/">
+            <span>RB</span>
+            <strong>Roshanbrand</strong>
           </a>
           <span className="delivered-order-topbar-status">
             <CheckCircle2 /> Order delivered
@@ -636,7 +690,9 @@ export default function App() {
                     className={`w-2 h-2 rounded-full ${
                       trackedOrder.status === 'pending_verification'
                         ? 'bg-amber-400 animate-pulse'
-                        : 'bg-rose-400'
+                        : trackedOrder.status === 'rejected'
+                          ? 'bg-rose-400'
+                          : 'bg-emerald-400'
                     }`}
                   />
                 )}
@@ -660,7 +716,7 @@ export default function App() {
                     Enter your 12-digit{' '}
                     <span className="font-mono font-semibold text-cyan-300">UTR Number</span> or{' '}
                     <span className="font-mono font-semibold text-cyan-300">Order ID</span> to
-                    check live status &amp; view your IRCTC ID and Password.
+                    check its status. Your private access key is required to view credentials.
                   </p>
                   <form onSubmit={handleTrackSearch} className="space-y-2.5">
                     <input
@@ -669,6 +725,14 @@ export default function App() {
                       onChange={(e) => setSearchInput(e.target.value)}
                       placeholder="Enter 12-digit UTR or Order ID"
                       className="w-full px-3 py-2 text-xs rounded-xl border border-cyan-500/40 bg-slate-950/90 text-white font-mono focus:outline-none focus:ring-2 focus:ring-cyan-400/30 focus:border-cyan-400"
+                    />
+                    <input
+                      type="password"
+                      value={orderAccessInput}
+                      onChange={(event) => setOrderAccessInput(event.target.value)}
+                      placeholder="Private order access key (optional)"
+                      autoComplete="off"
+                      className="w-full px-3 py-2 text-xs rounded-xl border border-cyan-500/40 bg-slate-950/90 text-white font-mono placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-cyan-400/30 focus:border-cyan-400"
                     />
                     {trackError && (
                       <p className="text-[11px] text-rose-400 font-semibold">{trackError}</p>
@@ -686,6 +750,7 @@ export default function App() {
                           onClick={() => {
                             setTrackedOrderId('');
                             setSearchInput('');
+                            setOrderAccessInput('');
                             setTrackedOrder(null);
                           }}
                           className="px-2.5 py-2 rounded-xl text-xs font-semibold text-slate-300 hover:text-white bg-slate-800/90 border border-slate-700 cursor-pointer"
@@ -713,7 +778,7 @@ export default function App() {
 
       {/* Main Storefront Content */}
       <main className="relative z-10 flex-1 flex flex-col min-h-0">
-        <div className="max-w-4xl mx-auto w-full px-3 sm:px-5 pt-4 sm:pt-6 pb-32 flex-1 flex flex-col">
+        <div className="max-w-4xl mx-auto w-full px-3 sm:px-5 pt-4 sm:pt-6 pb-6 flex-1 flex flex-col">
           {storeConfig.announcementText.trim() && (
             <div className="mb-5 flex justify-center">
               <div className="flex w-fit max-w-full items-center justify-center gap-2.5 rounded-2xl border border-cyan-400/35 bg-gradient-to-r from-cyan-950/70 via-blue-950/55 to-slate-950/80 px-4 py-3 text-center shadow-[0_8px_28px_rgba(8,145,178,0.12)]">
@@ -745,10 +810,16 @@ export default function App() {
                           </span>
                         </div>
                         <p className="text-xs text-slate-300 mt-0.5">
-                          UTR{' '}
-                          <span className="font-mono font-bold text-cyan-300">
-                            {trackedOrder.utrNumber}
-                          </span>{' '}
+                          {trackedOrder.utrNumber ? (
+                            <>
+                              UTR{' '}
+                              <span className="font-mono font-bold text-cyan-300">
+                                {trackedOrder.utrNumber}
+                              </span>{' '}
+                            </>
+                          ) : (
+                            'Payment reference is private. '
+                          )}
                           (₹{trackedOrder.totalAmount} for {trackedOrder.quantity} ID
                           {trackedOrder.quantity > 1 ? 's' : ''}) submitted. Credentials will be
                           released only after this payment is confirmed in{' '}
@@ -775,7 +846,7 @@ export default function App() {
                     </button>
                   </div>
                 </div>
-              ) : (
+              ) : trackedOrder.status === 'rejected' ? (
                 <div className="neon-card-3d border-rose-500/50 p-4 flex items-center justify-between gap-3">
                   <div className="flex items-center gap-3">
                     <XCircle className="w-5 h-5 text-rose-400 shrink-0" />
@@ -789,6 +860,16 @@ export default function App() {
                       </p>
                     </div>
                   </div>
+                </div>
+              ) : (
+                <div className="neon-card-3d border-amber-400/50 p-4 space-y-2">
+                  <h3 className="text-sm font-extrabold text-white">
+                    Order delivered — private access key required
+                  </h3>
+                  <p className="text-xs text-slate-300">
+                    Enter the private key saved when you placed this order to view your credentials.
+                    If you no longer have it, contact support with your order ID and payment receipt.
+                  </p>
                 </div>
               )}
             </div>
@@ -820,7 +901,7 @@ export default function App() {
             </span>
           </div>
 
-          {/* Product Options List (including the new 3rd option below: Buy Rental IRCTC ID for 24 Hours at ₹49) */}
+          {/* Available product options */}
           <div className="flex-1 min-h-0">
             <ul className="grid grid-cols-1 gap-4 list-none p-0 m-0">
               {productOptions.map((option) => {
@@ -1363,7 +1444,7 @@ export default function App() {
       </main>
 
       {/* Support Launcher */}
-      <div className="fixed z-40 right-0 bottom-24 sm:bottom-8 flex flex-col items-end">
+      <div className="fixed z-40 right-0 bottom-4 sm:bottom-5 flex flex-col items-end">
         <button
           type="button"
           onClick={() => setSupportOpen(true)}
@@ -1422,7 +1503,7 @@ export default function App() {
 
               <div className="p-3.5 rounded-xl bg-emerald-950/40 border border-emerald-400/35 space-y-1">
                 <p className="font-bold text-emerald-300">
-                  How does the ₹49 24-Hour Rental IRCTC ID work?
+                  How does the 24-Hour Rental IRCTC ID work?
                 </p>
                 <p className="text-slate-300 leading-relaxed">
                   Pay ₹{storeConfig.priceRental24h} via UPI QR and submit your 12-digit UTR.
@@ -1452,18 +1533,6 @@ export default function App() {
 
               <div className="grid gap-2 sm:grid-cols-2">
                 <a
-                  href="https://wa.me/14086439496"
-                  target="_blank"
-                  rel="noreferrer"
-                  className="flex items-center gap-3 rounded-xl border border-emerald-400/40 bg-emerald-950/40 p-3 text-left hover:bg-emerald-900/50"
-                >
-                  <MessageCircle className="h-5 w-5 shrink-0 text-emerald-300" />
-                  <span className="min-w-0">
-                    <span className="block font-bold text-white">WhatsApp Support</span>
-                    <span className="block truncate text-[11px] text-emerald-200">Chat with us</span>
-                  </span>
-                </a>
-                <a
                   href="https://t.me/Roshanadminn"
                   target="_blank"
                   rel="noreferrer"
@@ -1491,12 +1560,12 @@ export default function App() {
         </div>
       )}
 
-      {/* Bottom Floating How It Works Bar */}
+      {/* Order steps and essential customer information */}
       <aside
-        className="fixed bottom-0 left-0 right-0 z-30 pointer-events-none px-3 sm:px-5 pb-2.5 pt-1"
+        className="mt-auto px-3 sm:px-5 pb-4 pt-5"
         aria-label="How ordering works and store highlights"
       >
-        <div className="max-w-4xl mx-auto pointer-events-auto">
+        <div className="max-w-4xl mx-auto">
           <div className="store-bottom-dock-float">
             <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-2.5 lg:gap-4">
               <div className="min-w-0">
@@ -1511,7 +1580,7 @@ export default function App() {
                     <div className="min-w-0 leading-tight">
                       <p className="text-[10px] font-bold text-white truncate">Choose plan</p>
                       <p className="text-[9px] text-slate-400 truncate hidden sm:block">
-                        ₹49 Rental, 1, 2, 5 or Bulk
+                        ₹{storeConfig.priceRental24h} rental, standard or bulk
                       </p>
                     </div>
                   </li>
@@ -1546,33 +1615,38 @@ export default function App() {
 
               <div className="flex items-center justify-between sm:justify-end gap-3 pt-1.5 lg:pt-0 border-t lg:border-t-0 lg:border-l border-cyan-500/25 lg:pl-4 shrink-0">
                 <div className="flex items-center gap-3 sm:gap-4">
-                  <div className="text-center sm:text-left">
-                    <p className="text-xs font-extrabold text-white tabular-nums leading-none">
-                      10K+
-                    </p>
-                    <p className="text-[9px] text-cyan-300/80 font-medium mt-0.5">Delivered</p>
-                  </div>
-                  <div className="w-px h-6 bg-cyan-500/25" />
-                  <div className="text-center sm:text-left">
-                    <p className="text-xs font-extrabold text-white tabular-nums leading-none">
-                      4.9★
-                    </p>
-                    <p className="text-[9px] text-cyan-300/80 font-medium mt-0.5">Rating</p>
-                  </div>
-                  <div className="w-px h-6 bg-cyan-500/25" />
-                  <div className="text-center sm:text-left">
-                    <p className="text-xs font-extrabold text-emerald-400 leading-none flex items-center gap-1">
-                      <ShieldCheck className="w-3.5 h-3.5" />
-                      <span>24/7</span>
-                    </p>
-                    <p className="text-[9px] text-cyan-300/80 font-medium mt-0.5">
-                      Rodex UPI
-                    </p>
-                  </div>
+                  <span className="text-[10px] font-bold text-cyan-100">UPI payment</span>
+                  <span className="text-[10px] font-bold text-cyan-100">Manual payment review</span>
+                  <span className="text-[10px] font-bold text-cyan-100">Secure order access</span>
                 </div>
               </div>
             </div>
           </div>
+          <details className="mt-3 rounded-xl border border-cyan-500/25 bg-slate-950/80 px-4 py-3 text-[11px] text-slate-300">
+            <summary className="cursor-pointer font-bold text-cyan-200">
+              Payment, privacy and product information
+            </summary>
+            <ul className="mt-2 list-disc space-y-1.5 pl-4 leading-relaxed">
+              <li>
+                This is an independent seller and is not affiliated with or endorsed by IRCTC.
+              </li>
+              <li>
+                Verify the recipient and amount in your UPI app. Submitting a UTR is not payment
+                confirmation; orders are delivered only after the received payment is manually
+                checked.
+              </li>
+              <li>
+                Rental validity starts when credentials are delivered. Ask support for written
+                coverage and refund terms before paying; UTR submission alone does not confirm
+                payment or authorize a refund.
+              </li>
+              <li>
+                Your UTR and optional contact details are used to identify and support your order.
+                Keep your private order access key secret; it is required to view delivered
+                credentials on another device.
+              </li>
+            </ul>
+          </details>
         </div>
       </aside>
 

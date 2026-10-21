@@ -64,6 +64,7 @@ export default function App() {
   const [outOfStockQuantity, setOutOfStockQuantity] = useState<number | null>(null);
   const [customNote, setCustomNote] = useState<string>('');
   const [checkoutDraft, setCheckoutDraft] = useState<CheckoutDraft | null>(null);
+  const [rentalStockNoticeOpen, setRentalStockNoticeOpen] = useState(false);
 
   const [trackedOrderId, setTrackedOrderId] = useState<string>(() => {
     try {
@@ -149,6 +150,18 @@ export default function App() {
       events.close();
     };
   }, []);
+
+  useEffect(() => {
+    if (!storeConfigLoaded || displayedRentalStock <= 0) return;
+
+    try {
+      if (sessionStorage.getItem('roshanbrand_rental_stock_notice_seen') === '1') return;
+      sessionStorage.setItem('roshanbrand_rental_stock_notice_seen', '1');
+    } catch {
+      // Keep the notice available when browser storage is disabled.
+    }
+    setRentalStockNoticeOpen(true);
+  }, [storeConfigLoaded, displayedRentalStock]);
 
   // Poll tracked order if present
   useEffect(() => {
@@ -915,6 +928,7 @@ export default function App() {
                 return (
                   <li
                     key={option.id}
+                    id={`product-${option.id}`}
                     className={`store-product-wrap ${
                       option.isRental24h ? 'store-product-wrap--rental' : ''
                     } ${isOpen ? 'store-product-wrap--open' : ''}`}
@@ -1466,6 +1480,85 @@ export default function App() {
       </div>
 
       {/* Support Modal */}
+      {rentalStockNoticeOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md"
+          onClick={() => setRentalStockNoticeOpen(false)}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="rental-stock-notice-title"
+            className="relative z-10 w-full max-w-md overflow-hidden rounded-2xl border border-cyan-400/50 bg-slate-950 text-white shadow-[0_0_60px_rgba(34,211,238,0.2)]"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-cyan-400 via-blue-500 to-emerald-400" />
+            <button
+              type="button"
+              aria-label="Close stock notice"
+              onClick={() => setRentalStockNoticeOpen(false)}
+              className="absolute right-4 top-4 rounded-lg p-2 text-slate-400 transition hover:bg-slate-800 hover:text-white"
+            >
+              <X className="h-4 w-4" />
+            </button>
+
+            <div className="p-6 sm:p-7">
+              <div className="mb-5 flex h-12 w-12 items-center justify-center rounded-2xl border border-cyan-300/30 bg-cyan-400/10 text-cyan-300">
+                <Clock className="h-6 w-6" />
+              </div>
+              <p className="mb-2 text-xs font-extrabold uppercase tracking-[0.18em] text-emerald-300">
+                Limited 24-hour rental stock
+              </p>
+              <h2
+                id="rental-stock-notice-title"
+                className="pr-6 text-2xl font-black leading-tight text-white"
+              >
+                Only {displayedRentalStock} rental ID
+                {displayedRentalStock === 1 ? '' : 's'} available right now
+              </h2>
+              <p className="mt-3 text-sm leading-relaxed text-slate-300">
+                Need an IRCTC ID for a Tatkal or urgent booking? Get 24-hour rental access while
+                stock is available.
+              </p>
+
+              <div className="mt-5 flex items-center justify-between gap-3 rounded-xl border border-cyan-400/20 bg-slate-900/80 px-4 py-3">
+                <span className="text-sm font-bold text-slate-200">24-hour access</span>
+                <span className="text-lg font-black text-white">
+                  ₹{storeConfig.priceRental24h}
+                  <span className="ml-1 text-xs font-semibold text-slate-400">/ ID</span>
+                </span>
+              </div>
+              <p className="mt-3 text-xs leading-relaxed text-slate-400">
+                Availability may change. Payment is verified before rental details are delivered.
+              </p>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setRentalStockNoticeOpen(false);
+                  setOpenCardId('irctc-rental-24h');
+                  document
+                    .getElementById('product-irctc-rental-24h')
+                    ?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }}
+                className="mt-6 flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-cyan-500 px-5 py-3.5 text-sm font-extrabold text-white shadow-lg shadow-cyan-950/40 transition hover:brightness-110"
+              >
+                View {displayedRentalStock} available ID
+                {displayedRentalStock === 1 ? '' : 's'}
+                <ChevronRight className="h-4 w-4" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setRentalStockNoticeOpen(false)}
+                className="mt-3 w-full rounded-xl px-4 py-2.5 text-sm font-semibold text-slate-400 transition hover:text-white"
+              >
+                Continue browsing
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+
       {supportOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-md">
           <div className="fixed inset-0" onClick={() => setSupportOpen(false)} />

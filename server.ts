@@ -780,6 +780,56 @@ async function startServer() {
       return;
     }
 
+    const turnstileSecretKey = process.env.TURNSTILE_SECRET_KEY;
+    if (!turnstileSecretKey) {
+      console.error('Turnstile verification is unavailable: TURNSTILE_SECRET_KEY is not set.');
+      res.status(503).json({ error: 'Human verification is unavailable. Please contact support.' });
+      return;
+    }
+
+    const captchaToken = String(body.captchaToken || '').trim();
+    if (!captchaToken) {
+      res.status(400).json({ error: 'Please complete the human verification.' });
+      return;
+    }
+
+    try {
+      const verificationBody = new URLSearchParams({
+        secret: turnstileSecretKey,
+        response: captchaToken,
+      });
+      if (req.ip) verificationBody.set('remoteip', req.ip);
+
+      const verificationResponse = await fetch(
+        'https://challenges.cloudflare.com/turnstile/v0/siteverify',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: verificationBody,
+        }
+      );
+
+      if (!verificationResponse.ok) {
+        console.error(`Turnstile verification returned HTTP ${verificationResponse.status}.`);
+        res.status(502).json({ error: 'Human verification failed. Please try again.' });
+        return;
+      }
+
+      const verification = (await verificationResponse.json()) as {
+        success?: boolean;
+        'error-codes'?: string[];
+      };
+      if (!verification.success) {
+        console.warn('Turnstile verification rejected a token:', verification['error-codes'] || []);
+        res.status(400).json({ error: 'Human verification failed. Please verify again.' });
+        return;
+      }
+    } catch (error) {
+      console.error('Turnstile verification request failed.', error);
+      res.status(502).json({ error: 'Human verification could not be checked. Please try again.' });
+      return;
+    }
+
     if (db.utrIndex[utrNumber]) {
       res.status(409).json({
         error:

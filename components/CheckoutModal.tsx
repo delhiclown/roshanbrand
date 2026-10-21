@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AlertCircle,
   Check,
@@ -16,6 +16,58 @@ import {
 import { LIMITS } from '../src/constants';
 import { CheckoutDraft, OrderRecord, StoreConfig } from '../src/types';
 import { UpiQrBox } from './UpiQrBox';
+
+interface TurnstileApi {
+  render: (
+    container: HTMLElement,
+    options: {
+      sitekey: string;
+      theme: 'dark';
+      callback: (token: string) => void;
+      'error-callback': () => void;
+      'expired-callback': () => void;
+    }
+  ) => string;
+  reset: (widgetId?: string) => void;
+  remove: (widgetId: string) => void;
+}
+
+declare global {
+  interface Window {
+    turnstile?: TurnstileApi;
+  }
+}
+
+const TURNSTILE_SCRIPT_URL =
+  'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+let turnstileScriptPromise: Promise<TurnstileApi> | null = null;
+
+function loadTurnstile(): Promise<TurnstileApi> {
+  if (window.turnstile) return Promise.resolve(window.turnstile);
+  if (turnstileScriptPromise) return turnstileScriptPromise;
+
+  turnstileScriptPromise = new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = TURNSTILE_SCRIPT_URL;
+    script.async = true;
+    script.defer = true;
+    script.onload = () => {
+      if (window.turnstile) {
+        resolve(window.turnstile);
+      } else {
+        turnstileScriptPromise = null;
+        reject(new Error('Cloudflare Turnstile did not initialize.'));
+      }
+    };
+    script.onerror = () => {
+      turnstileScriptPromise = null;
+      reject(new Error('Cloudflare Turnstile could not be loaded.'));
+    };
+    document.head.appendChild(script);
+  });
+
+  return turnstileScriptPromise;
+}
 
 interface CheckoutModalProps {
   draft: CheckoutDraft | null;
@@ -51,6 +103,68 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [completedOrder, setCompletedOrder] = useState<OrderRecord | null>(activeOrder);
+  const [captchaToken, setCaptchaToken] = useState('');
+  const [captchaStatus, setCaptchaStatus] = useState<'loading' | 'ready' | 'missing' | 'error'>(
+    'loading'
+  );
+  const [captchaError, setCaptchaError] = useState<string | null>(null);
+  const captchaContainerRef = useRef<HTMLDivElement>(null);
+  const captchaWidgetRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!draft || completedOrder) return;
+
+    const siteKey = import.meta.env.VITE_TURNSTILE_SITE_KEY;
+    if (!siteKey) {
+      setCaptchaStatus('missing');
+      setCaptchaError('Captcha is not configured. Please contact support.');
+      return;
+    }
+
+    let cancelled = false;
+    setCaptchaStatus('loading');
+    setCaptchaError(null);
+
+    loadTurnstile()
+      .then((turnstile) => {
+        if (cancelled || !captchaContainerRef.current) return;
+
+        captchaWidgetRef.current = turnstile.render(captchaContainerRef.current, {
+          sitekey: siteKey,
+          theme: 'dark',
+          callback: (token) => {
+            setCaptchaToken(token);
+            setCaptchaError(null);
+          },
+          'error-callback': () => {
+            setCaptchaToken('');
+            setCaptchaError('Captcha verification failed. Please try again.');
+          },
+          'expired-callback': () => {
+            setCaptchaToken('');
+            setCaptchaError('Captcha expired. Please verify again.');
+          },
+        });
+        setCaptchaStatus('ready');
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setCaptchaStatus('error');
+        setCaptchaError(
+          error instanceof Error
+            ? error.message
+            : 'Captcha could not be loaded. Please refresh and try again.'
+        );
+      });
+
+    return () => {
+      cancelled = true;
+      if (captchaWidgetRef.current && window.turnstile) {
+        window.turnstile.remove(captchaWidgetRef.current);
+        captchaWidgetRef.current = null;
+      }
+    };
+  }, [draft, completedOrder]);
 
   const submitUtrForReview = useCallback(
     async (rawUtrToVerify: string) => {
@@ -62,6 +176,11 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
 
       if (!LIMITS.UTR_REGEX.test(cleanedUtr)) {
         setErrorMsg('Kripya apna valid 12-digit numeric UPI UTR dalein.');
+        return;
+      }
+
+      if (!captchaToken) {
+        setErrorMsg('Please complete the human verification before submitting your UTR.');
         return;
       }
 
@@ -79,6 +198,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
             unitPrice: draft.unitPrice,
             totalAmount: draft.totalAmount,
             utrNumber: cleanedUtr,
+            captchaToken,
             upiAppUsed,
             customerReference: customerRef.trim() || 'Direct UPI Buyer',
             customSpec: customSpec.trim(),
@@ -88,7 +208,8 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         const data = await response.json();
         if (!response.ok) {
           setErrorMsg(data.error || 'UTR submission failed. Please check your UTR number.');
-          setSubmitting(false);
+          setCaptchaToken('');
+          window.turnstile?.reset(captchaWidgetRef.current || undefined);
           return;
         }
 
@@ -114,11 +235,22 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
             ? err.message
             : 'Network error while submitting your UTR. Please try again.'
         );
+        setCaptchaToken('');
+        window.turnstile?.reset(captchaWidgetRef.current || undefined);
       } finally {
         setSubmitting(false);
       }
     },
-    [draft, submitting, completedOrder, upiAppUsed, customerRef, customSpec, onOrderCreated]
+    [
+      draft,
+      submitting,
+      completedOrder,
+      captchaToken,
+      upiAppUsed,
+      customerRef,
+      customSpec,
+      onOrderCreated,
+    ]
   );
 
   // Real-time SSE + 1s live sync if order is awaiting 1-click admin verification
@@ -500,6 +632,26 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                     </p>
                   </div>
 
+                  <div className="space-y-1.5">
+                    <div
+                      ref={captchaContainerRef}
+                      className="min-h-[65px] overflow-hidden rounded-lg"
+                      aria-label="Human verification"
+                    />
+                    {captchaError && (
+                      <p
+                        className={`text-[11px] ${
+                          captchaStatus === 'missing' || captchaStatus === 'error'
+                            ? 'text-red-300'
+                            : 'text-amber-300'
+                        }`}
+                        role="status"
+                      >
+                        {captchaError}
+                      </p>
+                    )}
+                  </div>
+
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <div>
                       <label className="block text-xs font-semibold text-slate-300 mb-1">
@@ -544,8 +696,8 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
 
                 <button
                   type="submit"
-                  disabled={submitting}
-                  className="w-full py-3 px-5 text-sm font-extrabold text-white store-pay-pill rounded-xl flex items-center justify-center gap-2 disabled:opacity-50 cursor-pointer"
+                  disabled={submitting || !captchaToken}
+                  className="w-full py-3 px-5 text-sm font-extrabold text-white store-pay-pill rounded-xl flex items-center justify-center gap-2 disabled:opacity-50 cursor-not-allowed"
                 >
                   {submitting ? (
                     <>

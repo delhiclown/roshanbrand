@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   Clock,
   Copy,
+  Eye,
   IndianRupee,
   KeyRound,
   LogOut,
@@ -23,7 +24,14 @@ import {
   Zap,
 } from 'lucide-react';
 import { LIMITS } from '../src/constants';
-import { OrderRecord, StoreConfig, VaultItem, VaultPoolType } from '../src/types';
+import {
+  GuaranteeClaim,
+  GuaranteeClaimStatus,
+  OrderRecord,
+  StoreConfig,
+  VaultItem,
+  VaultPoolType,
+} from '../src/types';
 import { UpiQrBox } from './UpiQrBox';
 
 interface AdminPortalProps {
@@ -32,7 +40,13 @@ interface AdminPortalProps {
   onBackToStore: () => void;
 }
 
-type AdminTab = 'orders' | 'qr_settings' | 'site_settings' | 'inventory' | 'security';
+type AdminTab =
+  | 'orders'
+  | 'guarantee_claims'
+  | 'qr_settings'
+  | 'site_settings'
+  | 'inventory'
+  | 'security';
 
 function getOrderVaultPool(order: OrderRecord): VaultPoolType {
   if (order.packType === 'rental_24h') return 'rental_24h';
@@ -62,11 +76,48 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   const [activeTab, setActiveTab] = useState<AdminTab>('orders');
   const [orders, setOrders] = useState<OrderRecord[]>([]);
   const [vault, setVault] = useState<VaultItem[]>([]);
+  const [guaranteeClaims, setGuaranteeClaims] = useState<GuaranteeClaim[]>([]);
+  const [ordersOffset, setOrdersOffset] = useState(0);
+  const [claimsOffset, setClaimsOffset] = useState(0);
+  const [ordersTotal, setOrdersTotal] = useState(0);
+  const [claimsTotal, setClaimsTotal] = useState(0);
+  const [adminSummary, setAdminSummary] = useState({
+    ordersTotal: 0,
+    pendingOrders: 0,
+    deliveredOrders: 0,
+    verifiedRevenue: 0,
+  });
+  const [replacementCounts, setReplacementCounts] = useState<Record<string, number>>({});
+  const [claimStatusFilter, setClaimStatusFilter] = useState<'all' | GuaranteeClaimStatus>('all');
+  const [claimSearchQuery, setClaimSearchQuery] = useState('');
+  const [claimActionBusy, setClaimActionBusy] = useState<string | null>(null);
+  const [claimWarning, setClaimWarning] = useState('');
+  const [rejectClaim, setRejectClaim] = useState<GuaranteeClaim | null>(null);
+  const [rejectionReason, setRejectionReason] = useState('');
+  const [claimScreenshot, setClaimScreenshot] = useState<{ title: string; dataUrl: string } | null>(
+    null
+  );
   const [statusFilter, setStatusFilter] = useState<'all' | OrderRecord['status']>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [credDrafts, setCredDrafts] = useState<Record<string, string>>({});
   const [busyOrderId, setBusyOrderId] = useState<string | null>(null);
   const [copiedUtr, setCopiedUtr] = useState<string | null>(null);
+  const adminFiltersRef = useRef({
+    ordersOffset: 0,
+    claimsOffset: 0,
+    statusFilter: 'all' as 'all' | OrderRecord['status'],
+    searchQuery: '',
+    claimStatusFilter: 'all' as 'all' | GuaranteeClaimStatus,
+    claimSearchQuery: '',
+  });
+  adminFiltersRef.current = {
+    ordersOffset,
+    claimsOffset,
+    statusFilter,
+    searchQuery,
+    claimStatusFilter,
+    claimSearchQuery,
+  };
 
   const [newVaultText, setNewVaultText] = useState('');
   const [newVaultNote, setNewVaultNote] = useState('');
@@ -86,6 +137,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   });
   const [dirtyStockInputs, setDirtyStockInputs] = useState<Record<string, boolean>>({});
   const [supportHandleDirty, setSupportHandleDirty] = useState(false);
+  const [supportUrlDirty, setSupportUrlDirty] = useState(false);
   const previousStoreConfig = useRef(storeConfig);
   const [savingSettings, setSavingSettings] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState('');
@@ -116,6 +168,9 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
       if (key === 'supportHandle' && supportHandleDirty) {
         continue;
       }
+      if (key === 'supportUrl' && supportUrlDirty) {
+        continue;
+      }
       if (dirtyStockInputs[key] && key in stockInputs) {
         continue;
       }
@@ -143,7 +198,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     if (formChanged) {
       setFormConfig(nextFormConfig);
     }
-  }, [storeConfig, dirtyStockInputs, supportHandleDirty]);
+  }, [storeConfig, dirtyStockInputs, supportHandleDirty, supportUrlDirty]);
 
   useEffect(() => {
     const checkAuth = async () => {
@@ -162,18 +217,66 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     checkAuth();
   }, []);
 
-  const fetchAdminState = async (syncConfig = false) => {
+  const fetchAdminState = async (
+    syncConfig = false,
+    resetOrders = false,
+    resetClaims = false
+  ) => {
     try {
-      const res = await fetch('/api/admin/state');
-      if (!res.ok) return;
+      const filters = adminFiltersRef.current;
+      const requestOrdersOffset = resetOrders ? 0 : filters.ordersOffset;
+      const requestClaimsOffset = resetClaims ? 0 : filters.claimsOffset;
+      const params = new URLSearchParams({
+        ordersOffset: String(requestOrdersOffset),
+        claimsOffset: String(requestClaimsOffset),
+        ordersLimit: '50',
+        claimsLimit: '50',
+        orderStatus: filters.statusFilter,
+        orderSearch: filters.searchQuery,
+        claimStatus: filters.claimStatusFilter,
+        claimSearch: filters.claimSearchQuery,
+      });
+      const res = await fetch(`/api/admin/state?${params.toString()}`);
+      if (!res.ok) throw new Error(`Admin state returned HTTP ${res.status}.`);
       const data = await res.json();
-      setOrders(data.orders || []);
+      const mergePage = <T extends { orderId?: string; claimId?: string }>(
+        previous: T[],
+        page: T[],
+        key: 'orderId' | 'claimId',
+        offset: number
+      ) => {
+        if (offset === 0) return page;
+        const combined = new Map(
+          previous.map((item) => [item[key], item] as const)
+        );
+        for (const item of page) combined.set(item[key], item);
+        return Array.from(combined.values());
+      };
+      setOrders((previous) =>
+        mergePage(previous, data.orders || [], 'orderId', requestOrdersOffset)
+      );
       setVault(data.vault || []);
+      setGuaranteeClaims((previous) =>
+        mergePage(previous, data.guaranteeClaims || [], 'claimId', requestClaimsOffset)
+      );
+      if (resetOrders) setOrdersOffset(0);
+      if (resetClaims) setClaimsOffset(0);
+      setOrdersTotal(Number(data.ordersTotal) || 0);
+      setClaimsTotal(Number(data.guaranteeClaimsTotal) || 0);
+      setAdminSummary(data.summary || {
+        ordersTotal: 0,
+        pendingOrders: 0,
+        deliveredOrders: 0,
+        verifiedRevenue: 0,
+      });
+      setReplacementCounts(data.replacementCounts || {});
       if (syncConfig && data.storeConfig) {
         onConfigUpdated(data.storeConfig);
       }
-    } catch {
-      // ignore transient errors
+    } catch (error) {
+      setClaimWarning(
+        error instanceof Error ? error.message : 'Could not refresh admin data.'
+      );
     }
   };
 
@@ -191,12 +294,28 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
       }
       fetchAdminState(syncConfig);
     };
-    const timer = setInterval(() => fetchAdminState(), 1000);
+    const timer = setInterval(() => fetchAdminState(), 15000);
     return () => {
       es.close();
       clearInterval(timer);
     };
   }, [isAuthenticated]);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    const timer = window.setTimeout(() => {
+      void fetchAdminState();
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [
+    isAuthenticated,
+    ordersOffset,
+    claimsOffset,
+    statusFilter,
+    searchQuery,
+    claimStatusFilter,
+    claimSearchQuery,
+  ]);
 
   const handleCopyUtr = (utr: string) => {
     navigator.clipboard.writeText(utr);
@@ -252,6 +371,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
         });
         setDirtyStockInputs({});
         setSupportHandleDirty(false);
+        setSupportUrlDirty(false);
         onConfigUpdated(data.storeConfig);
         setSaveSuccess(
           `Settings saved. 7 Days: ${data.storeConfig.stock7DayGuaranteeAvailable} IDs · 1 Month: ${data.storeConfig.stock1MonthGuaranteeAvailable} IDs.`
@@ -311,7 +431,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
       });
       if (res.ok) {
         setOrderErrors((prev) => ({ ...prev, [order.orderId]: '' }));
-        await fetchAdminState();
+        await fetchAdminState(false, true);
       } else {
         const data = await res.json();
         setOrderErrors((prev) => ({
@@ -336,7 +456,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
         method: 'POST',
       });
       if (res.ok) {
-        await fetchAdminState();
+        await fetchAdminState(false, true);
       }
     } finally {
       setBusyOrderId(null);
@@ -347,10 +467,19 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     try {
       const res = await fetch(`/api/admin/orders/${orderId}`, { method: 'DELETE' });
       if (res.ok) {
-        await fetchAdminState();
+        await fetchAdminState(false, true);
+      } else {
+        const data = await res.json();
+        setOrderErrors((previous) => ({
+          ...previous,
+          [orderId]: data.error || 'The order could not be deleted.',
+        }));
       }
-    } catch {
-      // ignore
+    } catch (error) {
+      setOrderErrors((previous) => ({
+        ...previous,
+        [orderId]: error instanceof Error ? error.message : 'Could not connect to the server.',
+      }));
     }
   };
 
@@ -492,11 +621,9 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     setActiveTab('orders');
   };
 
-  const pendingCount = orders.filter((o) => o.status === 'pending_verification').length;
-  const deliveredCount = orders.filter((o) => o.status === 'verified_delivered').length;
-  const verifiedRevenue = orders
-    .filter((o) => o.status === 'verified_delivered')
-    .reduce((sum, o) => sum + (o.totalAmount || 0), 0);
+  const pendingCount = adminSummary.pendingOrders;
+  const deliveredCount = adminSummary.deliveredOrders;
+  const verifiedRevenue = adminSummary.verifiedRevenue;
   const readyVaultCount = vault.filter((v) => !v.isAssigned && !v.reservedOrderId).length;
 
   const filteredOrders = orders.filter((o) => {
@@ -511,6 +638,93 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     );
   });
 
+  const filteredGuaranteeClaims = guaranteeClaims.filter((claim) => {
+    if (claimStatusFilter !== 'all' && claim.status !== claimStatusFilter) return false;
+    const query = claimSearchQuery.trim().toLowerCase();
+    if (!query) return true;
+    return [
+      claim.claimId,
+      claim.orderId,
+      claim.utrNumber,
+      claim.customerReference,
+      claim.oldCredential,
+    ]
+      .join(' ')
+      .toLowerCase()
+      .includes(query);
+  });
+
+  const getClaimReplacementCount = (claim: GuaranteeClaim) =>
+    replacementCounts[claim.orderId] || 0;
+
+  const getAvailableGuaranteeStock = (pool: 'guarantee_7days' | 'guarantee_1month') =>
+    vault.filter(
+      (item) => item.poolType === pool && !item.isAssigned && !item.reservedOrderId
+    ).length;
+
+  const handleClaimAction = async (
+    claim: GuaranteeClaim,
+    action: 'approve' | 'replace' | 'refund' | 'reject',
+    reason?: string
+  ) => {
+    setClaimActionBusy(claim.claimId);
+    setClaimWarning('');
+    try {
+      const response = await fetch(
+        `/api/admin/guarantee-claims/${encodeURIComponent(claim.claimId)}/${action}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          ...(action === 'refund'
+            ? { body: JSON.stringify({ refundConfirmed: true }) }
+            : reason
+              ? { body: JSON.stringify({ rejectionReason: reason }) }
+              : {}),
+        }
+      );
+      const data = await response.json();
+      if (!response.ok) {
+        await fetchAdminState();
+        setClaimWarning(data.error || 'The claim action could not be completed.');
+        return;
+      }
+      setRejectClaim(null);
+      setRejectionReason('');
+      setClaimsOffset(0);
+      await fetchAdminState(false, false, true);
+    } catch (error) {
+      setClaimWarning(
+        error instanceof Error ? error.message : 'Could not connect to the claim service.'
+      );
+    } finally {
+      setClaimActionBusy(null);
+    }
+  };
+
+  const handleViewClaimScreenshot = async (claim: GuaranteeClaim) => {
+    try {
+      const response = await fetch(
+        `/api/admin/guarantee-claims/${encodeURIComponent(claim.claimId)}/screenshot`
+      );
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Could not load the screenshot.');
+      setClaimScreenshot({ title: claim.claimId, dataUrl: data.screenshotDataUrl });
+    } catch (error) {
+      setClaimWarning(
+        error instanceof Error ? error.message : 'Could not load the screenshot.'
+      );
+    }
+  };
+
+  const formatClaimDate = (value: string) =>
+    new Date(value).toLocaleString('en-IN', {
+      day: 'numeric',
+      month: 'short',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+
   const navItems: {
     id: AdminTab;
     label: string;
@@ -524,6 +738,15 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
       subtitle: 'Verify UTR & dispatch IDs',
       icon: <Send className="w-4 h-4" />,
       badge: pendingCount,
+    },
+    {
+      id: 'guarantee_claims',
+      label: 'Guarantee Claims',
+      subtitle: 'Review claims & issue replacements',
+      icon: <ShieldCheck className="w-4 h-4" />,
+      badge: guaranteeClaims.filter(
+        (claim) => claim.status === 'pending' || claim.status === 'approved'
+      ).length,
     },
     {
       id: 'qr_settings',
@@ -1004,7 +1227,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                 <div className="flex items-center gap-1.5 overflow-x-auto pb-1 sm:pb-0">
                   {(
                     [
-                      { id: 'all', label: `All (${orders.length})` },
+                      { id: 'all', label: `All (${ordersTotal})` },
                       { id: 'pending_verification', label: `Pending (${pendingCount})` },
                       { id: 'verified_delivered', label: `Delivered (${deliveredCount})` },
                       { id: 'rejected', label: 'Rejected' },
@@ -1013,7 +1236,11 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     <button
                       key={tab.id}
                       type="button"
-                      onClick={() => setStatusFilter(tab.id)}
+                      onClick={() => {
+                        setStatusFilter(tab.id);
+                        setOrdersOffset(0);
+                        setOrders([]);
+                      }}
                       className={`px-3 py-1.5 rounded-xl text-xs font-extrabold whitespace-nowrap transition-all cursor-pointer ${
                         statusFilter === tab.id
                           ? 'bg-gradient-to-r from-blue-600 to-cyan-500 text-white shadow-[0_2px_0_#0f296b]'
@@ -1030,7 +1257,11 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                   <input
                     type="text"
                     value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
+                    onChange={(e) => {
+                      setSearchQuery(e.target.value);
+                      setOrdersOffset(0);
+                      setOrders([]);
+                    }}
                     placeholder="Search UTR, Order ID, Mobile..."
                     className="w-full pl-9 pr-3 py-2 rounded-xl bg-slate-950 border border-cyan-500/35 text-xs text-white placeholder:text-slate-500 focus:outline-none focus:border-cyan-400"
                   />
@@ -1047,6 +1278,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                   </p>
                 </div>
               ) : (
+                <>
                 <div className="space-y-4">
                   {filteredOrders.map((order) => {
                     const orderPool = getOrderVaultPool(order);
@@ -1095,6 +1327,12 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                                 <span className="text-rose-300 font-extrabold flex items-center gap-1">
                                   <XCircle className="w-3.5 h-3.5" />
                                   Rejected
+                                </span>
+                              )}
+                              {order.refundedAt && (
+                                <span className="text-amber-200 font-extrabold flex items-center gap-1">
+                                  <IndianRupee className="w-3.5 h-3.5" />
+                                  Refunded
                                 </span>
                               )}
                               <span>·</span>
@@ -1186,7 +1424,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                                   [order.orderId]: e.target.value,
                                 }))
                               }
-                              placeholder="Enter IRCTC ID & Password for customer (1 per line)&#10;Example: user_irctc01 | Pass@123"
+                              placeholder="Enter existing vault username | password (1 per line)&#10;Example: user_irctc01 | your-real-password"
                               className="w-full px-3 py-2.5 rounded-xl bg-slate-900 border border-cyan-500/35 text-xs text-white font-mono placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-cyan-400/30 focus:border-cyan-400"
                             />
                             {orderErrors[order.orderId] && (
@@ -1198,7 +1436,9 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                             <div className="flex flex-wrap items-center gap-2 pt-1">
                               <button
                                 type="button"
-                                disabled={busyOrderId === order.orderId}
+                                disabled={
+                                  busyOrderId === order.orderId || order.status === 'rejected'
+                                }
                                 onClick={() => handleVerifyOrder(order)}
                                 className="flex-1 py-2.5 px-3 rounded-xl text-white font-extrabold text-xs store-pay-pill disabled:opacity-50 flex items-center justify-center gap-1.5 cursor-pointer"
                               >
@@ -1208,7 +1448,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                                   : 'Confirm Received Payment & Deliver ID'}
                               </button>
 
-                              {order.status !== 'rejected' && (
+                              {order.status === 'pending_verification' && (
                                 <button
                                   type="button"
                                   disabled={busyOrderId === order.orderId}
@@ -1234,7 +1474,308 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     );
                   })}
                 </div>
+                {orders.length < ordersTotal && (
+                  <button
+                    type="button"
+                    onClick={() => setOrdersOffset(orders.length)}
+                    className="w-full rounded-xl border border-cyan-400/30 bg-slate-950 px-4 py-2.5 text-xs font-bold text-cyan-200"
+                  >
+                    Load older orders ({orders.length} of {ordersTotal})
+                  </button>
+                )}
+                </>
               )}
+            </div>
+          )}
+
+          {activeTab === 'guarantee_claims' && (
+            <div className="space-y-5">
+              <section className="grid gap-3 sm:grid-cols-2">
+                {(['guarantee_7days', 'guarantee_1month'] as const).map((pool) => {
+                  const available = getAvailableGuaranteeStock(pool);
+                  const low = available <= 2;
+                  return (
+                    <div
+                      key={pool}
+                      className={`rounded-2xl border p-4 ${
+                        low
+                          ? 'border-rose-400/40 bg-rose-950/35'
+                          : 'border-emerald-400/30 bg-emerald-950/25'
+                      }`}
+                    >
+                      <p className="text-xs font-extrabold uppercase tracking-wide text-slate-300">
+                        {pool === 'guarantee_7days' ? '7-day replacement pool' : '1-month replacement pool'}
+                      </p>
+                      <p className={`mt-1 text-lg font-black ${low ? 'text-rose-200' : 'text-emerald-200'}`}>
+                        {available} available · {available === 0 ? 'Out of stock' : low ? 'Low stock' : 'Stock healthy'}
+                      </p>
+                      {low && (
+                        <p className="mt-1 text-xs text-rose-200/80">
+                          Add matching pool IDs before resolving replacement claims.
+                        </p>
+                      )}
+                    </div>
+                  );
+                })}
+              </section>
+
+              <section className="neon-card-3d min-w-0 overflow-hidden p-4 sm:p-5">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h2 className="font-display text-base font-black text-white">Guarantee Claims</h2>
+                    <p className="mt-1 text-xs text-slate-400">
+                      Review customer evidence, approve claims, then replace, refund, or reject.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => fetchAdminState()}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-400/30 bg-slate-900 px-3 py-2 text-xs font-bold text-cyan-100"
+                  >
+                    <RefreshCw className="h-3.5 w-3.5" />
+                    Refresh
+                  </button>
+                </div>
+
+                <div className="mt-4 grid gap-2 sm:grid-cols-[minmax(0,1fr)_200px]">
+                  <label className="relative">
+                    <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
+                    <input
+                      type="search"
+                      value={claimSearchQuery}
+                      onChange={(event) => {
+                        setClaimSearchQuery(event.target.value);
+                        setClaimsOffset(0);
+                        setGuaranteeClaims([]);
+                      }}
+                      placeholder="Search UTR, customer, order, or delivered ID"
+                      className="w-full rounded-xl border border-cyan-500/30 bg-slate-950 py-2.5 pl-9 pr-3 text-sm text-white placeholder:text-slate-500"
+                    />
+                  </label>
+                  <select
+                    value={claimStatusFilter}
+                    onChange={(event) => {
+                      setClaimStatusFilter(event.target.value as 'all' | GuaranteeClaimStatus);
+                      setClaimsOffset(0);
+                      setGuaranteeClaims([]);
+                    }}
+                    className="rounded-xl border border-cyan-500/30 bg-slate-950 px-3 py-2.5 text-sm text-white"
+                    aria-label="Filter guarantee claims by status"
+                  >
+                    <option value="all">All statuses</option>
+                    <option value="pending">Pending</option>
+                    <option value="approved">Approved</option>
+                    <option value="rejected">Rejected</option>
+                    <option value="resolved">Resolved</option>
+                  </select>
+                </div>
+
+                {filteredGuaranteeClaims.length === 0 ? (
+                  <div className="mt-4 rounded-xl border border-slate-700 bg-slate-950/70 p-8 text-center text-sm text-slate-400">
+                    No guarantee claims match this filter.
+                  </div>
+                ) : (
+                  <div className="mt-4 overflow-x-auto rounded-xl border border-slate-700/80">
+                    <table className="w-full min-w-[1500px] border-collapse text-left text-xs">
+                      <thead className="bg-slate-950 text-[10px] uppercase tracking-wide text-cyan-200">
+                        <tr>
+                          <th className="p-3">Claim / Date</th>
+                          <th className="p-3">Customer / Order</th>
+                          <th className="p-3">Delivered ID (old)</th>
+                          <th className="p-3">UTR / Guarantee</th>
+                          <th className="p-3">Issue / Evidence</th>
+                          <th className="p-3">Status / History</th>
+                          <th className="p-3">Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {filteredGuaranteeClaims.map((claim) => {
+                          const replacementCount = getClaimReplacementCount(claim);
+                          const limitReached =
+                            replacementCount >= formConfig.maxGuaranteeReplacementsPerOrder;
+                          const pool =
+                            claim.guaranteeType === 'guarantee_7days'
+                              ? 'guarantee_7days'
+                              : 'guarantee_1month';
+                          const poolAvailable = getAvailableGuaranteeStock(pool);
+                          const open = claim.status === 'pending' || claim.status === 'approved';
+                          return (
+                            <tr key={claim.claimId} className="border-t border-slate-700/70 align-top text-slate-200">
+                              <td className="p-3">
+                                <strong className="font-mono text-cyan-200">{claim.claimId}</strong>
+                                <p className="mt-1 text-slate-400">{formatClaimDate(claim.createdAt)}</p>
+                              </td>
+                              <td className="p-3">
+                                <strong>{claim.customerReference || 'Customer'}</strong>
+                                <p className="mt-1 text-slate-400">Order {claim.orderId}</p>
+                              </td>
+                              <td className="max-w-[250px] break-words p-3 font-mono text-[11px] text-amber-100">
+                                {claim.oldCredential}
+                                <p className="mt-1 font-sans text-slate-400">
+                                  Account {claim.credentialIndex + 1}
+                                </p>
+                              </td>
+                              <td className="p-3">
+                                <strong className="font-mono">{claim.utrNumber}</strong>
+                                <p className="mt-1 text-emerald-200">
+                                  {claim.guaranteeType === 'guarantee_7days' ? '7-day' : '1-month'} guarantee
+                                </p>
+                                <p className="mt-1 text-slate-400">Expires {formatClaimDate(claim.expiresAt)}</p>
+                              </td>
+                              <td className="max-w-[300px] whitespace-pre-wrap break-words p-3">
+                                <p>{claim.issueDescription}</p>
+                                {claim.hasScreenshot && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleViewClaimScreenshot(claim)}
+                                    className="mt-2 inline-flex items-center gap-1.5 rounded-lg border border-cyan-400/30 bg-slate-950 px-2.5 py-1.5 font-bold text-cyan-200"
+                                  >
+                                    <Eye className="h-3.5 w-3.5" />
+                                    View screenshot
+                                  </button>
+                                )}
+                              </td>
+                              <td className="min-w-[230px] p-3">
+                                <span
+                                  className={`inline-flex rounded-full px-2.5 py-1 font-extrabold capitalize ${
+                                    claim.status === 'pending'
+                                      ? 'bg-amber-400/15 text-amber-200'
+                                      : claim.status === 'approved'
+                                      ? 'bg-blue-400/15 text-blue-200'
+                                      : claim.status === 'rejected'
+                                      ? 'bg-rose-400/15 text-rose-200'
+                                      : 'bg-emerald-400/15 text-emerald-200'
+                                  }`}
+                                >
+                                  {claim.status}
+                                  {claim.resolution ? ` · ${claim.resolution}` : ''}
+                                </span>
+                                {claim.rejectionReason && (
+                                  <p className="mt-2 text-rose-200">Reason: {claim.rejectionReason}</p>
+                                )}
+                                {claim.replacementHistory.length > 0 && (
+                                  <details className="mt-2">
+                                    <summary className="cursor-pointer font-bold text-cyan-200">
+                                      Replacement history ({claim.replacementHistory.length})
+                                    </summary>
+                                    {claim.replacementHistory.map((entry, index) => (
+                                      <div key={`${claim.claimId}-replacement-${index}`} className="mt-2 space-y-1 border-l border-cyan-400/30 pl-2">
+                                        <p className="break-words text-rose-200">Old: {entry.oldCredential}</p>
+                                        <p className="font-black text-cyan-200">→</p>
+                                        <p className="break-words text-emerald-200">New: {entry.newCredential}</p>
+                                        <p className="text-slate-400">
+                                          {formatClaimDate(entry.replacedAt)} · {entry.adminName}
+                                        </p>
+                                      </div>
+                                    ))}
+                                  </details>
+                                )}
+                                <details className="mt-2">
+                                  <summary className="cursor-pointer font-bold text-slate-300">
+                                    Action log ({claim.actionLog.length})
+                                  </summary>
+                                  {claim.actionLog.map((action, index) => (
+                                    <p key={`${claim.claimId}-action-${index}`} className="mt-1 text-slate-400">
+                                      {action.action.replaceAll('_', ' ')} · {formatClaimDate(action.timestamp)} · {action.adminName}
+                                      {action.note ? ` · ${action.note}` : ''}
+                                    </p>
+                                  ))}
+                                </details>
+                              </td>
+                              <td className="min-w-[230px] space-y-2 p-3">
+                                {claim.status === 'pending' && (
+                                  <button
+                                    type="button"
+                                    disabled={claimActionBusy === claim.claimId}
+                                    onClick={() => handleClaimAction(claim, 'approve')}
+                                    className="w-full rounded-lg bg-blue-600 px-3 py-2 font-extrabold text-white disabled:opacity-50"
+                                  >
+                                    Approve claim
+                                  </button>
+                                )}
+                                {claim.status === 'approved' && (
+                                  <>
+                                    <button
+                                      type="button"
+                                      disabled={
+                                        claimActionBusy === claim.claimId ||
+                                        limitReached
+                                      }
+                                      onClick={() => handleClaimAction(claim, 'replace')}
+                                      title={
+                                        limitReached
+                                          ? 'Replacement limit reached'
+                                          : poolAvailable === 0
+                                            ? 'Click to see the stock warning'
+                                          : ''
+                                      }
+                                      className="w-full rounded-lg bg-emerald-600 px-3 py-2 font-extrabold text-white disabled:cursor-not-allowed disabled:opacity-45"
+                                    >
+                                      Resolve with Replacement
+                                    </button>
+                                    {limitReached && (
+                                      <p className="text-center font-bold text-amber-200">
+                                        Replacement limit reached
+                                      </p>
+                                    )}
+                                    <button
+                                      type="button"
+                                      disabled={claimActionBusy === claim.claimId}
+                                      onClick={() => {
+                                        if (
+                                          window.confirm(
+                                            'Confirm that you have already sent the refund through your payment provider. This action only records the refund in the panel.'
+                                          )
+                                        ) {
+                                          void handleClaimAction(claim, 'refund');
+                                        }
+                                      }}
+                                      className="w-full rounded-lg border border-amber-300/30 bg-amber-600/15 px-3 py-2 font-extrabold text-amber-100 disabled:opacity-50"
+                                    >
+                                      Record sent refund
+                                    </button>
+                                    <p className="text-[10px] leading-relaxed text-slate-500">
+                                      Send the money through your payment provider first. This button only records a refund you confirm was sent.
+                                    </p>
+                                  </>
+                                )}
+                                {open && (
+                                  <button
+                                    type="button"
+                                    disabled={claimActionBusy === claim.claimId}
+                                    onClick={() => {
+                                      setRejectClaim(claim);
+                                      setRejectionReason('');
+                                    }}
+                                    className="w-full rounded-lg border border-rose-400/30 bg-rose-950/70 px-3 py-2 font-bold text-rose-200 disabled:opacity-50"
+                                  >
+                                    Reject
+                                  </button>
+                                )}
+                                {!open && (
+                                  <p className="text-center text-slate-500">No further actions</p>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+                {guaranteeClaims.length < claimsTotal && (
+                  <button
+                    type="button"
+                    onClick={() => setClaimsOffset(guaranteeClaims.length)}
+                    className="mt-3 w-full rounded-xl border border-cyan-400/30 bg-slate-950 px-4 py-2.5 text-xs font-bold text-cyan-200"
+                  >
+                    Load older claims ({guaranteeClaims.length} of {claimsTotal})
+                  </button>
+                )}
+                <p className="text-[11px] text-slate-500">
+                  Low stock is 2 or fewer IDs. Replacements use the matching guarantee pool and keep the original expiry date.
+                </p>
+              </section>
             </div>
           )}
 
@@ -1647,7 +2188,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
 
                 <div className="space-y-1.5">
                   <label className="block text-xs font-extrabold text-cyan-300">
-                    Support Handle (WhatsApp / Telegram)
+                    Support Display Name
                   </label>
                   <input
                     type="text"
@@ -1660,9 +2201,80 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                         supportHandle: value,
                       }));
                     }}
-                    placeholder="@RoshanbrandSupport"
+                    placeholder="WhatsApp Support"
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-cyan-500/35 text-sm text-white"
                   />
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="block text-xs font-extrabold text-cyan-300">
+                    Admin Name for Claim Audit Log
+                  </label>
+                  <input
+                    type="text"
+                    maxLength={80}
+                    required
+                    value={formConfig.adminDisplayName}
+                    onChange={(e) =>
+                      setFormConfig((current) => ({
+                        ...current,
+                        adminDisplayName: e.target.value,
+                      }))
+                    }
+                    placeholder="Store Admin"
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-cyan-500/35 text-sm text-white"
+                  />
+                  <p className="text-[11px] text-slate-400">
+                    This name is attached to approvals, rejections, refunds, and replacements.
+                  </p>
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="block text-xs font-extrabold text-cyan-300">
+                    WhatsApp Support Link
+                  </label>
+                  <input
+                    type="url"
+                    required
+                    value={formConfig.supportUrl}
+                    onChange={(e) => {
+                      setSupportUrlDirty(true);
+                      setFormConfig((current) => ({
+                        ...current,
+                        supportUrl: e.target.value,
+                      }));
+                    }}
+                    placeholder="https://wa.me/1234567890"
+                    pattern="https://wa\.me/[0-9]{8,15}"
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-cyan-500/35 text-sm text-white"
+                  />
+                  <p className="text-[11px] text-slate-400">
+                    Use the full international phone number with country code and no plus sign.
+                  </p>
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="block text-xs font-extrabold text-cyan-300">
+                    Maximum Guarantee Replacements per Order
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={20}
+                    step={1}
+                    required
+                    value={formConfig.maxGuaranteeReplacementsPerOrder}
+                    onChange={(e) =>
+                      setFormConfig((current) => ({
+                        ...current,
+                        maxGuaranteeReplacementsPerOrder: Number(e.target.value),
+                      }))
+                    }
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-cyan-500/35 text-sm text-white"
+                  />
+                  <p className="text-[11px] text-slate-400">
+                    Applies across the original order guarantee. Set to 0 to disable replacements.
+                  </p>
                 </div>
 
                 <div className="sm:col-span-2 lg:col-span-4 space-y-1.5">
@@ -1699,84 +2311,6 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
           {/* TAB 4: READY ID VAULT */}
           {activeTab === 'inventory' && (
             <div className="space-y-6">
-              {/* One-Time Pre-Set Master Ready ID Card */}
-              <form
-                onSubmit={handleSaveSettings}
-                className="neon-card-3d p-6 space-y-4 border-emerald-400/50"
-              >
-                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-cyan-500/25 pb-3">
-                  <div>
-                    <h2 className="font-display text-base font-black text-white flex items-center gap-2">
-                      <Zap className="w-5 h-5 text-emerald-400" />
-                      Ek Baar Me Pre-Set Ready ID (Auto-Shows to Customer on UTR Verify)
-                    </h2>
-                    <p className="text-xs text-slate-300 mt-1">
-                      Yahan apni Ready IRCTC ID &amp; Password ek baar set karke save kar dein. Jaise
-                      hi customer ka UTR verify hoga, yahi pre-set ID turant customer ki screen par
-                      show ho jayegi!
-                    </p>
-                  </div>
-                </div>
-
-                {saveSuccess && (
-                  <div className="p-3 rounded-xl bg-emerald-950/70 border border-emerald-400/50 text-xs text-emerald-300 font-bold flex items-center gap-2">
-                    <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-400" />
-                    <span>{saveSuccess}</span>
-                  </div>
-                )}
-
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div className="space-y-1.5">
-                    <label className="block text-xs font-extrabold text-emerald-300">
-                      Pre-Set 24-Hour Rental IRCTC ID Credentials
-                    </label>
-                    <textarea
-                      rows={3}
-                      value={formConfig.presetRentalCredentials || ''}
-                      onChange={(e) =>
-                        setFormConfig({
-                          ...formConfig,
-                          presetRentalCredentials: e.target.value,
-                        })
-                      }
-                      placeholder="Username: roshan_rent24_vip | Password: Tatkal@2499"
-                      className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-emerald-400/40 text-xs text-white font-mono focus:outline-none focus:border-emerald-400"
-                    />
-                  </div>
-
-                  <div className="space-y-1.5">
-                    <label className="block text-xs font-extrabold text-cyan-300">
-                      Pre-Set Permanent IRCTC ID (Standard / Bulk Plan)
-                    </label>
-                    <textarea
-                      rows={3}
-                      value={formConfig.presetPermanentCredentials || ''}
-                      onChange={(e) =>
-                        setFormConfig({
-                          ...formConfig,
-                          presetPermanentCredentials: e.target.value,
-                        })
-                      }
-                      placeholder="Username: rb_irctc_vip801 | Password: RailPass@801"
-                      className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-cyan-500/35 text-xs text-white font-mono focus:outline-none focus:border-cyan-400"
-                    />
-                  </div>
-                </div>
-
-                <button
-                  type="submit"
-                  disabled={savingSettings}
-                  className="py-3 px-6 rounded-xl text-white font-extrabold text-xs sm:text-sm store-pay-pill flex items-center justify-center gap-2 cursor-pointer"
-                >
-                  <CheckCircle2 className="w-4 h-4" />
-                  <span>
-                    {savingSettings
-                      ? 'Saving Pre-Set Ready IDs...'
-                      : 'Save Pre-Set Ready IDs (Used Instantly on UTR Verify)'}
-                  </span>
-                </button>
-              </form>
-
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
               <form
                 onSubmit={handleAddVaultIds}
@@ -1788,9 +2322,9 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     Add IRCTC IDs &amp; Passwords to Vault
                   </h2>
                   <p className="text-xs text-slate-300 mt-1">
-                    Paste ready IRCTC IDs (one account per line:{' '}
-                    <code className="text-cyan-300">username | password</code>). Used for
-                    instant UPI auto-dispatch!
+                    Add one account per line:{' '}
+                    <code className="text-cyan-300">username | password</code>. IDs are assigned
+                    from the selected pool after an order&apos;s payment is manually verified.
                   </p>
                 </div>
 
@@ -1868,7 +2402,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
 
                 {vault.length === 0 ? (
                   <div className="p-8 text-center text-xs text-slate-400">
-                    No pre-loaded IDs in vault yet. Add IDs on the left for instant auto-delivery.
+                    No IDs are available in this pool yet. Add accounts on the left; they will be
+                    assigned after payment is manually verified.
                   </div>
                 ) : (
                   <div className="space-y-2.5 max-h-[500px] overflow-y-auto pr-1">
@@ -1930,6 +2465,112 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                 )}
               </div>
               </div>
+            </div>
+          )}
+
+          {claimWarning && (
+            <div
+              className="fixed inset-0 z-[100] flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
+              role="alertdialog"
+              aria-modal="true"
+              aria-labelledby="claim-warning-title"
+            >
+              <section className="w-full max-w-md rounded-2xl border border-amber-400/40 bg-slate-950 p-5 shadow-2xl">
+                <div className="flex items-start gap-3">
+                  <AlertCircle className="mt-0.5 h-5 w-5 shrink-0 text-amber-300" />
+                  <div>
+                    <h2 id="claim-warning-title" className="font-extrabold text-amber-100">
+                      Guarantee claim update
+                    </h2>
+                    <p className="mt-2 whitespace-pre-wrap text-sm leading-relaxed text-slate-200">
+                      {claimWarning}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setClaimWarning('')}
+                  className="mt-5 w-full rounded-xl bg-amber-500/20 px-4 py-2.5 text-sm font-bold text-amber-100 hover:bg-amber-500/30"
+                >
+                  Close
+                </button>
+              </section>
+            </div>
+          )}
+
+          {rejectClaim && (
+            <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm">
+              <form
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  handleClaimAction(rejectClaim, 'reject', rejectionReason);
+                }}
+                className="w-full max-w-lg rounded-2xl border border-rose-400/40 bg-slate-950 p-5 shadow-2xl"
+              >
+                <h2 className="font-extrabold text-white">Reject guarantee claim</h2>
+                <p className="mt-1 text-xs text-slate-400">
+                  The customer will see this reason with their order.
+                </p>
+                <textarea
+                  required
+                  maxLength={500}
+                  rows={4}
+                  value={rejectionReason}
+                  onChange={(event) => setRejectionReason(event.target.value)}
+                  placeholder="Enter a clear reason for rejecting this claim"
+                  className="mt-4 w-full rounded-xl border border-rose-400/25 bg-slate-900 p-3 text-sm text-white placeholder:text-slate-500"
+                />
+                <div className="mt-4 flex justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setRejectClaim(null)}
+                    className="rounded-xl border border-slate-600 px-4 py-2 text-sm font-bold text-slate-200"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={!rejectionReason.trim() || claimActionBusy === rejectClaim.claimId}
+                    className="rounded-xl bg-rose-600 px-4 py-2 text-sm font-extrabold text-white disabled:opacity-50"
+                  >
+                    Confirm rejection
+                  </button>
+                </div>
+              </form>
+            </div>
+          )}
+
+          {claimScreenshot && (
+            <div
+              className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm"
+              onClick={() => setClaimScreenshot(null)}
+            >
+              <section
+                role="dialog"
+                aria-modal="true"
+                aria-label={`Screenshot for ${claimScreenshot.title}`}
+                className="w-full max-w-4xl rounded-2xl border border-cyan-400/30 bg-slate-950 p-4"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <h2 className="font-mono text-sm font-bold text-cyan-100">
+                    Claim screenshot · {claimScreenshot.title}
+                  </h2>
+                  <button
+                    type="button"
+                    onClick={() => setClaimScreenshot(null)}
+                    aria-label="Close screenshot"
+                    className="rounded-lg p-2 text-slate-300 hover:bg-slate-800"
+                  >
+                    <XCircle className="h-5 w-5" />
+                  </button>
+                </div>
+                <img
+                  src={claimScreenshot.dataUrl}
+                  alt={`Customer evidence for claim ${claimScreenshot.title}`}
+                  className="max-h-[75vh] w-full rounded-xl bg-black object-contain"
+                />
+              </section>
             </div>
           )}
         </main>

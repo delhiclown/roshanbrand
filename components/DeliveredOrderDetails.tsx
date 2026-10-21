@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { ChangeEvent, useEffect, useState } from 'react';
 import {
   Activity,
   ArrowDownToLine,
@@ -11,20 +11,24 @@ import {
   CreditCard,
   Eye,
   EyeOff,
+  FileImage,
   KeyRound,
   Package,
   ShieldCheck,
   Ticket,
   UserRound,
 } from 'lucide-react';
-import { OrderRecord } from '../src/types';
+import { CustomerGuaranteeClaim, OrderRecord } from '../src/types';
 import './DeliveredOrderDetails.css';
 
 interface DeliveredOrderDetailsProps {
   order: OrderRecord;
+  accessToken: string;
+  guaranteeClaims: CustomerGuaranteeClaim[];
   copiedKey: string | null;
   onCopy: (text: string, key: string) => void;
   onDownload: (order: OrderRecord) => void;
+  onGuaranteeClaimsUpdated: (claims: CustomerGuaranteeClaim[]) => void;
   onBack: () => void;
 }
 
@@ -48,21 +52,84 @@ function parseCredential(line: string): ParsedCredential {
   };
 }
 
+function getRentalExpiry(order: OrderRecord): Date | null {
+  if (!order.isRental24h) return null;
+  const savedExpiry = order.rentalExpiresAt ? new Date(order.rentalExpiresAt) : null;
+  if (savedExpiry && Number.isFinite(savedExpiry.getTime())) return savedExpiry;
+  const deliveredAt = new Date(order.verifiedAt || order.createdAt);
+  return Number.isFinite(deliveredAt.getTime())
+    ? new Date(deliveredAt.getTime() + 24 * 60 * 60 * 1000)
+    : null;
+}
+
+function getOriginalGuaranteeExpiry(order: OrderRecord): Date | null {
+  if (order.packType === 'guarantee_7days') {
+    return new Date(
+      new Date(order.verifiedAt || order.createdAt).getTime() + 7 * 24 * 60 * 60 * 1000
+    );
+  }
+  if (order.packType !== 'guarantee_1month') return null;
+  const expiry = new Date(order.verifiedAt || order.createdAt);
+  if (!Number.isFinite(expiry.getTime())) return null;
+  const targetMonth = expiry.getUTCMonth() + 1;
+  const lastDay = new Date(
+    Date.UTC(expiry.getUTCFullYear(), targetMonth + 1, 0)
+  ).getUTCDate();
+  expiry.setUTCDate(Math.min(expiry.getUTCDate(), lastDay));
+  expiry.setUTCMonth(targetMonth);
+  return expiry;
+}
+
 export function DeliveredOrderDetails({
   order,
+  accessToken,
+  guaranteeClaims,
   copiedKey,
   onCopy,
   onDownload,
+  onGuaranteeClaimsUpdated,
   onBack,
 }: DeliveredOrderDetailsProps) {
   const [visiblePasswords, setVisiblePasswords] = useState<Record<number, boolean>>({});
+  const [claimingCredentialIndex, setClaimingCredentialIndex] = useState<number | null>(null);
+  const [issueDescription, setIssueDescription] = useState('');
+  const [screenshotDataUrl, setScreenshotDataUrl] = useState('');
+  const [claimSubmitting, setClaimSubmitting] = useState(false);
+  const [claimError, setClaimError] = useState('');
+  const [claimSuccess, setClaimSuccess] = useState('');
+  const [, setRentalExpiryTick] = useState(0);
+  const rentalExpiry = getRentalExpiry(order);
+  const isRentalExpired = Boolean(
+    order.credentialsExpired ||
+    (rentalExpiry && Number.isFinite(rentalExpiry.getTime()) && rentalExpiry.getTime() <= Date.now())
+  );
   const accounts = (order.deliveredCredentials || '')
     .split('\n')
     .map((line) => line.trim())
     .filter(Boolean)
-    .map(parseCredential);
-  const isDelivered = order.status === 'verified_delivered' && accounts.length > 0;
+    .map(parseCredential)
+    .filter(() => !isRentalExpired);
+  const isDelivered = order.status === 'verified_delivered';
   const deliveredAt = order.verifiedAt || order.updatedAt || order.createdAt;
+  const hasGuarantee =
+    order.packType === 'guarantee_7days' || order.packType === 'guarantee_1month';
+  const guaranteeExpiry = getOriginalGuaranteeExpiry(order);
+  const guaranteeDaysLeft = guaranteeExpiry
+    ? Math.max(0, Math.ceil((guaranteeExpiry.getTime() - Date.now()) / (24 * 60 * 60 * 1000)))
+    : 0;
+  const guaranteeOpenClaim = guaranteeClaims.find(
+    (claim) => claim.status === 'pending' || claim.status === 'approved'
+  );
+  useEffect(() => {
+    if (!rentalExpiry || isRentalExpired) return;
+    const delay = rentalExpiry.getTime() - Date.now();
+    if (delay <= 0) {
+      setRentalExpiryTick((tick) => tick + 1);
+      return;
+    }
+    const timer = window.setTimeout(() => setRentalExpiryTick((tick) => tick + 1), delay);
+    return () => window.clearTimeout(timer);
+  }, [rentalExpiry?.getTime(), isRentalExpired]);
   const formatDate = (value: string) =>
     new Date(value).toLocaleString('en-IN', {
       day: 'numeric',
@@ -71,6 +138,60 @@ export function DeliveredOrderDetails({
       hour: '2-digit',
       minute: '2-digit',
     });
+
+  const handleScreenshotChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    setClaimError('');
+    setScreenshotDataUrl('');
+    if (!file) return;
+    if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) {
+      setClaimError('Choose a PNG, JPEG, or WebP screenshot.');
+      event.target.value = '';
+      return;
+    }
+    if (file.size > 1024 * 1024) {
+      setClaimError('Screenshot must be no larger than 1 MB.');
+      event.target.value = '';
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === 'string') setScreenshotDataUrl(reader.result);
+    };
+    reader.onerror = () => setClaimError('The screenshot could not be read. Please try again.');
+    reader.readAsDataURL(file);
+  };
+
+  const submitGuaranteeClaim = async () => {
+    if (claimingCredentialIndex === null || !issueDescription.trim() || !accessToken) return;
+    setClaimSubmitting(true);
+    setClaimError('');
+    setClaimSuccess('');
+    try {
+      const response = await fetch('/api/orders/guarantee-claims', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          orderId: order.orderId,
+          accessToken,
+          credentialIndex: claimingCredentialIndex,
+          issueDescription: issueDescription.trim(),
+          screenshotDataUrl: screenshotDataUrl || undefined,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Could not submit your guarantee claim.');
+      onGuaranteeClaimsUpdated(data.guaranteeClaims || []);
+      setClaimSuccess('Claim submitted. You can follow its status here.');
+      setClaimingCredentialIndex(null);
+      setIssueDescription('');
+      setScreenshotDataUrl('');
+    } catch (error) {
+      setClaimError(error instanceof Error ? error.message : 'Could not submit your claim.');
+    } finally {
+      setClaimSubmitting(false);
+    }
+  };
 
   return (
     <section className="delivered-order-page" aria-labelledby="delivered-order-title">
@@ -100,6 +221,7 @@ export function DeliveredOrderDetails({
                 : 'IRCTC Account'}
             </span>
             <span className="delivered-badge-soft"><ShieldCheck /> UPI Verified</span>
+            {order.refundedAt && <span className="delivered-badge-status is-pending">Refunded</span>}
             <span className={`delivered-badge-status${isDelivered ? '' : ' is-pending'}`}>
               {isDelivered ? <CheckCircle2 /> : <Clock3 />}
               {isDelivered ? 'Delivered' : 'Delivery pending'}
@@ -128,11 +250,11 @@ export function DeliveredOrderDetails({
               </div>
               <div className="delivered-overview-item">
                 <span className="delivered-overview-icon"><ShieldCheck /></span>
-                <span><small>Payment status</small><strong className="delivered-positive">Verified · UTR {order.utrNumber}</strong></span>
+                <span><small>Payment status</small><strong className={order.refundedAt ? 'delivered-waiting' : 'delivered-positive'}>{order.refundedAt ? 'Refunded' : 'Verified'} · UTR {order.utrNumber}</strong></span>
               </div>
               <div className="delivered-overview-item">
                 <span className="delivered-overview-icon"><Activity /></span>
-                <span><small>Delivery status</small><strong className={isDelivered ? 'delivered-positive' : 'delivered-waiting'}>{isDelivered ? 'Credentials delivered' : 'Awaiting delivery'}</strong></span>
+                <span><small>Delivery status</small><strong className={isDelivered && !isRentalExpired ? 'delivered-positive' : 'delivered-waiting'}>{isRentalExpired ? 'Rental expired' : isDelivered ? 'Credentials delivered' : 'Awaiting delivery'}</strong></span>
               </div>
             </div>
           </section>
@@ -142,7 +264,13 @@ export function DeliveredOrderDetails({
               <span className="delivered-section-icon"><KeyRound /></span>
               <div><h2>Delivery Details</h2><p>Your credentials to access your IRCTC account</p></div>
             </div>
-            {isDelivered ? (
+            {isRentalExpired ? (
+              <div className="delivered-claim-status is-resolved" role="status">
+                <strong>24-hour rental expired</strong>
+                <span>The panel no longer displays or provides access to these credentials. Expiry here does not disable the account in IRCTC.</span>
+                {rentalExpiry && <span>Expired {formatDate(rentalExpiry.toISOString())}</span>}
+              </div>
+            ) : isDelivered ? (
               <div className="delivered-account-list">
                 {accounts.map((account, index) => {
                   const passwordKey = `delivered-password-${index}`;
@@ -175,16 +303,113 @@ export function DeliveredOrderDetails({
                       {account.notes.length > 0 && (
                         <p className="delivered-account-notes">{account.notes.join(' · ')}</p>
                       )}
+                      {hasGuarantee && guaranteeExpiry && (
+                        <div className="delivered-guarantee-box">
+                          <div className="delivered-guarantee-meta">
+                            <ShieldCheck />
+                            <span>
+                              <strong>
+                                {order.packType === 'guarantee_7days' ? '7-day' : '1-month'} guarantee
+                                {guaranteeDaysLeft > 0
+                                  ? ` · ${guaranteeDaysLeft} day${guaranteeDaysLeft === 1 ? '' : 's'} left`
+                                  : ' · Expired'}
+                              </strong>
+                              <small>Guarantee valid till: {formatDate(guaranteeExpiry.toISOString())}</small>
+                            </span>
+                          </div>
+                          {guaranteeClaims
+                            .filter((claim) => claim.credentialIndex === index)
+                            .map((claim) => (
+                              <div key={claim.claimId} className={`delivered-claim-status is-${claim.status}`}>
+                                <strong>Claim {claim.status}</strong>
+                                <span>#{claim.claimId} · {formatDate(claim.createdAt)}</span>
+                                {claim.rejectionReason && <p>Reason: {claim.rejectionReason}</p>}
+                                {claim.resolution === 'refund' && <p>Refund marked for this order.</p>}
+                                {claim.resolution === 'replacement' && (
+                                  <p>Replacement delivered · guarantee remains valid till {formatDate(claim.expiresAt)}.</p>
+                                )}
+                              </div>
+                            ))}
+                          {guaranteeDaysLeft > 0 && (
+                            <button
+                              type="button"
+                              disabled={
+                                !accessToken ||
+                                Boolean(guaranteeOpenClaim) ||
+                                Boolean(order.refundedAt)
+                              }
+                              onClick={() => {
+                                setClaimError('');
+                                setClaimSuccess('');
+                                setIssueDescription('');
+                                setScreenshotDataUrl('');
+                                setClaimingCredentialIndex(index);
+                              }}
+                              className="delivered-claim-button"
+                            >
+                              {guaranteeOpenClaim
+                                ? 'Claim already in progress'
+                                : 'Claim Guarantee'}
+                            </button>
+                          )}
+                          {claimingCredentialIndex === index && (
+                            <div className="delivered-claim-form">
+                              <label>
+                                <span>Describe the issue <strong>*</strong></span>
+                                <textarea
+                                  required
+                                  maxLength={2000}
+                                  rows={4}
+                                  value={issueDescription}
+                                  onChange={(event) => setIssueDescription(event.target.value)}
+                                  placeholder="Tell us what happened to this ID"
+                                />
+                              </label>
+                              <label className="delivered-claim-upload">
+                                <FileImage />
+                                <span>
+                                  Screenshot (optional)
+                                  <small>PNG, JPEG, or WebP · up to 1 MB</small>
+                                </span>
+                                <input
+                                  type="file"
+                                  accept="image/png,image/jpeg,image/webp"
+                                  onChange={handleScreenshotChange}
+                                />
+                              </label>
+                              {screenshotDataUrl && <p className="delivered-claim-file">Screenshot attached</p>}
+                              {claimError && <p className="delivered-claim-error" role="alert">{claimError}</p>}
+                              <div className="delivered-claim-actions">
+                                <button
+                                  type="button"
+                                  onClick={() => setClaimingCredentialIndex(null)}
+                                  disabled={claimSubmitting}
+                                >
+                                  Cancel
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={submitGuaranteeClaim}
+                                  disabled={claimSubmitting || !issueDescription.trim()}
+                                >
+                                  {claimSubmitting ? 'Submitting…' : 'Submit claim'}
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </article>
                   );
                 })}
-                <div className="delivered-credentials-actions">
+                {claimSuccess && <p className="delivered-claim-success" role="status">{claimSuccess}</p>}
+                {!isRentalExpired && <div className="delivered-credentials-actions">
                   <button type="button" onClick={() => onCopy(order.deliveredCredentials, 'delivered-all')}>
                     {copiedKey === 'delivered-all' ? <Check /> : <Copy />}
                     {copiedKey === 'delivered-all' ? 'Copied all credentials' : 'Copy all credentials'}
                   </button>
                   <button type="button" onClick={() => onDownload(order)}><ArrowDownToLine /> Download CSV</button>
-                </div>
+                </div>}
               </div>
             ) : (
               <div className="delivered-pending-message">
@@ -215,7 +440,7 @@ export function DeliveredOrderDetails({
             <p className="delivered-status-description">Track payment verification and account delivery for your order.</p>
             <div className={`delivered-status-summary${isDelivered ? '' : ' is-pending'}`}>
               <span className="delivered-status-led" />
-              <span><strong>{isDelivered ? 'Order Delivered' : 'Processing Order'}</strong><small>{isDelivered ? 'Your credentials are ready to use' : 'Your order is being verified'}</small></span>
+              <span><strong>{isRentalExpired ? 'Rental Expired' : isDelivered ? 'Order Delivered' : 'Processing Order'}</strong><small>{isRentalExpired ? 'Credentials are no longer available in this panel' : isDelivered ? 'Your credentials are ready to use' : 'Your order is being verified'}</small></span>
             </div>
             <div className="delivered-status-info"><span>Order ID</span><strong>{order.orderId}</strong></div>
             <div className="delivered-status-info"><span>Payment</span><strong>{isDelivered ? 'Verified' : 'Submitted'}</strong></div>
@@ -236,9 +461,11 @@ export function DeliveredOrderDetails({
               <div><dt>UTR reference</dt><dd>{order.utrNumber}</dd></div>
               <div className="delivered-billing-total"><dt>Total paid</dt><dd>₹{order.totalAmount.toLocaleString('en-IN')}</dd></div>
             </dl>
-            <button type="button" className="delivered-invoice-button" onClick={() => onDownload(order)}>
-              <ArrowDownToLine /> Download order CSV
-            </button>
+            {!isRentalExpired && (
+              <button type="button" className="delivered-invoice-button" onClick={() => onDownload(order)}>
+                <ArrowDownToLine /> Download order CSV
+              </button>
+            )}
           </section>
 
           <section className="delivered-help-card">

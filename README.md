@@ -37,3 +37,13 @@ If the frontend is deployed on Vercel, keep the backend on Render. `vercel.json`
 For a Render-only deployment, point the custom domain directly to the Render service; the Vercel rewrite is not used.
 
 Stock shown in the storefront is capped by both the configured display limit and the number of unassigned credentials in that product's vault pool. Add real credentials to the Admin Vault before making a product available; a fresh database starts with an empty vault.
+
+## Guarantee Claims
+
+Delivered 7-day and 1-month guarantee orders show the original expiry date and allow one open claim per order. Customers can report an issue and attach an optional PNG, JPEG, or WebP screenshot up to 1 MB. Claims and their audit/replacement history are persisted with the existing PostgreSQL `roshanbrand_state` JSONB state; screenshots are excluded from the polled admin state and loaded only when an admin views them.
+
+Admins review and approve a claim before resolving it with a replacement or refund, or reject it with a customer-visible reason. Replacement IDs are assigned from the matching guarantee vault pool and replace only the selected account in the original order. The original delivery date and expiry are preserved. The default maximum is two replacements per order and can be changed in Prices & Site Control (0–20). A refund action is an audit record only: the admin must send the money through the payment provider and confirm that first. Admin actions use the configurable audit display name; the current panel uses one shared admin login.
+
+The admin claims and order views are server-filtered and paginated in batches of 50; older records can be loaded on demand. State-changing API requests lock and refresh the shared PostgreSQL state row before applying changes. Admin login sessions are stored in PostgreSQL so they work across application instances.
+
+24-hour rental credentials are hidden by the panel after their expiry and are not returned by the private order-access API. This panel cannot revoke or disable the account at IRCTC; account access must be disabled externally if the rental product requires that guarantee.

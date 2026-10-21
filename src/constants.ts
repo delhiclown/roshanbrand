@@ -36,7 +36,10 @@ export const DEFAULT_STORE_CONFIG: StoreConfig = {
   upiId: PAYMENT_UPI_ID,
   payeeName: 'Roshanbrand Official',
   qrCodeUrl: '',
-  supportHandle: '@RoshanbrandSupport · 24×7 Instant Help',
+  supportHandle: 'WhatsApp Support',
+  supportUrl: 'https://wa.me/14086439496',
+  adminDisplayName: 'Store Admin',
+  maxGuaranteeReplacementsPerOrder: 2,
   price1Id: 340,
   price2Id: 680,
   price5Id: 1700,
@@ -53,10 +56,6 @@ export const DEFAULT_STORE_CONFIG: StoreConfig = {
   stock7DayGuaranteeAvailable: 0,
   stock1MonthGuaranteeAvailable: 0,
   instantAutoVerify: false,
-  presetRentalCredentials:
-    'Username: roshan_rent24_vip | Password: Tatkal@2499 | 24-Hour Active Rental',
-  presetPermanentCredentials:
-    'Username: rb_irctc_vip801 | Password: RailPass@801 | Permanent Aadhaar Verified',
   instantDeliveryNote:
     'UPI payment karein aur apna 12-digit UTR submit karein. Payment account me receive hone aur manually verify hone ke baad hi order deliver hoga.',
 };

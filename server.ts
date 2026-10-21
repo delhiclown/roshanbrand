@@ -541,6 +541,10 @@ async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
 
+  if (process.env.NODE_ENV === 'production' && !postgresPool) {
+    throw new Error('DATABASE_URL is required when NODE_ENV is production.');
+  }
+
   await initializePersistence(db);
   db.storeConfig = {
     ...DEFAULT_STORE_CONFIG,
@@ -667,6 +671,53 @@ async function startServer() {
 
   const sessionCookie = 'rb_admin_session';
   const sessionMaxAgeSeconds = 12 * 60 * 60;
+  const orderAccessCookieName = (orderId: string) =>
+    /^[A-Za-z0-9_-]{1,100}$/.test(orderId) ? `rb_order_access_${orderId}` : '';
+  const getOrderAccessCookie = (req: express.Request, orderId: string) => {
+    const cookieName = orderAccessCookieName(orderId);
+    if (!cookieName) return '';
+    const cookie = req.headers.cookie
+      ?.split(';')
+      .map((part) => part.trim())
+      .find((part) => part.startsWith(`${cookieName}=`));
+    if (!cookie) return '';
+    try {
+      return decodeURIComponent(cookie.slice(cookieName.length + 1));
+    } catch {
+      return '';
+    }
+  };
+  const getAuthorizedOrderAccessToken = (
+    req: express.Request,
+    orderId: string,
+    expectedHash: string | undefined,
+    suppliedToken: unknown
+  ) => {
+    if (!expectedHash) return '';
+    const expectedDigest = Buffer.from(expectedHash, 'hex');
+    const tokens = [String(suppliedToken || '').trim(), getOrderAccessCookie(req, orderId)];
+    const authorizedToken = tokens.find((token) => {
+      if (!/^[a-f0-9]{64}$/i.test(token)) return false;
+      const suppliedHash = createHash('sha256').update(token).digest();
+      return suppliedHash.length === expectedDigest.length &&
+        timingSafeEqual(suppliedHash, expectedDigest);
+    });
+    return authorizedToken || '';
+  };
+  const setOrderAccessCookie = (
+    res: express.Response,
+    orderId: string,
+    accessToken: string
+  ) => {
+    const cookieName = orderAccessCookieName(orderId);
+    if (!cookieName) return;
+    res.append(
+      'Set-Cookie',
+      `${cookieName}=${encodeURIComponent(accessToken)}; Path=/api/orders; HttpOnly; SameSite=Strict; Max-Age=${45 * 24 * 60 * 60}${
+        process.env.NODE_ENV === 'production' ? '; Secure' : ''
+      }`
+    );
+  };
   const clearSessionCookie = (res: express.Response) => {
     res.setHeader(
       'Set-Cookie',
@@ -1113,14 +1164,15 @@ async function startServer() {
     const existingOrder = db.orders.find((order) => order.utrNumber === utrNumber);
     if (existingOrder) {
       const expectedHash = db.orderAccessTokens[existingOrder.orderId];
-      const suppliedHash = createHash('sha256').update(accessToken).digest();
-      const expectedDigest = expectedHash ? Buffer.from(expectedHash, 'hex') : Buffer.alloc(0);
-      if (
-        expectedHash &&
-        suppliedHash.length === expectedDigest.length &&
-        timingSafeEqual(suppliedHash, expectedDigest)
-      ) {
-        res.status(200).json({ order: existingOrder, accessToken });
+      const authorizedToken = getAuthorizedOrderAccessToken(
+        req,
+        existingOrder.orderId,
+        expectedHash,
+        accessToken
+      );
+      if (authorizedToken) {
+        setOrderAccessCookie(res, existingOrder.orderId, authorizedToken);
+        res.status(200).json({ order: existingOrder, accessToken: authorizedToken });
         return;
       }
       res.status(409).json({
@@ -1265,6 +1317,7 @@ async function startServer() {
     // Push instant <50ms notification to Admin Panel & Customer screens
     broadcastStateUpdate('order_created', { order: newOrder });
 
+    setOrderAccessCookie(res, orderId, accessToken);
     res.status(201).json({ order: newOrder, accessToken, storeConfig: db.storeConfig });
   });
 
@@ -1306,15 +1359,9 @@ async function startServer() {
     const orderId = String(req.body?.orderId || '').trim();
     const accessToken = String(req.body?.accessToken || '').trim();
     const expectedHash = db.orderAccessTokens[orderId];
-    const suppliedHash = createHash('sha256').update(accessToken).digest();
-    const expectedDigest = expectedHash ? Buffer.from(expectedHash, 'hex') : Buffer.alloc(0);
 
-    if (
-      !expectedHash ||
-      !/^[a-f0-9]{64}$/i.test(accessToken) ||
-      suppliedHash.length !== expectedDigest.length ||
-      !timingSafeEqual(suppliedHash, expectedDigest)
-    ) {
+    const authorizedToken = getAuthorizedOrderAccessToken(req, orderId, expectedHash, accessToken);
+    if (!authorizedToken) {
       res.status(401).json({ error: 'The order access key is invalid.' });
       return;
     }
@@ -1341,6 +1388,7 @@ async function startServer() {
       return;
     }
 
+    setOrderAccessCookie(res, orderId, authorizedToken);
     res.json({
       order,
       guaranteeClaims: db.guaranteeClaims
@@ -1353,14 +1401,7 @@ async function startServer() {
     const orderId = String(req.body?.orderId || '').trim();
     const accessToken = String(req.body?.accessToken || '').trim();
     const expectedHash = db.orderAccessTokens[orderId];
-    const suppliedHash = createHash('sha256').update(accessToken).digest();
-    const expectedDigest = expectedHash ? Buffer.from(expectedHash, 'hex') : Buffer.alloc(0);
-    if (
-      !expectedHash ||
-      !/^[a-f0-9]{64}$/i.test(accessToken) ||
-      suppliedHash.length !== expectedDigest.length ||
-      !timingSafeEqual(suppliedHash, expectedDigest)
-    ) {
+    if (!getAuthorizedOrderAccessToken(req, orderId, expectedHash, accessToken)) {
       res.status(401).json({ error: 'The order access key is invalid.' });
       return;
     }

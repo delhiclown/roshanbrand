@@ -36,6 +36,7 @@ import {
 } from './types';
 
 const orderAccessStorageKey = (orderId: string) => `roshanbrand_order_access_${orderId}`;
+const cookieAuthenticatedOrder = 'http-only-cookie';
 
 interface ProductOption {
   id: string;
@@ -164,7 +165,17 @@ export default function App() {
     events.onmessage = (event) => {
       try {
         const message = JSON.parse(event.data) as { type?: string };
-        if (message.type === 'config_updated') {
+        if (
+          [
+            'config_updated',
+            'order_created',
+            'order_rejected',
+            'order_deleted',
+            'order_verified',
+            'vault_updated',
+            'guarantee_claim_replaced',
+          ].includes(message.type || '')
+        ) {
           loadStore();
         }
       } catch {
@@ -212,22 +223,29 @@ export default function App() {
           } catch {
             accessToken = '';
           }
-          if (accessToken) {
-            setTrackedOrderAccessToken(accessToken);
-            const accessResponse = await fetch('/api/orders/access', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ orderId: order.orderId, accessToken }),
-            });
-            if (accessResponse.ok) {
-              const accessData = await accessResponse.json();
-              order = accessData.order;
-              setGuaranteeClaims(accessData.guaranteeClaims || []);
-            }
+          const accessResponse = await fetch('/api/orders/access', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              orderId: order.orderId,
+              ...(accessToken ? { accessToken } : {}),
+            }),
+          });
+          try {
+            localStorage.removeItem(orderAccessStorageKey(order.orderId));
+          } catch {
+            // The access key is no longer written to browser storage.
+          }
+          if (accessResponse.ok) {
+            const accessData = await accessResponse.json();
+            order = accessData.order;
+            setTrackedOrderAccessToken(accessToken || cookieAuthenticatedOrder);
+            setGuaranteeClaims(accessData.guaranteeClaims || []);
           } else {
             setTrackedOrderAccessToken('');
             setGuaranteeClaims([]);
           }
+          if (!active) return;
           setTrackedOrder(order);
           setTrackError('');
         } else {
@@ -540,14 +558,8 @@ export default function App() {
     });
   };
 
-  const handleOrderCreated = (order: OrderRecord) => {
-    try {
-      setTrackedOrderAccessToken(
-        localStorage.getItem(orderAccessStorageKey(order.orderId)) || ''
-      );
-    } catch {
-      setTrackedOrderAccessToken('');
-    }
+  const handleOrderCreated = (order: OrderRecord, accessToken = '') => {
+    setTrackedOrderAccessToken(accessToken);
     setGuaranteeClaims([]);
     setTrackedOrderId(order.orderId);
     setSearchInput(order.orderId);
@@ -580,7 +592,7 @@ export default function App() {
           return;
         }
         try {
-          localStorage.setItem(orderAccessStorageKey(data.order.orderId), accessToken);
+          localStorage.removeItem(orderAccessStorageKey(data.order.orderId));
         } catch {
           // The access key remains available in the field for this visit.
         }

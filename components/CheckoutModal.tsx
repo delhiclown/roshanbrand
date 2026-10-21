@@ -72,6 +72,18 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
       setSubmitting(true);
 
       try {
+        const accessCheck = await fetch('/api/orders/access', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ orderId: 'deployment-check', accessToken: '0'.repeat(64) }),
+        });
+        if (accessCheck.status !== 401) {
+          setErrorMsg(
+            'Secure order tracking is not ready yet. Please try again later; do not submit another payment.'
+          );
+          return;
+        }
+
         const accessToken =
           (orderAccessTokenUtr === cleanedUtr && orderAccessToken) ||
           Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) =>

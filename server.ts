@@ -1,13 +1,22 @@
 import express from 'express';
 import 'dotenv/config';
 import { randomBytes, scrypt, timingSafeEqual, createHash } from 'crypto';
+import { AsyncLocalStorage } from 'async_hooks';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { Pool } from 'pg';
 import { createServer as createViteServer } from 'vite';
 import { DEFAULT_STORE_CONFIG, LIMITS } from './src/constants.ts';
-import { OrderRecord, PackType, StoreConfig, VaultItem, VaultPoolType } from './src/types.ts';
+import {
+  CustomerGuaranteeClaim,
+  GuaranteeClaim,
+  OrderRecord,
+  PackType,
+  StoreConfig,
+  VaultItem,
+  VaultPoolType,
+} from './src/types.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -17,10 +26,17 @@ const DATA_DIR = process.env.DATA_DIR || DEFAULT_DATA_DIR;
 const DATA_FILE = path.join(DATA_DIR, 'roshanbrand_store.json');
 const SEED_DATA_FILE = path.join(DEFAULT_DATA_DIR, 'roshanbrand_store.json');
 const ADMIN_AUTH_FILE = path.join(DATA_DIR, 'admin_auth.json');
-const postgresPool = new Pool({ connectionString: process.env.DATABASE_URL });
+const ADMIN_SESSION_FILE = path.join(DATA_DIR, 'admin_sessions.json');
+const postgresPool = process.env.DATABASE_URL
+  ? new Pool({ connectionString: process.env.DATABASE_URL })
+  : null;
 let persistenceQueue: Promise<void> = Promise.resolve();
 let lastPersistedState = '';
 let persistenceVersion = 0;
+const requestTransaction = new AsyncLocalStorage<{
+  client: import('pg').PoolClient;
+  committed: boolean;
+}>();
 
 interface AdminAuthRecord {
   salt: string;
@@ -33,10 +49,45 @@ interface PersistedDatabase {
   vault: VaultItem[];
   utrIndex: Record<string, string>;
   orderAccessTokens: Record<string, string>;
+  guaranteeClaims: GuaranteeClaim[];
 }
 
 function buildInitialVault(): VaultItem[] {
   return [];
+}
+
+function ensureDataDirectory(): void {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+function loadAdminSessionStore(): Record<string, number> {
+  try {
+    if (!fs.existsSync(ADMIN_SESSION_FILE)) {
+      return {};
+    }
+    const parsed = JSON.parse(fs.readFileSync(ADMIN_SESSION_FILE, 'utf-8')) as Record<string, unknown>;
+    const entries: Record<string, number> = {};
+    for (const [tokenHash, expiresAt] of Object.entries(parsed)) {
+      const expiry = Number(expiresAt);
+      if (Number.isFinite(expiry)) {
+        entries[tokenHash] = expiry;
+      }
+    }
+    return entries;
+  } catch {
+    return {};
+  }
+}
+
+const fallbackAdminSessions = loadAdminSessionStore();
+
+function persistAdminSessionStore(): void {
+  try {
+    ensureDataDirectory();
+    fs.writeFileSync(ADMIN_SESSION_FILE, JSON.stringify(fallbackAdminSessions), 'utf-8');
+  } catch {
+    // Ignore write failures in local-only mode so the site still boots.
+  }
 }
 
 function loadDb(): PersistedDatabase {
@@ -45,7 +96,12 @@ function loadDb(): PersistedDatabase {
     try {
       const raw = fs.readFileSync(sourceFile, 'utf-8');
       const parsed = JSON.parse(raw) as Partial<PersistedDatabase>;
-      const savedStoreConfig: Partial<StoreConfig> = parsed.storeConfig || {};
+      const savedStoreConfig = Object.fromEntries(
+        Object.entries(parsed.storeConfig || {}).filter(
+          ([key]) =>
+            key !== 'presetRentalCredentials' && key !== 'presetPermanentCredentials'
+        )
+      ) as Partial<StoreConfig>;
       const orders = Array.isArray(parsed.orders) ? parsed.orders : [];
       const orderAccessTokens =
         parsed.orderAccessTokens && typeof parsed.orderAccessTokens === 'object'
@@ -69,6 +125,19 @@ function loadDb(): PersistedDatabase {
         storeConfig: {
           ...DEFAULT_STORE_CONFIG,
           ...savedStoreConfig,
+          supportUrl: normalizeSupportUrl(
+            savedStoreConfig.supportUrl,
+            DEFAULT_STORE_CONFIG.supportUrl
+          ),
+          adminDisplayName: String(
+            savedStoreConfig.adminDisplayName || DEFAULT_STORE_CONFIG.adminDisplayName
+          )
+            .trim()
+            .slice(0, 80),
+          maxGuaranteeReplacementsPerOrder: normalizeReplacementLimit(
+            savedStoreConfig.maxGuaranteeReplacementsPerOrder,
+            DEFAULT_STORE_CONFIG.maxGuaranteeReplacementsPerOrder
+          ),
           priceRental24h: normalizePrice(
             savedStoreConfig.priceRental24h,
             DEFAULT_STORE_CONFIG.priceRental24h
@@ -98,16 +167,6 @@ function loadDb(): PersistedDatabase {
           upiId: normalizeUpiId(savedStoreConfig.upiId, DEFAULT_STORE_CONFIG.upiId),
           instantAutoVerify: false,
           instantDeliveryNote: DEFAULT_STORE_CONFIG.instantDeliveryNote,
-          presetRentalCredentials: sanitizeDeliveredCredentials(
-            savedStoreConfig.presetRentalCredentials ||
-              DEFAULT_STORE_CONFIG.presetRentalCredentials ||
-              ''
-          ),
-          presetPermanentCredentials: sanitizeDeliveredCredentials(
-            savedStoreConfig.presetPermanentCredentials ||
-              DEFAULT_STORE_CONFIG.presetPermanentCredentials ||
-              ''
-          ),
           stockDisplayAvailable: normalizeStock(
             savedStoreConfig.stockDisplayAvailable,
             normalizeStock(savedStoreConfig.stockAvailable, DEFAULT_STORE_CONFIG.stockDisplayAvailable)
@@ -137,6 +196,7 @@ function loadDb(): PersistedDatabase {
           : buildInitialVault(),
         utrIndex: verifiedUtrIndex,
         orderAccessTokens,
+        guaranteeClaims: Array.isArray(parsed.guaranteeClaims) ? parsed.guaranteeClaims : [],
       };
     } catch (err) {
       console.error('Failed to read store data file; refusing to initialize defaults:', err);
@@ -150,12 +210,19 @@ function loadDb(): PersistedDatabase {
     vault: buildInitialVault(),
     utrIndex: {},
     orderAccessTokens: {},
+    guaranteeClaims: [],
   };
 }
 
 async function initializePersistence(db: PersistedDatabase): Promise<void> {
-  if (!process.env.DATABASE_URL) {
-    throw new Error('DATABASE_URL is required to start the server.');
+  if (!postgresPool) {
+    ensureDataDirectory();
+    const seededDb = loadDb();
+    Object.assign(db, seededDb);
+    db.orderAccessTokens ||= {};
+    db.guaranteeClaims ||= [];
+    lastPersistedState = JSON.stringify(db);
+    return;
   }
 
   await postgresPool.query(`
@@ -163,6 +230,12 @@ async function initializePersistence(db: PersistedDatabase): Promise<void> {
       id SMALLINT PRIMARY KEY CHECK (id = 1),
       state JSONB NOT NULL,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await postgresPool.query(`
+    CREATE TABLE IF NOT EXISTS roshanbrand_admin_sessions (
+      token_hash TEXT PRIMARY KEY,
+      expires_at TIMESTAMPTZ NOT NULL
     )
   `);
 
@@ -196,6 +269,25 @@ async function initializePersistence(db: PersistedDatabase): Promise<void> {
 
 function saveDb(db: PersistedDatabase): Promise<void> {
   const state = JSON.stringify(db);
+  if (!postgresPool) {
+    ensureDataDirectory();
+    fs.writeFileSync(DATA_FILE, state, 'utf-8');
+    lastPersistedState = state;
+    return Promise.resolve();
+  }
+  const transaction = requestTransaction.getStore();
+  if (transaction) {
+    return transaction.client
+      .query(
+        'UPDATE roshanbrand_state SET state = $1::jsonb, updated_at = NOW() WHERE id = 1',
+        [state]
+      )
+      .then(() => transaction.client.query('COMMIT'))
+      .then(() => {
+        transaction.committed = true;
+        lastPersistedState = state;
+      });
+  }
   const version = ++persistenceVersion;
   const write = persistenceQueue.then(() =>
     postgresPool.query(
@@ -241,6 +333,13 @@ function normalizePrice(value: unknown, fallback: number): number {
     : fallback;
 }
 
+function normalizeReplacementLimit(value: unknown, fallback: number): number {
+  const limit = Number(value);
+  return Number.isFinite(limit) && Number.isInteger(limit)
+    ? Math.max(0, Math.min(20, limit))
+    : fallback;
+}
+
 function normalizeUpiId(value: unknown, fallback: string): string {
   const upiId = String(value ?? '').trim();
   return upiId.length >= LIMITS.UPI_ID_MIN &&
@@ -248,6 +347,75 @@ function normalizeUpiId(value: unknown, fallback: string): string {
     LIMITS.UPI_ID_REGEX.test(upiId)
     ? upiId
     : fallback;
+}
+
+function normalizeSupportUrl(value: unknown, fallback: string): string {
+  const supportUrl = String(value ?? '').trim();
+  try {
+    const url = new URL(supportUrl);
+    if (
+      url.protocol === 'https:' &&
+      url.hostname === 'wa.me' &&
+      !url.username &&
+      !url.password &&
+      !url.port &&
+      /^\/\d{8,15}$/.test(url.pathname) &&
+      !url.search &&
+      !url.hash
+    ) {
+      return url.toString().replace(/\/$/, '');
+    }
+  } catch {
+    // Use the configured fallback when legacy settings contain an invalid URL.
+  }
+  return fallback;
+}
+
+function getGuaranteeExpiry(order: OrderRecord): Date | null {
+  if (order.packType !== 'guarantee_7days' && order.packType !== 'guarantee_1month') {
+    return null;
+  }
+  const originalDate = new Date(order.verifiedAt || order.createdAt);
+  if (!Number.isFinite(originalDate.getTime())) return null;
+  if (order.packType === 'guarantee_7days') {
+    return new Date(originalDate.getTime() + 7 * 24 * 60 * 60 * 1000);
+  }
+  const year = originalDate.getUTCFullYear();
+  const month = originalDate.getUTCMonth() + 1;
+  const lastDay = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+  originalDate.setUTCDate(Math.min(originalDate.getUTCDate(), lastDay));
+  originalDate.setUTCMonth(month);
+  return originalDate;
+}
+
+function getRentalExpiry(order: OrderRecord): Date | null {
+  if (!order.isRental24h) return null;
+  const recorded = order.rentalExpiresAt ? new Date(order.rentalExpiresAt) : null;
+  if (recorded && Number.isFinite(recorded.getTime())) return recorded;
+  const deliveredAt = new Date(order.verifiedAt || order.createdAt);
+  return Number.isFinite(deliveredAt.getTime())
+    ? new Date(deliveredAt.getTime() + 24 * 60 * 60 * 1000)
+    : null;
+}
+
+function toCustomerGuaranteeClaim(claim: GuaranteeClaim): CustomerGuaranteeClaim {
+  return {
+    claimId: claim.claimId,
+    orderId: claim.orderId,
+    credentialIndex: claim.credentialIndex,
+    guaranteeType: claim.guaranteeType,
+    expiresAt: claim.expiresAt,
+    status: claim.status,
+    createdAt: claim.createdAt,
+    rejectionReason: claim.rejectionReason,
+    resolution: claim.resolution,
+  };
+}
+
+function isValidScreenshotDataUrl(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const match = value.match(/^data:image\/(png|jpeg|webp);base64,([a-zA-Z0-9+/]+={0,2})$/);
+  return Boolean(match && Buffer.from(match[2], 'base64').byteLength <= 1024 * 1024);
 }
 
 function getVaultPoolForPackType(packType: PackType): VaultPoolType {
@@ -329,10 +497,7 @@ function broadcastStateUpdate(eventType: string, _payload?: unknown) {
 }
 
 /**
- * Pulls credentials from Ready ID Vault:
- * 1. First checks unassigned items in the Ready ID Vault matching the pool ('rental_24h' or 'permanent').
- * 2. Next uses the Admin's Pre-Set Master Ready ID (presetRentalCredentials / presetPermanentCredentials)
- *    or any Vault items set by the Admin so customers ALWAYS get the Admin's pre-configured Ready Vault ID!
+ * Pulls credentials only from unassigned items in the matching Ready ID Vault pool.
  */
 function allocateCredentials(
   quantity: number,
@@ -377,9 +542,99 @@ async function startServer() {
   const PORT = Number(process.env.PORT) || 3000;
 
   await initializePersistence(db);
+  db.storeConfig = {
+    ...DEFAULT_STORE_CONFIG,
+    ...db.storeConfig,
+    maxGuaranteeReplacementsPerOrder: normalizeReplacementLimit(
+      db.storeConfig.maxGuaranteeReplacementsPerOrder,
+      DEFAULT_STORE_CONFIG.maxGuaranteeReplacementsPerOrder
+    ),
+  };
+  db.guaranteeClaims ||= [];
+  const legacyStoreConfig = db.storeConfig as StoreConfig & Record<string, unknown>;
+  let storeConfigMigrated = false;
+  for (const legacyKey of ['presetRentalCredentials', 'presetPermanentCredentials']) {
+    if (legacyKey in legacyStoreConfig) {
+      delete legacyStoreConfig[legacyKey];
+      storeConfigMigrated = true;
+    }
+  }
+  const supportUrl = normalizeSupportUrl(
+    legacyStoreConfig.supportUrl,
+    DEFAULT_STORE_CONFIG.supportUrl
+  );
+  if (legacyStoreConfig.supportUrl !== supportUrl) {
+    legacyStoreConfig.supportUrl = supportUrl;
+    storeConfigMigrated = true;
+  }
+  if (storeConfigMigrated) {
+    await saveDb(db);
+  }
   app.use(express.json({ limit: '2mb' }));
 
-  const sessions = new Map<string, number>();
+  app.use('/api', async (req, res, next) => {
+    if (!postgresPool) {
+      next();
+      return;
+    }
+    if (req.path === '/events' || req.path.startsWith('/admin/auth/')) {
+      next();
+      return;
+    }
+    const isMutation = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method);
+    const isAdminStateRead = req.method === 'GET' && req.path === '/admin/state';
+    const client = await postgresPool.connect();
+    const transaction = { client, committed: false };
+    try {
+      await client.query('BEGIN');
+      if (isAdminStateRead) {
+        const result = await client.query('SELECT id FROM roshanbrand_state WHERE id = 1 FOR SHARE');
+        if (!result.rows[0]) throw new Error('Persistent application state is missing.');
+      } else {
+        const result = await client.query<{ state: PersistedDatabase }>(
+          `SELECT state FROM roshanbrand_state WHERE id = 1 FOR ${isMutation ? 'UPDATE' : 'SHARE'}`
+        );
+        if (!result.rows[0]) throw new Error('Persistent application state is missing.');
+        Object.assign(db, result.rows[0].state);
+        db.orderAccessTokens ||= {};
+        db.guaranteeClaims ||= [];
+      }
+      let finalized = false;
+      const finalize = () => {
+        if (finalized) return;
+        finalized = true;
+        void (async () => {
+          try {
+            if (!transaction.committed) {
+              if (isMutation || res.destroyed) {
+                await client.query('ROLLBACK');
+                if (isMutation) {
+                  const current = await client.query<{ state: PersistedDatabase }>(
+                    'SELECT state FROM roshanbrand_state WHERE id = 1'
+                  );
+                  if (current.rows[0]) Object.assign(db, current.rows[0].state);
+                }
+              } else {
+                await client.query('COMMIT');
+              }
+            }
+          } catch (error) {
+            console.error('Failed to finalize application-state transaction:', error);
+          } finally {
+            client.release();
+          }
+        })();
+      };
+      res.once('finish', finalize);
+      res.once('close', finalize);
+      requestTransaction.run(transaction, () => next());
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release();
+      next(error);
+    }
+  });
+
   const loginFailures = new Map<string, { count: number; resetAt: number }>();
   const derivePasswordHash = (password: string, salt: Buffer) =>
     new Promise<Buffer>((resolve, reject) => {
@@ -427,22 +682,42 @@ async function startServer() {
       .find((part) => part.startsWith(`${sessionCookie}=`));
     return cookie ? decodeURIComponent(cookie.slice(sessionCookie.length + 1)) : '';
   };
-  const isAdminAuthenticated = (req: express.Request) => {
+  const isAdminAuthenticated = async (req: express.Request) => {
     const token = getSessionToken(req);
-    const expiresAt = sessions.get(token);
-    if (!expiresAt) return false;
-    if (expiresAt <= Date.now()) {
-      sessions.delete(token);
-      return false;
+    if (!token) return false;
+    const tokenHash = createHash('sha256').update(token).digest('hex');
+    if (!postgresPool) {
+      const expiresAt = fallbackAdminSessions[tokenHash];
+      if (!expiresAt || expiresAt <= Date.now()) {
+        delete fallbackAdminSessions[tokenHash];
+        persistAdminSessionStore();
+        return false;
+      }
+      return true;
     }
-    return true;
+    const client = requestTransaction.getStore()?.client;
+    const query = client ? client.query.bind(client) : postgresPool.query.bind(postgresPool);
+    const result = await query(
+      'DELETE FROM roshanbrand_admin_sessions WHERE token_hash = $1 AND expires_at <= NOW() RETURNING token_hash',
+      [tokenHash]
+    );
+    if (result.rowCount) return false;
+    const session = await query(
+      'SELECT 1 FROM roshanbrand_admin_sessions WHERE token_hash = $1 AND expires_at > NOW()',
+      [tokenHash]
+    );
+    return session.rows.length > 0;
   };
-  const requireAdminAuth: express.RequestHandler = (req, res, next) => {
-    if (!isAdminAuthenticated(req)) {
-      res.status(401).json({ error: 'Admin login required.' });
-      return;
+  const requireAdminAuth: express.RequestHandler = async (req, res, next) => {
+    try {
+      if (!(await isAdminAuthenticated(req))) {
+        res.status(401).json({ error: 'Admin login required.' });
+        return;
+      }
+      next();
+    } catch (error) {
+      next(error);
     }
-    next();
   };
 
   app.use('/api/admin', (req, res, next) => {
@@ -454,11 +729,15 @@ async function startServer() {
   });
 
   app.get('/api/admin/auth/status', (req, res) => {
-    res.json({
-      configured: Boolean(adminAuth),
-      authenticated: isAdminAuthenticated(req),
-      recoveryAvailable: Boolean(process.env.ADMIN_RECOVERY_KEY),
-    });
+    void isAdminAuthenticated(req)
+      .then((authenticated) =>
+        res.json({
+          configured: Boolean(adminAuth),
+          authenticated,
+          recoveryAvailable: Boolean(process.env.ADMIN_RECOVERY_KEY),
+        })
+      )
+      .catch((error: unknown) => res.status(500).json({ error: 'Could not check admin session.' }));
   });
 
   app.post('/api/admin/auth/login', async (req, res) => {
@@ -491,7 +770,16 @@ async function startServer() {
 
     loginFailures.delete(clientKey);
     const token = randomBytes(32).toString('hex');
-    sessions.set(token, now + sessionMaxAgeSeconds * 1000);
+    const tokenHash = createHash('sha256').update(token).digest('hex');
+    if (!postgresPool) {
+      fallbackAdminSessions[tokenHash] = Date.now() + sessionMaxAgeSeconds * 1000;
+      persistAdminSessionStore();
+    } else {
+      await postgresPool.query(
+        "INSERT INTO roshanbrand_admin_sessions (token_hash, expires_at) VALUES ($1, NOW() + ($2::int * INTERVAL '1 second'))",
+        [tokenHash, sessionMaxAgeSeconds]
+      );
+    }
     res.setHeader(
       'Set-Cookie',
       `${sessionCookie}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${sessionMaxAgeSeconds}${
@@ -502,9 +790,21 @@ async function startServer() {
   });
 
   app.post('/api/admin/auth/logout', (req, res) => {
-    sessions.delete(getSessionToken(req));
-    clearSessionCookie(res);
-    res.json({ ok: true });
+    const tokenHash = createHash('sha256').update(getSessionToken(req)).digest('hex');
+    if (!postgresPool) {
+      delete fallbackAdminSessions[tokenHash];
+      persistAdminSessionStore();
+      clearSessionCookie(res);
+      res.json({ ok: true });
+      return;
+    }
+    void postgresPool
+      .query('DELETE FROM roshanbrand_admin_sessions WHERE token_hash = $1', [tokenHash])
+      .then(() => {
+        clearSessionCookie(res);
+        res.json({ ok: true });
+      })
+      .catch(() => res.status(500).json({ error: 'Could not sign out the admin session.' }));
   });
 
   app.post('/api/admin/auth/password', async (req, res) => {
@@ -530,8 +830,27 @@ async function startServer() {
     adminAuth = await createAuthRecord(newPassword);
     persistAuthRecord(adminAuth);
     const currentSessionToken = getSessionToken(req);
-    sessions.clear();
-    sessions.set(currentSessionToken, Date.now() + sessionMaxAgeSeconds * 1000);
+    const currentSessionHash = createHash('sha256').update(currentSessionToken).digest('hex');
+    if (!postgresPool) {
+      for (const [tokenHash] of Object.entries(fallbackAdminSessions)) {
+        if (tokenHash !== currentSessionHash) {
+          delete fallbackAdminSessions[tokenHash];
+        }
+      }
+      fallbackAdminSessions[currentSessionHash] = Date.now() + sessionMaxAgeSeconds * 1000;
+      persistAdminSessionStore();
+      res.json({ ok: true });
+      return;
+    }
+    await postgresPool.query('DELETE FROM roshanbrand_admin_sessions WHERE token_hash <> $1', [
+      currentSessionHash,
+    ]);
+    await postgresPool.query(
+      `INSERT INTO roshanbrand_admin_sessions (token_hash, expires_at)
+       VALUES ($1, NOW() + ($2::int * INTERVAL '1 second'))
+       ON CONFLICT (token_hash) DO UPDATE SET expires_at = EXCLUDED.expires_at`,
+      [currentSessionHash, sessionMaxAgeSeconds]
+    );
     res.json({ ok: true });
   });
 
@@ -561,7 +880,12 @@ async function startServer() {
     }
     adminAuth = await createAuthRecord(newPassword);
     persistAuthRecord(adminAuth);
-    sessions.clear();
+    if (!postgresPool) {
+      Object.keys(fallbackAdminSessions).forEach((tokenHash) => delete fallbackAdminSessions[tokenHash]);
+      persistAdminSessionStore();
+    } else {
+      await postgresPool.query('DELETE FROM roshanbrand_admin_sessions');
+    }
     loginFailures.delete(clientKey);
     clearSessionCookie(res);
     res.json({ ok: true });
@@ -602,7 +926,12 @@ async function startServer() {
       ).length,
     };
     const storeConfig = {
-      ...db.storeConfig,
+      ...Object.fromEntries(
+        Object.entries(db.storeConfig).filter(
+          ([key]) =>
+            key !== 'presetRentalCredentials' && key !== 'presetPermanentCredentials'
+        )
+      ),
       stockDisplayAvailable: Math.min(
         db.storeConfig.stockDisplayAvailable,
         vaultStock.permanent
@@ -635,6 +964,30 @@ async function startServer() {
       res.status(400).json({ error: 'Please enter a valid UPI ID.' });
       return;
     }
+    const supportUrl = String(body.supportUrl ?? db.storeConfig.supportUrl).trim();
+    if (normalizeSupportUrl(supportUrl, '') !== supportUrl) {
+      res.status(400).json({ error: 'Please enter a valid WhatsApp link such as https://wa.me/1234567890.' });
+      return;
+    }
+    const adminDisplayName = String(
+      body.adminDisplayName ?? db.storeConfig.adminDisplayName
+    ).trim();
+    if (!adminDisplayName || adminDisplayName.length > 80) {
+      res.status(400).json({ error: 'Admin display name must be 1 to 80 characters.' });
+      return;
+    }
+    const maxGuaranteeReplacementsPerOrder = Number(
+      body.maxGuaranteeReplacementsPerOrder ??
+        db.storeConfig.maxGuaranteeReplacementsPerOrder
+    );
+    if (
+      !Number.isInteger(maxGuaranteeReplacementsPerOrder) ||
+      maxGuaranteeReplacementsPerOrder < 0 ||
+      maxGuaranteeReplacementsPerOrder > 20
+    ) {
+      res.status(400).json({ error: 'Replacement limit must be a whole number from 0 to 20.' });
+      return;
+    }
     const customerPerId = Math.max(
       1,
       Math.min(100000, Math.floor(Number(body.priceCustomPerId) || 340))
@@ -663,6 +1016,9 @@ async function startServer() {
       supportHandle: String(body.supportHandle ?? db.storeConfig.supportHandle)
         .trim()
         .slice(0, LIMITS.SUPPORT_HANDLE_MAX),
+      supportUrl,
+      adminDisplayName,
+      maxGuaranteeReplacementsPerOrder,
       priceCustomPerId: customerPerId,
       price1Id: customerPerId,
       price2Id: customerPerId * 2,
@@ -715,20 +1071,6 @@ async function startServer() {
         db.storeConfig.stock1MonthGuaranteeAvailable
       ),
       instantAutoVerify: false,
-      presetRentalCredentials: String(
-        body.presetRentalCredentials ??
-          db.storeConfig.presetRentalCredentials ??
-          DEFAULT_STORE_CONFIG.presetRentalCredentials
-      )
-        .trim()
-        .slice(0, LIMITS.CREDENTIALS_MAX),
-      presetPermanentCredentials: String(
-        body.presetPermanentCredentials ??
-          db.storeConfig.presetPermanentCredentials ??
-          DEFAULT_STORE_CONFIG.presetPermanentCredentials
-      )
-        .trim()
-        .slice(0, LIMITS.CREDENTIALS_MAX),
       instantDeliveryNote: DEFAULT_STORE_CONFIG.instantDeliveryNote,
       updatedAt: new Date().toISOString(),
     };
@@ -982,17 +1324,507 @@ async function startServer() {
       res.status(404).json({ error: 'Order not found.' });
       return;
     }
+    const rentalExpiry = getRentalExpiry(order);
+    if (rentalExpiry && rentalExpiry.getTime() <= Date.now()) {
+      res.json({
+        order: {
+          ...order,
+          utrNumber: '',
+          customerReference: '',
+          customSpec: '',
+          deliveredCredentials: '',
+          adminNote: '',
+          credentialsExpired: true,
+        },
+        guaranteeClaims: [],
+      });
+      return;
+    }
 
-    res.json({ order });
+    res.json({
+      order,
+      guaranteeClaims: db.guaranteeClaims
+        .filter((claim) => claim.orderId === orderId)
+        .map(toCustomerGuaranteeClaim),
+    });
+  });
+
+  app.post('/api/orders/guarantee-claims', async (req, res) => {
+    const orderId = String(req.body?.orderId || '').trim();
+    const accessToken = String(req.body?.accessToken || '').trim();
+    const expectedHash = db.orderAccessTokens[orderId];
+    const suppliedHash = createHash('sha256').update(accessToken).digest();
+    const expectedDigest = expectedHash ? Buffer.from(expectedHash, 'hex') : Buffer.alloc(0);
+    if (
+      !expectedHash ||
+      !/^[a-f0-9]{64}$/i.test(accessToken) ||
+      suppliedHash.length !== expectedDigest.length ||
+      !timingSafeEqual(suppliedHash, expectedDigest)
+    ) {
+      res.status(401).json({ error: 'The order access key is invalid.' });
+      return;
+    }
+
+    const order = db.orders.find((item) => item.orderId === orderId);
+    if (!order || order.status !== 'verified_delivered' || order.refundedAt) {
+      res.status(409).json({ error: 'This order is not eligible for a guarantee claim.' });
+      return;
+    }
+    const expiresAt = getGuaranteeExpiry(order);
+    if (!expiresAt || Date.now() > expiresAt.getTime()) {
+      res.status(409).json({ error: 'The guarantee period for this order has expired.' });
+      return;
+    }
+    if (
+      db.guaranteeClaims.some(
+        (claim) =>
+          claim.orderId === orderId &&
+          (claim.status === 'pending' || claim.status === 'approved')
+      )
+    ) {
+      res.status(409).json({ error: 'This order already has an open guarantee claim.' });
+      return;
+    }
+    const credentialIndex = Number(req.body?.credentialIndex);
+    const credentials = order.deliveredCredentials.split('\n').filter(Boolean);
+    if (
+      !Number.isInteger(credentialIndex) ||
+      credentialIndex < 0 ||
+      credentialIndex >= credentials.length
+    ) {
+      res.status(400).json({ error: 'Select a valid delivered ID for this claim.' });
+      return;
+    }
+    const issueDescription = String(req.body?.issueDescription || '').trim();
+    if (!issueDescription || issueDescription.length > 2000) {
+      res.status(400).json({ error: 'Describe the issue in 1 to 2,000 characters.' });
+      return;
+    }
+    const screenshotDataUrl = req.body?.screenshotDataUrl;
+    if (screenshotDataUrl && !isValidScreenshotDataUrl(screenshotDataUrl)) {
+      res.status(400).json({
+        error: 'Screenshot must be a PNG, JPEG, or WebP image no larger than 1 MB.',
+      });
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const claim: GuaranteeClaim = {
+      claimId: `CLM-${Date.now()}-${randomBytes(3).toString('hex').toUpperCase()}`,
+      orderId,
+      customerReference: order.customerReference,
+      utrNumber: order.utrNumber,
+      credentialIndex,
+      oldCredential: credentials[credentialIndex],
+      guaranteeType: order.packType as 'guarantee_7days' | 'guarantee_1month',
+      originalPurchaseDate: (order.verifiedAt || order.createdAt),
+      expiresAt: expiresAt.toISOString(),
+      issueDescription,
+      screenshotDataUrl: screenshotDataUrl || undefined,
+      status: 'pending',
+      createdAt: now,
+      updatedAt: now,
+      replacementHistory: [],
+      actionLog: [{ action: 'claim_created', timestamp: now, adminName: 'Customer' }],
+    };
+    db.guaranteeClaims.unshift(claim);
+    if (!(await persistDbOrRespond(res))) return;
+    broadcastStateUpdate('guarantee_claim_created', { claimId: claim.claimId });
+    res.status(201).json({
+      claim: toCustomerGuaranteeClaim(claim),
+      guaranteeClaims: db.guaranteeClaims
+        .filter((item) => item.orderId === orderId)
+        .map(toCustomerGuaranteeClaim),
+    });
   });
 
   // Admin Portal State
-  app.get('/api/admin/state', (_req, res) => {
-    res.json({
-      storeConfig: db.storeConfig,
-      orders: db.orders,
-      vault: db.vault,
+  app.get('/api/admin/state', async (req, res) => {
+    const pageSize = (key: string) => {
+      const value = Number(req.query[key]);
+      return Number.isInteger(value) ? Math.max(1, Math.min(500, value)) : 50;
+    };
+    const offset = (key: string) => {
+      const value = Number(req.query[key]);
+      return Number.isInteger(value) ? Math.max(0, Math.min(1000000, value)) : 0;
+    };
+    const orderQuery = String(req.query.orderSearch || '').trim();
+    const orderStatus = String(req.query.orderStatus || 'all');
+    const claimQuery = String(req.query.claimSearch || '').trim();
+    const claimStatus = String(req.query.claimStatus || 'all');
+    const orderOffset = offset('ordersOffset');
+    const claimOffset = offset('claimsOffset');
+    const ordersPageSize = pageSize('ordersLimit');
+    const claimsPageSize = pageSize('claimsLimit');
+    if (!postgresPool) {
+      const normalizedOrders = db.orders.filter((order) => {
+        if (orderStatus !== 'all' && order.status !== orderStatus) return false;
+        if (!orderQuery) return true;
+        const haystack = [
+          order.orderId,
+          order.utrNumber,
+          order.customerReference,
+          order.packLabel,
+          order.deliveredCredentials,
+        ]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase();
+        return haystack.includes(orderQuery.toLowerCase());
+      });
+      const normalizedClaims = db.guaranteeClaims.filter((claim) => {
+        if (claimStatus !== 'all' && claim.status !== claimStatus) return false;
+        if (!claimQuery) return true;
+        const haystack = [
+          claim.claimId,
+          claim.orderId,
+          claim.utrNumber,
+          claim.customerReference,
+          claim.oldCredential,
+        ]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase();
+        return haystack.includes(claimQuery.toLowerCase());
+      });
+      const orders = normalizedOrders.slice(orderOffset, orderOffset + ordersPageSize);
+      const claims = normalizedClaims.slice(claimOffset, claimOffset + claimsPageSize).map((claim) => ({
+        ...claim,
+        hasScreenshot: Boolean(claim.screenshotDataUrl),
+      }));
+      const summary = {
+        ordersTotal: normalizedOrders.length,
+        pendingOrders: db.orders.filter((order) => order.status === 'pending_verification').length,
+        deliveredOrders: db.orders.filter((order) => order.status === 'verified_delivered').length,
+        verifiedRevenue: db.orders
+          .filter((order) => order.status === 'verified_delivered' && !order.refundedAt)
+          .reduce((sum, order) => sum + (Number(order.totalAmount) || 0), 0),
+      };
+      const replacementCounts = Object.fromEntries(
+        db.guaranteeClaims
+          .map((claim) => [claim.orderId, claim.replacementHistory.length])
+          .filter((entry): entry is [string, number] => Boolean(entry[0]))
+      );
+      res.json({
+        storeConfig: db.storeConfig,
+        orders,
+        ordersTotal: normalizedOrders.length,
+        guaranteeClaims: claims,
+        guaranteeClaimsTotal: normalizedClaims.length,
+        vault: db.vault,
+        summary,
+        replacementCounts,
+        ordersOffset: orderOffset,
+        claimsOffset: claimOffset,
+        ordersPageSize,
+        claimsPageSize,
+      });
+      return;
+    }
+    try {
+      const client = requestTransaction.getStore()?.client;
+      const query = client ? client.query.bind(client) : postgresPool.query.bind(postgresPool);
+      const result = await query(
+        `WITH app_state AS (
+           SELECT state FROM roshanbrand_state WHERE id = 1
+         ),
+         order_rows AS (
+           SELECT item, ordinal
+           FROM app_state,
+           jsonb_array_elements(COALESCE(state->'orders', '[]'::jsonb))
+             WITH ORDINALITY AS expanded_orders(item, ordinal)
+         ),
+         filtered_orders AS (
+           SELECT item, ordinal FROM order_rows
+           WHERE ($3 = 'all' OR item->>'status' = $3)
+             AND ($4 = '' OR POSITION(LOWER($4) IN LOWER(CONCAT_WS(' ',
+               item->>'orderId', item->>'utrNumber', item->>'customerReference',
+               item->>'packLabel', item->>'deliveredCredentials'))) > 0)
+         ),
+         claim_rows AS (
+           SELECT item, ordinal
+           FROM app_state,
+           jsonb_array_elements(COALESCE(state->'guaranteeClaims', '[]'::jsonb))
+             WITH ORDINALITY AS expanded_claims(item, ordinal)
+         ),
+         filtered_claims AS (
+           SELECT item, ordinal FROM claim_rows
+           WHERE ($7 = 'all' OR item->>'status' = $7)
+             AND ($8 = '' OR POSITION(LOWER($8) IN LOWER(CONCAT_WS(' ',
+               item->>'claimId', item->>'orderId', item->>'utrNumber',
+               item->>'customerReference', item->>'oldCredential'))) > 0)
+         ),
+         replacement_counts AS (
+           SELECT item->>'orderId' AS order_id,
+             SUM(jsonb_array_length(COALESCE(item->'replacementHistory', '[]'::jsonb)))::int AS count
+           FROM claim_rows
+           GROUP BY item->>'orderId'
+         )
+         SELECT
+           (SELECT state->'storeConfig' FROM app_state) AS "storeConfig",
+           COALESCE((
+             SELECT jsonb_agg(page.item ORDER BY page.ordinal)
+             FROM (
+               SELECT item, ordinal FROM filtered_orders
+               ORDER BY ordinal LIMIT $2 OFFSET $1
+             ) page
+           ), '[]'::jsonb) AS orders,
+           (SELECT COUNT(*) FROM filtered_orders)::int AS "ordersTotal",
+           COALESCE((
+             SELECT jsonb_agg(
+               (page.item - 'screenshotDataUrl') ||
+                 jsonb_build_object('hasScreenshot', page.item ? 'screenshotDataUrl')
+               ORDER BY page.ordinal
+             )
+             FROM (
+               SELECT item, ordinal FROM filtered_claims
+               ORDER BY ordinal LIMIT $6 OFFSET $5
+             ) page
+           ), '[]'::jsonb) AS "guaranteeClaims",
+           (SELECT COUNT(*) FROM filtered_claims)::int AS "guaranteeClaimsTotal",
+           (SELECT state->'vault' FROM app_state) AS vault,
+           jsonb_build_object(
+             'ordersTotal', (SELECT COUNT(*) FROM order_rows),
+             'pendingOrders', (SELECT COUNT(*) FROM order_rows WHERE item->>'status' = 'pending_verification'),
+             'deliveredOrders', (SELECT COUNT(*) FROM order_rows WHERE item->>'status' = 'verified_delivered'),
+             'verifiedRevenue', COALESCE((
+               SELECT SUM(
+                 CASE WHEN (item->>'totalAmount') ~ '^[0-9]+([.][0-9]+)?$'
+                   THEN (item->>'totalAmount')::numeric ELSE 0 END
+               )
+               FROM order_rows
+               WHERE item->>'status' = 'verified_delivered'
+                 AND NOT (item ? 'refundedAt')
+             ), 0)
+             ) AS summary,
+             COALESCE((
+               SELECT jsonb_object_agg(order_id, count)
+               FROM replacement_counts
+             ), '{}'::jsonb) AS "replacementCounts"`,
+        [
+          orderOffset,
+          ordersPageSize,
+          orderStatus,
+          orderQuery,
+          claimOffset,
+          claimsPageSize,
+          claimStatus,
+          claimQuery,
+        ]
+      );
+      res.json({
+        ...result.rows[0],
+        ordersOffset: orderOffset,
+        claimsOffset: claimOffset,
+        ordersPageSize,
+        claimsPageSize,
+      });
+    } catch (error) {
+      console.error('Could not load paginated admin state:', error);
+      res.status(500).json({ error: 'Could not load admin data.' });
+    }
+  });
+
+  app.get('/api/admin/guarantee-claims/:claimId/screenshot', (req, res) => {
+    const claim = db.guaranteeClaims.find((item) => item.claimId === req.params.claimId);
+    if (!claim?.screenshotDataUrl) {
+      res.status(404).json({ error: 'No screenshot is attached to this claim.' });
+      return;
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ screenshotDataUrl: claim.screenshotDataUrl });
+  });
+
+  app.post('/api/admin/guarantee-claims/:claimId/approve', async (req, res) => {
+    const claim = db.guaranteeClaims.find((item) => item.claimId === req.params.claimId);
+    if (!claim) {
+      res.status(404).json({ error: 'Guarantee claim not found.' });
+      return;
+    }
+    if (claim.status !== 'pending') {
+      res.status(409).json({ error: 'Only pending claims can be approved.' });
+      return;
+    }
+    const now = new Date().toISOString();
+    claim.status = 'approved';
+    claim.updatedAt = now;
+    claim.actionLog.push({
+      action: 'approved',
+      timestamp: now,
+      adminName: db.storeConfig.adminDisplayName,
     });
+    if (!(await persistDbOrRespond(res))) return;
+    broadcastStateUpdate('guarantee_claim_updated', { claimId: claim.claimId });
+    res.json({ claim: db.guaranteeClaims.find((item) => item.claimId === claim.claimId) });
+  });
+
+  app.post('/api/admin/guarantee-claims/:claimId/reject', async (req, res) => {
+    const claim = db.guaranteeClaims.find((item) => item.claimId === req.params.claimId);
+    if (!claim) {
+      res.status(404).json({ error: 'Guarantee claim not found.' });
+      return;
+    }
+    if (claim.status !== 'pending' && claim.status !== 'approved') {
+      res.status(409).json({ error: 'This claim is already closed.' });
+      return;
+    }
+    const rejectionReason = String(req.body?.rejectionReason || '').trim();
+    if (!rejectionReason || rejectionReason.length > 500) {
+      res.status(400).json({ error: 'A rejection reason of 1 to 500 characters is required.' });
+      return;
+    }
+    const now = new Date().toISOString();
+    claim.status = 'rejected';
+    claim.rejectionReason = rejectionReason;
+    claim.updatedAt = now;
+    claim.actionLog.push({
+      action: 'rejected',
+      timestamp: now,
+      adminName: db.storeConfig.adminDisplayName,
+      note: rejectionReason,
+    });
+    if (!(await persistDbOrRespond(res))) return;
+    broadcastStateUpdate('guarantee_claim_updated', { claimId: claim.claimId });
+    res.json({ claim });
+  });
+
+  app.post('/api/admin/guarantee-claims/:claimId/replace', async (req, res) => {
+    const claim = db.guaranteeClaims.find((item) => item.claimId === req.params.claimId);
+    if (!claim) {
+      res.status(404).json({ error: 'Guarantee claim not found.' });
+      return;
+    }
+    if (claim.status !== 'approved') {
+      res.status(409).json({ error: 'Approve this claim before issuing a replacement.' });
+      return;
+    }
+    const order = db.orders.find((item) => item.orderId === claim.orderId);
+    if (!order || order.refundedAt) {
+      res.status(409).json({ error: 'This order is not available for replacement.' });
+      return;
+    }
+    const replacementCount = db.guaranteeClaims
+      .filter((item) => item.orderId === order.orderId)
+      .reduce((count, item) => count + item.replacementHistory.length, 0);
+    if (replacementCount >= db.storeConfig.maxGuaranteeReplacementsPerOrder) {
+      res.status(409).json({ error: 'Replacement limit reached.' });
+      return;
+    }
+    const poolType = claim.guaranteeType;
+    const availableItem = db.vault.find(
+      (item) => item.poolType === poolType && !item.isAssigned && !item.reservedOrderId
+    );
+    if (!availableItem) {
+      claim.status = 'pending';
+      claim.updatedAt = new Date().toISOString();
+      if (!(await persistDbOrRespond(res))) return;
+      res.status(409).json({
+        error: `No available IDs in the ${poolType === 'guarantee_7days' ? '7-day' : '1-month'} pool. Please add stock to resolve this claim.`,
+      });
+      return;
+    }
+    const credentials = order.deliveredCredentials.split('\n').filter(Boolean);
+    if (claim.credentialIndex < 0 || claim.credentialIndex >= credentials.length) {
+      res.status(409).json({ error: 'The original ID for this claim could not be found.' });
+      return;
+    }
+
+    const oldCredential = credentials[claim.credentialIndex];
+    if (oldCredential !== claim.oldCredential) {
+      res.status(409).json({
+        error: 'The delivered ID changed after this claim was created. Refresh the order before resolving it.',
+      });
+      return;
+    }
+    const oldUsername = (oldCredential.split(/[|:,]/)[0] || '')
+      .replace(/^Username:\s*/i, '')
+      .trim();
+    const oldVaultItem = db.vault.find(
+      (item) =>
+        item.poolType === poolType &&
+        item.assignedOrderId === order.orderId &&
+        item.irctcUsername === oldUsername
+    );
+    if (!oldVaultItem) {
+      res.status(409).json({
+        error: 'The original account could not be matched to this order in the vault.',
+      });
+      return;
+    }
+    const replacementCredential = `Username: ${availableItem.irctcUsername} | Password: ${availableItem.irctcPassword}${
+      availableItem.accountNote ? ` | ${availableItem.accountNote}` : ''
+    }`;
+    const now = new Date().toISOString();
+    const adminName = db.storeConfig.adminDisplayName;
+    oldVaultItem.accountNote = `${oldVaultItem.accountNote} · Replaced/Faulty`
+      .trim()
+      .slice(0, 160);
+    oldVaultItem.updatedAt = now;
+    availableItem.isAssigned = true;
+    availableItem.assignedOrderId = order.orderId;
+    availableItem.reservedOrderId = undefined;
+    availableItem.updatedAt = now;
+    credentials[claim.credentialIndex] = replacementCredential;
+    order.deliveredCredentials = credentials.join('\n');
+    order.updatedAt = now;
+    claim.status = 'resolved';
+    claim.resolution = 'replacement';
+    claim.updatedAt = now;
+    claim.replacementHistory.push({
+      oldCredential,
+      newCredential: replacementCredential,
+      replacedAt: now,
+      adminName,
+    });
+    claim.actionLog.push({
+      action: 'replaced',
+      timestamp: now,
+      adminName,
+      note: `Replaced account ${claim.credentialIndex + 1}; original expiry ${claim.expiresAt}.`,
+    });
+    if (!(await persistDbOrRespond(res))) return;
+    broadcastStateUpdate('guarantee_claim_replaced', { claimId: claim.claimId, orderId: order.orderId });
+    res.json({ claim, order });
+  });
+
+  app.post('/api/admin/guarantee-claims/:claimId/refund', async (req, res) => {
+    const claim = db.guaranteeClaims.find((item) => item.claimId === req.params.claimId);
+    if (!claim) {
+      res.status(404).json({ error: 'Guarantee claim not found.' });
+      return;
+    }
+    if (claim.status !== 'approved') {
+      res.status(409).json({ error: 'Approve this claim before issuing a refund.' });
+      return;
+    }
+    if (req.body?.refundConfirmed !== true) {
+      res.status(400).json({
+        error: 'Confirm that the payment-provider refund has been sent before recording it.',
+      });
+      return;
+    }
+    const order = db.orders.find((item) => item.orderId === claim.orderId);
+    if (!order || order.refundedAt) {
+      res.status(409).json({ error: 'This order has already been refunded or was not found.' });
+      return;
+    }
+    const now = new Date().toISOString();
+    const adminName = db.storeConfig.adminDisplayName;
+    order.refundedAt = now;
+    order.refundReason = `Guarantee claim ${claim.claimId}`;
+    order.updatedAt = now;
+    claim.status = 'resolved';
+    claim.resolution = 'refund';
+    claim.updatedAt = now;
+    claim.actionLog.push({
+      action: 'refunded',
+      timestamp: now,
+      adminName,
+      note: `External refund confirmed by admin for order ${order.orderId}.`,
+    });
+    if (!(await persistDbOrRespond(res))) return;
+    broadcastStateUpdate('guarantee_claim_refunded', { claimId: claim.claimId, orderId: order.orderId });
+    res.json({ claim, order });
   });
 
   // Admin 1-Click Verify / Update Order Credentials (Automatically uses Ready ID Vault if not manually overridden)
@@ -1003,6 +1835,12 @@ async function startServer() {
       res.status(404).json({ error: 'Order not found' });
       return;
     }
+    if (order.status === 'rejected') {
+      res.status(409).json({
+        error: 'Rejected orders cannot be delivered. Create a new order after confirming payment.',
+      });
+      return;
+    }
     const verifiedOrderId = db.utrIndex[order.utrNumber];
     if (verifiedOrderId && verifiedOrderId !== order.orderId) {
       res.status(409).json({ error: 'This UTR has already been used for a verified order.' });
@@ -1010,6 +1848,12 @@ async function startServer() {
     }
 
     let creds = String(req.body?.deliveredCredentials || '').trim();
+    if (order.status === 'verified_delivered' && !creds) {
+      res.status(409).json({
+        error: 'This order was already delivered. Select its existing assigned credentials to update the delivery.',
+      });
+      return;
+    }
     const targetPool = getVaultPoolForPackType(order.packType);
     if (creds) {
       const credentialLines = creds.split('\n').map((line: string) => line.trim()).filter(Boolean);
@@ -1090,6 +1934,12 @@ async function startServer() {
       res.status(404).json({ error: 'Order not found' });
       return;
     }
+    if (order.status !== 'pending_verification') {
+      res.status(409).json({
+        error: 'Only orders awaiting payment review can be rejected.',
+      });
+      return;
+    }
 
     order.status = 'rejected';
     order.adminNote =
@@ -1113,6 +1963,15 @@ async function startServer() {
     const idx = db.orders.findIndex((o) => o.orderId === orderId);
     if (idx !== -1) {
       const deletedOrder = db.orders[idx];
+      if (
+        deletedOrder.status === 'verified_delivered' ||
+        db.guaranteeClaims.some((claim) => claim.orderId === orderId)
+      ) {
+        res.status(409).json({
+          error: 'Delivered or claimed orders cannot be deleted; keep the order and audit history.',
+        });
+        return;
+      }
       for (const item of db.vault) {
         if (item.reservedOrderId === deletedOrder.orderId) {
           item.reservedOrderId = undefined;
@@ -1132,7 +1991,7 @@ async function startServer() {
 
   // Admin Add Vault Items
   app.post('/api/admin/vault', async (req, res) => {
-    const lines: string[] = Array.isArray(req.body?.lines) ? req.body.lines : [];
+    const lines: unknown[] = Array.isArray(req.body?.lines) ? req.body.lines : [];
     const batchNote = String(req.body?.accountNote || '').trim();
     const poolTypes: VaultPoolType[] = [
       'permanent',
@@ -1153,20 +2012,51 @@ async function startServer() {
         ? 'permanent'
         : (requestedPoolType as VaultPoolType);
 
-    const now = new Date().toISOString();
-    let addedCount = 0;
-    const formattedAddedLines: string[] = [];
-
-    for (const rawLine of lines) {
-      const line = String(rawLine).trim();
+    if (lines.length === 0 || lines.length > 500) {
+      res.status(400).json({ error: 'Provide between 1 and 500 credential lines.' });
+      return;
+    }
+    const parsedLines: { username: string; password: string; extraNote: string }[] = [];
+    const usernames = new Set(db.vault.map((item) => item.irctcUsername.toLowerCase()));
+    for (const [index, rawLine] of lines.entries()) {
+      const line = typeof rawLine === 'string' ? rawLine.trim() : '';
       if (!line) continue;
-      const parts = line
-        .split(/[|:,]/)
-        .map((p) => p.trim())
-        .filter(Boolean);
-      const username = (parts[0] || line).slice(0, 80);
-      const password = (parts[1] || 'Pass@123').slice(0, 80);
-      const extraNote = sanitizeVaultNote(parts.slice(2).join(' | '));
+      const parts = line.split('|').map((part) => part.trim());
+      const username = parts[0] || '';
+      const password = parts[1] || '';
+      if (
+        parts.length < 2 ||
+        !username ||
+        username.length > 80 ||
+        !/^[a-zA-Z0-9_-]+$/.test(username) ||
+        password.length < 2 ||
+        password.length > 80
+      ) {
+        res.status(400).json({
+          error: `Credential line ${index + 1} must contain a valid username and password separated by "|".`,
+        });
+        return;
+      }
+      if (usernames.has(username.toLowerCase())) {
+        res.status(409).json({
+          error: `Username on line ${index + 1} already exists in the vault.`,
+        });
+        return;
+      }
+      usernames.add(username.toLowerCase());
+      parsedLines.push({
+        username,
+        password,
+        extraNote: sanitizeVaultNote(parts.slice(2).join(' | ')),
+      });
+    }
+    if (parsedLines.length === 0) {
+      res.status(400).json({ error: 'No valid credential lines were provided.' });
+      return;
+    }
+
+    const now = new Date().toISOString();
+    for (const { username, password, extraNote } of parsedLines) {
       const combinedNote = [
         sanitizeVaultNote(batchNote),
         extraNote,
@@ -1187,13 +2077,10 @@ async function startServer() {
         .substring(2, 6)
         .toUpperCase()}`;
 
-      const finalUser = username.length >= 2 ? username : `id_${username}`;
-      const finalPass = password.length >= 2 ? password : `pw_${password}`;
-
       db.vault.unshift({
         vaultId,
-        irctcUsername: finalUser,
-        irctcPassword: finalPass,
+        irctcUsername: username,
+        irctcPassword: password,
         accountNote: combinedNote,
         poolType,
         isAssigned: false,
@@ -1201,29 +2088,17 @@ async function startServer() {
         createdAt: now,
         updatedAt: now,
       });
-      formattedAddedLines.push(
-        `Username: ${finalUser} | Password: ${finalPass}${
-          combinedNote ? ` | ${combinedNote}` : ''
-        }`
-      );
-      addedCount++;
     }
 
-    if (addedCount > 0) {
-      if (poolType === 'rental_24h') {
-        db.storeConfig.rentalStockAvailable =
-          db.storeConfig.rentalStockAvailable + addedCount;
-        // Also update the default Pre-Set Rental ID to the latest added ID so it's always ready!
-        db.storeConfig.presetRentalCredentials = formattedAddedLines[0];
-      } else if (poolType === 'permanent') {
-        db.storeConfig.stockAvailable += addedCount;
-        db.storeConfig.presetPermanentCredentials = formattedAddedLines[0];
-      }
-      if (!(await persistDbOrRespond(res))) return;
-      broadcastStateUpdate('vault_updated', {});
+    if (poolType === 'rental_24h') {
+      db.storeConfig.rentalStockAvailable += parsedLines.length;
+    } else if (poolType === 'permanent') {
+      db.storeConfig.stockAvailable += parsedLines.length;
     }
+    if (!(await persistDbOrRespond(res))) return;
+    broadcastStateUpdate('vault_updated', {});
 
-    res.status(201).json({ vault: db.vault, storeConfig: db.storeConfig });
+    res.status(201).json({ addedCount: parsedLines.length, storeConfig: db.storeConfig });
   });
 
   // Admin Delete Vault Item

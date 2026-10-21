@@ -10,6 +10,56 @@ export type PackType =
   | 'guarantee_1month';
 
 export type OrderStatus = 'pending_verification' | 'verified_delivered' | 'rejected';
+export type GuaranteeType = 'guarantee_7days' | 'guarantee_1month';
+export type GuaranteeClaimStatus = 'pending' | 'approved' | 'rejected' | 'resolved';
+
+export interface GuaranteeClaimAction {
+  action: 'claim_created' | 'approved' | 'rejected' | 'replaced' | 'refunded';
+  timestamp: string;
+  adminName: string;
+  note?: string;
+}
+
+export interface GuaranteeReplacement {
+  oldCredential: string;
+  newCredential: string;
+  replacedAt: string;
+  adminName: string;
+}
+
+export interface GuaranteeClaim {
+  claimId: string;
+  orderId: string;
+  customerReference: string;
+  utrNumber: string;
+  credentialIndex: number;
+  oldCredential: string;
+  guaranteeType: GuaranteeType;
+  originalPurchaseDate: string;
+  expiresAt: string;
+  issueDescription: string;
+  screenshotDataUrl?: string;
+  hasScreenshot?: boolean;
+  status: GuaranteeClaimStatus;
+  createdAt: string;
+  updatedAt: string;
+  rejectionReason?: string;
+  resolution?: 'replacement' | 'refund';
+  replacementHistory: GuaranteeReplacement[];
+  actionLog: GuaranteeClaimAction[];
+}
+
+export interface CustomerGuaranteeClaim {
+  claimId: string;
+  orderId: string;
+  credentialIndex: number;
+  guaranteeType: GuaranteeType;
+  expiresAt: string;
+  status: GuaranteeClaimStatus;
+  createdAt: string;
+  rejectionReason?: string;
+  resolution?: 'replacement' | 'refund';
+}
 
 export type VaultPoolType =
   | 'permanent'
@@ -24,6 +74,9 @@ export interface StoreConfig {
   payeeName: string;
   qrCodeUrl: string;
   supportHandle: string;
+  supportUrl: string;
+  adminDisplayName: string;
+  maxGuaranteeReplacementsPerOrder: number;
   price1Id: number;
   price2Id: number;
   price5Id: number;
@@ -40,8 +93,6 @@ export interface StoreConfig {
   stock7DayGuaranteeAvailable: number;
   stock1MonthGuaranteeAvailable: number;
   instantAutoVerify: boolean;
-  presetRentalCredentials?: string;
-  presetPermanentCredentials?: string;
   instantDeliveryNote: string;
   updatedAt?: string;
 }
@@ -53,6 +104,7 @@ export interface OrderRecord {
   isRental24h?: boolean;
   rentalDurationHours?: number;
   rentalExpiresAt?: string;
+  credentialsExpired?: boolean;
   quantity: number;
   unitPrice: number;
   totalAmount: number;
@@ -65,6 +117,8 @@ export interface OrderRecord {
   deliveredCredentials: string;
   adminNote: string;
   verifiedAt?: string;
+  refundedAt?: string;
+  refundReason?: string;
   createdAt: string;
   updatedAt: string;
 }

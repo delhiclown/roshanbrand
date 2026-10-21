@@ -38,6 +38,16 @@ function extract12DigitUtr(raw: string): string | null {
   return null;
 }
 
+function getRentalExpiry(order: OrderRecord): Date | null {
+  if (!order.isRental24h) return null;
+  const savedExpiry = order.rentalExpiresAt ? new Date(order.rentalExpiresAt) : null;
+  if (savedExpiry && Number.isFinite(savedExpiry.getTime())) return savedExpiry;
+  const deliveredAt = new Date(order.verifiedAt || order.createdAt);
+  return Number.isFinite(deliveredAt.getTime())
+    ? new Date(deliveredAt.getTime() + 24 * 60 * 60 * 1000)
+    : null;
+}
+
 export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   draft,
   activeOrder,
@@ -201,13 +211,41 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
       checkLiveStatus();
     };
 
-    const interval = setInterval(checkLiveStatus, 1000);
+    const interval = setInterval(checkLiveStatus, 10000);
     return () => {
       active = false;
       es.close();
       clearInterval(interval);
     };
   }, [completedOrder, onOrderCreated, orderAccessToken]);
+
+  useEffect(() => {
+    if (
+      !completedOrder?.isRental24h ||
+      completedOrder.status !== 'verified_delivered' ||
+      completedOrder.credentialsExpired
+    ) {
+      return;
+    }
+    const expiry = getRentalExpiry(completedOrder)?.getTime();
+    if (!expiry) return;
+    const expireCredentials = () => {
+      const expiredOrder = {
+        ...completedOrder,
+        deliveredCredentials: '',
+        credentialsExpired: true,
+      };
+      setCompletedOrder(expiredOrder);
+      onOrderCreated(expiredOrder);
+    };
+    const delay = expiry - Date.now();
+    if (delay <= 0) {
+      expireCredentials();
+      return;
+    }
+    const timer = window.setTimeout(expireCredentials, delay);
+    return () => window.clearTimeout(timer);
+  }, [completedOrder, onOrderCreated]);
 
   if (!draft && !completedOrder) return null;
 
@@ -321,7 +359,11 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         {/* Completed Order View */}
         {completedOrder ? (
           <div className="p-5 sm:p-6 space-y-5">
-            {completedOrder.status === 'verified_delivered' ? (
+            {completedOrder.status === 'verified_delivered' && completedOrder.credentialsExpired ? (
+              <div className="rounded-2xl border border-amber-400/40 bg-amber-950/40 p-4 text-sm text-amber-100">
+                <strong>24-hour rental expired.</strong> The panel no longer displays these credentials. Expiry here does not disable the account in IRCTC.
+              </div>
+            ) : completedOrder.status === 'verified_delivered' ? (
               <div className="space-y-4">
                 <div className="p-4 rounded-2xl bg-emerald-950/50 border border-emerald-400/50 flex flex-wrap items-center justify-between gap-3">
                   <div className="flex items-center gap-3">

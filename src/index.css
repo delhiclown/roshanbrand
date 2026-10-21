@@ -320,30 +320,6 @@
     0 0 28px -6px rgba(37, 99, 235, 0.45);
 }
 
-.support-launcher {
-  color: #fff;
-  background: linear-gradient(135deg, #2563eb, #1d4ed8 50%, #06b6d4);
-  border: 1px solid rgba(125, 211, 252, 0.55);
-  border-right: none;
-  border-radius: 9999px 0 0 9999px;
-  align-items: center;
-  gap: 0.5rem;
-  padding: 0.5rem 0.75rem 0.5rem 0.6rem;
-  transition:
-    transform 0.2s,
-    filter 0.2s;
-  display: flex;
-  box-shadow:
-    inset 0 1.5px rgba(255, 255, 255, 0.35),
-    0 5px #0f296b,
-    -6px 12px 28px -4px rgba(6, 182, 212, 0.5);
-}
-
-.support-launcher:hover {
-  filter: brightness(1.08);
-  transform: translateX(-3px);
-}
-
 .ocean-dashboard {
   --ocean-bg: #07100e;
   --ocean-surface: #0d1916;

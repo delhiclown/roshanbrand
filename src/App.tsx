@@ -10,14 +10,11 @@ import {
   Headphones,
   Layers,
   Lock,
-  Mail,
   MessageCircle,
   Minus,
   Plus,
   QrCode,
   Search,
-  Send,
-  ShieldCheck,
   SlidersVertical,
   Sparkles,
   X,
@@ -29,7 +26,14 @@ import { CheckoutModal } from '../components/CheckoutModal';
 import { DeliveredOrderDetails } from '../components/DeliveredOrderDetails';
 import { buildDynamicUpiUri } from '../components/UpiQrBox';
 import { DEFAULT_STORE_CONFIG, LIMITS } from './constants';
-import { CheckoutDraft, OrderRecord, PackType, StoreConfig, VaultPoolType } from './types';
+import {
+  CheckoutDraft,
+  CustomerGuaranteeClaim,
+  OrderRecord,
+  PackType,
+  StoreConfig,
+  VaultPoolType,
+} from './types';
 
 const orderAccessStorageKey = (orderId: string) => `roshanbrand_order_access_${orderId}`;
 
@@ -56,6 +60,8 @@ export default function App() {
     guarantee_1month: 0,
   });
   const [storeConfigLoaded, setStoreConfigLoaded] = useState(false);
+  const [storeLoadError, setStoreLoadError] = useState('');
+  const [storeRetryCount, setStoreRetryCount] = useState(0);
 
   // Open a product by default so checkout options are immediately visible.
   const [openCardId, setOpenCardId] = useState<string>('irctc-rental-24h');
@@ -78,18 +84,31 @@ export default function App() {
   const [searchInput, setSearchInput] = useState<string>('');
   const [orderAccessInput, setOrderAccessInput] = useState<string>('');
   const [trackedOrder, setTrackedOrder] = useState<OrderRecord | null>(null);
+  const [trackedOrderAccessToken, setTrackedOrderAccessToken] = useState('');
+  const [guaranteeClaims, setGuaranteeClaims] = useState<CustomerGuaranteeClaim[]>([]);
   const [trackDropdownOpen, setTrackDropdownOpen] = useState<boolean>(false);
   const [trackError, setTrackError] = useState<string>('');
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [supportOpen, setSupportOpen] = useState<boolean>(false);
   const [inlineQrDataUrl, setInlineQrDataUrl] = useState<string>('');
+  const [cookieConsent, setCookieConsent] = useState<'accepted' | 'dismissed' | 'unknown'>(() => {
+    try {
+      return (localStorage.getItem('roshanbrand_cookie_consent') as 'accepted' | 'dismissed' | null) || 'unknown';
+    } catch {
+      return 'unknown';
+    }
+  });
   const displayedPermanentStock = storeConfig.stockDisplayAvailable;
   const displayedRentalStock = storeConfig.rentalStockDisplayAvailable;
-  const totalDisplayedStock =
-    displayedPermanentStock +
-    displayedRentalStock +
-    storeConfig.stock7DayGuaranteeAvailable +
-    storeConfig.stock1MonthGuaranteeAvailable;
+  const availableRentalStock = Math.max(
+    0,
+    Math.min(displayedRentalStock, vaultStock.rental_24h)
+  );
+  const totalAvailableStock =
+    Math.min(displayedPermanentStock, vaultStock.permanent) +
+    availableRentalStock +
+    Math.min(storeConfig.stock7DayGuaranteeAvailable, vaultStock.guarantee_7days) +
+    Math.min(storeConfig.stock1MonthGuaranteeAvailable, vaultStock.guarantee_1month);
 
   useEffect(() => {
     if (
@@ -110,24 +129,32 @@ export default function App() {
     const loadStore = async () => {
       try {
         const res = await fetch('/api/store', { cache: 'no-store' });
-        if (!res.ok) return;
-        const data = await res.json();
-        if (data.storeConfig) {
-          const normalizeVaultStock = (value: unknown) =>
-            typeof value === 'number' && Number.isFinite(value)
-              ? Math.max(0, Math.floor(value))
-              : 0;
-          setStoreConfig({ ...DEFAULT_STORE_CONFIG, ...data.storeConfig });
-          setVaultStock({
-            permanent: normalizeVaultStock(data.vaultStock?.permanent),
-            rental_24h: normalizeVaultStock(data.vaultStock?.rental_24h),
-            guarantee_7days: normalizeVaultStock(data.vaultStock?.guarantee_7days),
-            guarantee_1month: normalizeVaultStock(data.vaultStock?.guarantee_1month),
-          });
-          setStoreConfigLoaded(true);
+        if (!res.ok) {
+          throw new Error(`Store service returned HTTP ${res.status}.`);
         }
+        const data = await res.json();
+        if (!data.storeConfig || !data.vaultStock) {
+          throw new Error('Store service returned incomplete inventory data.');
+        }
+        const normalizeVaultStock = (value: unknown) =>
+          typeof value === 'number' && Number.isFinite(value)
+            ? Math.max(0, Math.floor(value))
+            : 0;
+        setStoreConfig({ ...DEFAULT_STORE_CONFIG, ...data.storeConfig });
+        setVaultStock({
+          permanent: normalizeVaultStock(data.vaultStock.permanent),
+          rental_24h: normalizeVaultStock(data.vaultStock.rental_24h),
+          guarantee_7days: normalizeVaultStock(data.vaultStock.guarantee_7days),
+          guarantee_1month: normalizeVaultStock(data.vaultStock.guarantee_1month),
+        });
+        setStoreConfigLoaded(true);
+        setStoreLoadError('');
       } catch {
-        // fallback to default config
+        setStoreLoadError(
+          storeConfigLoaded
+            ? 'Stock information could not be refreshed. Showing the last loaded stock.'
+            : 'Store inventory is temporarily unavailable. Please retry in a moment.'
+        );
       }
     };
     loadStore();
@@ -149,10 +176,10 @@ export default function App() {
       window.clearInterval(refreshTimer);
       events.close();
     };
-  }, []);
+  }, [storeRetryCount, storeConfigLoaded]);
 
   useEffect(() => {
-    if (!storeConfigLoaded || displayedRentalStock <= 0) return;
+    if (!storeConfigLoaded) return;
 
     try {
       if (sessionStorage.getItem('roshanbrand_rental_stock_notice_seen') === '1') return;
@@ -161,7 +188,7 @@ export default function App() {
       // Keep the notice available when browser storage is disabled.
     }
     setRentalStockNoticeOpen(true);
-  }, [storeConfigLoaded, displayedRentalStock]);
+  }, [storeConfigLoaded]);
 
   // Poll tracked order if present
   useEffect(() => {
@@ -186,6 +213,7 @@ export default function App() {
             accessToken = '';
           }
           if (accessToken) {
+            setTrackedOrderAccessToken(accessToken);
             const accessResponse = await fetch('/api/orders/access', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
@@ -194,7 +222,11 @@ export default function App() {
             if (accessResponse.ok) {
               const accessData = await accessResponse.json();
               order = accessData.order;
+              setGuaranteeClaims(accessData.guaranteeClaims || []);
             }
+          } else {
+            setTrackedOrderAccessToken('');
+            setGuaranteeClaims([]);
           }
           setTrackedOrder(order);
           setTrackError('');
@@ -212,7 +244,7 @@ export default function App() {
     es.onmessage = () => {
       fetchOrder();
     };
-    const timer = setInterval(fetchOrder, 1000);
+    const timer = setInterval(fetchOrder, 10000);
     return () => {
       active = false;
       es.close();
@@ -233,7 +265,7 @@ export default function App() {
     {
       id: 'irctc-7day-guarantee',
       title: 'IRCTC ID — 7 Days Guarantee',
-      subtitle: 'IRCTC ID with a 7 Days Guarantee',
+      subtitle: '7-day coverage from delivery · free replacement or full refund for eligible issues',
       tag: '7 Days Guarantee',
       unitPriceKey: 'price7DayGuaranteePerId',
       defaultQty: 1,
@@ -243,7 +275,7 @@ export default function App() {
     {
       id: 'irctc-1month-guarantee',
       title: 'IRCTC ID — 1 Month Guarantee',
-      subtitle: 'IRCTC ID with a 1 Month Guarantee',
+      subtitle: '1-month coverage from delivery · free replacement or full refund for eligible issues',
       tag: '1 Month Guarantee',
       unitPriceKey: 'price1MonthGuaranteePerId',
       defaultQty: 1,
@@ -509,6 +541,14 @@ export default function App() {
   };
 
   const handleOrderCreated = (order: OrderRecord) => {
+    try {
+      setTrackedOrderAccessToken(
+        localStorage.getItem(orderAccessStorageKey(order.orderId)) || ''
+      );
+    } catch {
+      setTrackedOrderAccessToken('');
+    }
+    setGuaranteeClaims([]);
     setTrackedOrderId(order.orderId);
     setSearchInput(order.orderId);
     setTrackedOrder(order);
@@ -545,6 +585,8 @@ export default function App() {
           // The access key remains available in the field for this visit.
         }
         setTrackedOrder(data.order);
+        setTrackedOrderAccessToken(accessToken);
+        setGuaranteeClaims(data.guaranteeClaims || []);
         setTrackedOrderId(data.order.orderId);
         setSearchInput(data.order.orderId);
         setOrderAccessInput('');
@@ -605,7 +647,10 @@ export default function App() {
     );
   }
 
-  if (trackedOrder?.status === 'verified_delivered' && trackedOrder.deliveredCredentials) {
+  if (
+    trackedOrder?.status === 'verified_delivered' &&
+    (trackedOrder.deliveredCredentials || trackedOrder.credentialsExpired)
+  ) {
     return (
       <div className="delivered-order-shell">
         <header className="delivered-order-topbar">
@@ -620,9 +665,12 @@ export default function App() {
         <main className="delivered-order-main">
           <DeliveredOrderDetails
             order={trackedOrder}
+            accessToken={trackedOrderAccessToken}
+            guaranteeClaims={guaranteeClaims}
             copiedKey={copiedKey}
             onCopy={copyToClipboard}
             onDownload={downloadOrderCsv}
+            onGuaranteeClaimsUpdated={setGuaranteeClaims}
             onBack={() => {
               setTrackedOrder(null);
               setTrackedOrderId('');
@@ -634,8 +682,43 @@ export default function App() {
     );
   }
 
+  const handleCookieConsent = (decision: 'accepted' | 'dismissed') => {
+    setCookieConsent(decision);
+    try {
+      localStorage.setItem('roshanbrand_cookie_consent', decision);
+    } catch {
+      // ignore unavailable storage
+    }
+  };
+
   return (
     <div className="app-shell relative min-h-dvh flex flex-col text-slate-100">
+      {cookieConsent === 'unknown' && (
+        <div className="sticky top-0 z-40 border-b border-cyan-500/30 bg-slate-950/95 backdrop-blur-sm">
+          <div className="mx-auto flex max-w-5xl flex-col gap-3 px-4 py-3 text-sm text-slate-200 sm:flex-row sm:items-center sm:justify-between">
+            <p className="leading-relaxed">
+              This site stores order tracking and session data in your browser to show status and
+              private access details. By continuing, you accept local cookie storage.
+            </p>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => handleCookieConsent('accepted')}
+                className="rounded-lg bg-cyan-500 px-3 py-1.5 font-semibold text-slate-950 transition hover:bg-cyan-400"
+              >
+                Accept
+              </button>
+              <button
+                type="button"
+                onClick={() => handleCookieConsent('dismissed')}
+                className="rounded-lg border border-slate-600 px-3 py-1.5 font-semibold text-slate-200 transition hover:border-slate-400 hover:bg-slate-800"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       <div className="app-scene" aria-hidden="true">
         <div className="app-scene-blob app-scene-blob--cyan" />
         <div className="app-scene-blob app-scene-blob--violet" />
@@ -663,7 +746,7 @@ export default function App() {
             >
               <span
                 className={`w-2 h-2 rounded-full ${
-                  totalDisplayedStock > 0
+                  totalAvailableStock > 0
                     ? 'bg-emerald-400 shadow-[0_0_8px_#34d399]'
                     : 'bg-amber-400'
                 }`}
@@ -671,13 +754,10 @@ export default function App() {
               <span className="font-bold text-white">
                 {!storeConfigLoaded
                   ? '…'
-                  : totalDisplayedStock > 0
-                    ? <span className="tabular-nums">{totalDisplayedStock}</span>
+                  : totalAvailableStock > 0
+                    ? <span className="tabular-nums">{totalAvailableStock}</span>
                     : 'Out of stock'}
               </span>
-              {storeConfigLoaded && totalDisplayedStock > 0 && (
-                <span className="text-slate-400 font-normal hidden sm:inline">in stock</span>
-              )}
             </span>
 
             {/* Track Order Popover */}
@@ -803,6 +883,22 @@ export default function App() {
             </div>
           )}
 
+          {storeLoadError && (
+            <div
+              role="alert"
+              className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-amber-400/35 bg-amber-950/50 px-4 py-3 text-sm text-amber-100"
+            >
+              <span>{storeLoadError}</span>
+              <button
+                type="button"
+                onClick={() => setStoreRetryCount((count) => count + 1)}
+                className="rounded-lg border border-amber-300/35 px-3 py-1.5 text-xs font-bold text-amber-100 transition hover:bg-amber-400/10"
+              >
+                Retry
+              </button>
+            </div>
+          )}
+
           {/* Active / Tracked Order Status Box */}
           {trackedOrder && (
             <div className="mb-6">
@@ -913,7 +1009,6 @@ export default function App() {
               {productOptions.length} options available
             </span>
           </div>
-
           {/* Available product options */}
           <div className="flex-1 min-h-0">
             <ul className="grid grid-cols-1 gap-4 list-none p-0 m-0">
@@ -945,6 +1040,13 @@ export default function App() {
                           setOutOfStockQuantity(null);
                         }
                       }}
+                      aria-label={`${option.title}: ${
+                        !storeConfigLoaded
+                          ? 'stock loading'
+                          : isOutOfStock
+                            ? 'out of stock; open for product details'
+                            : `${stockCount} available`
+                      }`}
                       className="w-full text-left p-4 sm:p-5 flex items-center gap-3.5 sm:gap-4 transition-colors focus:outline-none cursor-pointer"
                     >
                       <div
@@ -1011,8 +1113,12 @@ export default function App() {
                             }`}
                           >
                             {!storeConfigLoaded
-                              ? 'Loading stock…'
-                              : `${stockCount} ID${stockCount === 1 ? '' : 's'} in stock`}
+                              ? storeLoadError
+                                ? 'Stock unavailable'
+                                : 'Loading stock…'
+                              : isOutOfStock
+                                ? 'Out of Stock'
+                                : `${stockCount} ID${stockCount === 1 ? '' : 's'} available`}
                           </span>
                           {option.isRental24h && (
                             <>
@@ -1033,7 +1139,13 @@ export default function App() {
                           }`}
                         >
                           <span>
-                            {isOpen ? 'Close' : 'Buy'}
+                            {isOpen
+                              ? 'Close'
+                              : !storeConfigLoaded
+                                ? 'Loading'
+                                : isOutOfStock
+                                  ? 'Out of Stock'
+                                  : 'Buy'}
                           </span>
                           <ChevronRight
                             className={`w-3.5 h-3.5 transition-transform duration-200 ${
@@ -1457,100 +1569,76 @@ export default function App() {
         </div>
       </main>
 
-      {/* Support Launcher */}
-      <div className="fixed z-40 right-0 bottom-4 sm:bottom-5 flex flex-col items-end">
-        <button
-          type="button"
-          onClick={() => setSupportOpen(true)}
-          className="support-launcher cursor-pointer"
-          aria-label="Open support desk"
-        >
-          <span className="w-8 h-8 rounded-full bg-white/15 flex items-center justify-center shrink-0">
-            <MessageCircle className="w-4 h-4" />
-          </span>
-          <span className="pr-1 text-left">
-            <span className="block text-[11px] font-extrabold leading-tight tracking-tight">
-              Help
-            </span>
-            <span className="block text-[9px] text-cyan-100 leading-tight hidden sm:block">
-              Support desk
-            </span>
-          </span>
-        </button>
-      </div>
-
       {/* Support Modal */}
       {rentalStockNoticeOpen && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-4 backdrop-blur-md"
           onClick={() => setRentalStockNoticeOpen(false)}
         >
           <section
             role="dialog"
             aria-modal="true"
             aria-labelledby="rental-stock-notice-title"
-            className="relative z-10 w-full max-w-md overflow-hidden rounded-2xl border border-cyan-400/50 bg-slate-950 text-white shadow-[0_0_60px_rgba(34,211,238,0.2)]"
+            className="relative z-10 w-full max-w-sm overflow-hidden rounded-[28px] border border-cyan-300/25 bg-[#070c1d] text-white shadow-[0_24px_100px_rgba(0,0,0,0.65),0_0_60px_rgba(34,211,238,0.14)]"
             onClick={(event) => event.stopPropagation()}
           >
-            <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-cyan-400 via-blue-500 to-emerald-400" />
+            <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_top_left,rgba(8,145,178,0.14),transparent_55%)]" />
+            <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-blue-600 via-cyan-400 to-emerald-400" />
             <button
               type="button"
               aria-label="Close stock notice"
               onClick={() => setRentalStockNoticeOpen(false)}
-              className="absolute right-4 top-4 rounded-lg p-2 text-slate-400 transition hover:bg-slate-800 hover:text-white"
+              className="absolute right-4 top-4 z-10 rounded-xl p-2 text-slate-400 transition hover:bg-white/10 hover:text-white"
             >
               <X className="h-4 w-4" />
             </button>
 
-            <div className="p-6 sm:p-7">
-              <div className="mb-5 flex h-12 w-12 items-center justify-center rounded-2xl border border-cyan-300/30 bg-cyan-400/10 text-cyan-300">
-                <Clock className="h-6 w-6" />
+            <div className="relative p-6 sm:p-7">
+              <div
+                className={`flex h-11 w-11 items-center justify-center rounded-2xl border ${
+                  availableRentalStock > 0
+                    ? 'border-cyan-300/30 bg-cyan-400/10 text-cyan-300'
+                    : 'border-rose-300/25 bg-rose-400/10 text-rose-300'
+                }`}
+              >
+                {availableRentalStock > 0 ? (
+                  <Clock className="h-5 w-5" />
+                ) : (
+                  <XCircle className="h-5 w-5" />
+                )}
               </div>
-              <p className="mb-2 text-xs font-extrabold uppercase tracking-[0.18em] text-emerald-300">
-                Limited 24-hour rental stock
-              </p>
               <h2
                 id="rental-stock-notice-title"
-                className="pr-6 text-2xl font-black leading-tight text-white"
+                className={`mt-6 text-center text-3xl font-black tracking-tight ${
+                  availableRentalStock > 0 ? 'text-white' : 'text-rose-200'
+                }`}
               >
-                Only {displayedRentalStock} rental ID
-                {displayedRentalStock === 1 ? '' : 's'} available right now
+                {availableRentalStock > 0
+                  ? `${availableRentalStock} ID${availableRentalStock === 1 ? '' : 's'} available`
+                  : 'Out of Stock'}
               </h2>
-              <p className="mt-3 text-sm leading-relaxed text-slate-300">
-                Need an IRCTC ID for a Tatkal or urgent booking? Get 24-hour rental access while
-                stock is available.
-              </p>
+              <div className="mx-auto mt-3 h-1 w-14 rounded-full bg-gradient-to-r from-blue-500 via-cyan-400 to-emerald-400" />
 
-              <div className="mt-5 flex items-center justify-between gap-3 rounded-xl border border-cyan-400/20 bg-slate-900/80 px-4 py-3">
-                <span className="text-sm font-bold text-slate-200">24-hour access</span>
-                <span className="text-lg font-black text-white">
-                  ₹{storeConfig.priceRental24h}
-                  <span className="ml-1 text-xs font-semibold text-slate-400">/ ID</span>
-                </span>
-              </div>
-              <p className="mt-3 text-xs leading-relaxed text-slate-400">
-                Availability may change. Payment is verified before rental details are delivered.
-              </p>
-
-              <button
-                type="button"
-                onClick={() => {
-                  setRentalStockNoticeOpen(false);
-                  setOpenCardId('irctc-rental-24h');
-                  document
-                    .getElementById('product-irctc-rental-24h')
-                    ?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                }}
-                className="mt-6 flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-cyan-500 px-5 py-3.5 text-sm font-extrabold text-white shadow-lg shadow-cyan-950/40 transition hover:brightness-110"
-              >
-                View {displayedRentalStock} available ID
-                {displayedRentalStock === 1 ? '' : 's'}
-                <ChevronRight className="h-4 w-4" />
-              </button>
+              {availableRentalStock > 0 ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setRentalStockNoticeOpen(false);
+                    setOpenCardId('irctc-rental-24h');
+                    document
+                      .getElementById('product-irctc-rental-24h')
+                      ?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                  }}
+                  className="mt-7 flex w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-blue-600 to-cyan-500 px-5 py-3.5 text-sm font-extrabold text-white shadow-[0_10px_28px_rgba(8,145,178,0.24)] transition hover:brightness-110"
+                >
+                  View IDs
+                  <ChevronRight className="h-4 w-4" />
+                </button>
+              ) : null}
               <button
                 type="button"
                 onClick={() => setRentalStockNoticeOpen(false)}
-                className="mt-3 w-full rounded-xl px-4 py-2.5 text-sm font-semibold text-slate-400 transition hover:text-white"
+                className="mt-3 w-full rounded-xl px-4 py-2.5 text-sm font-semibold text-slate-400 transition hover:bg-white/[0.04] hover:text-white"
               >
                 Continue browsing
               </button>
@@ -1562,14 +1650,19 @@ export default function App() {
       {supportOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-md">
           <div className="fixed inset-0" onClick={() => setSupportOpen(false)} />
-          <div className="relative z-10 w-full max-w-md neon-card-3d border-cyan-400/50 overflow-hidden">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="support-dialog-title"
+            className="relative z-10 w-full max-w-md neon-card-3d border-cyan-400/50 overflow-hidden"
+          >
             <div className="px-5 py-4 border-b border-cyan-500/25 flex items-center justify-between bg-slate-950/60">
               <div className="flex items-center gap-2.5">
                 <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-blue-600 to-cyan-500 text-white flex items-center justify-center shadow-[0_3px_0_#0f296b]">
                   <Headphones className="w-4 h-4" />
                 </div>
                 <div>
-                  <h3 className="text-sm font-extrabold text-white">
+                  <h3 id="support-dialog-title" className="text-sm font-extrabold text-white">
                     {storeConfig.siteTitle} Support Desk
                   </h3>
                   <p className="text-[11px] text-cyan-300/80">
@@ -1580,6 +1673,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setSupportOpen(false)}
+                aria-label="Close support desk"
                 className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 cursor-pointer"
               >
                 <X className="w-4 h-4" />
@@ -1588,9 +1682,10 @@ export default function App() {
 
             <div className="p-5 space-y-3.5 text-xs text-slate-300">
               <div className="p-3.5 rounded-xl bg-slate-950/80 border border-cyan-500/30 space-y-1">
-                <p className="font-bold text-white">How fast is UPI UTR verification?</p>
+                <p className="font-bold text-white">Payment and delivery</p>
                 <p className="text-slate-300 leading-relaxed">
                   {storeConfig.instantDeliveryNote}
+                  {' '}If we cannot deliver your ID, a full refund is guaranteed in under one minute.
                 </p>
               </div>
 
@@ -1604,50 +1699,37 @@ export default function App() {
                 </p>
               </div>
 
+              <div className="p-3.5 rounded-xl bg-blue-950/40 border border-blue-400/30 space-y-1">
+                <p className="font-bold text-blue-200">7-day and 1-month guarantee</p>
+                <p className="text-slate-300 leading-relaxed">
+                  Coverage starts when the ID is delivered. If an issue is not caused by the
+                  customer, we provide a free replacement or full refund. Submit a claim from the
+                  delivered order page; WhatsApp support is available if you need help.
+                </p>
+              </div>
+
               {storeConfig.supportHandle && (
                 <div className="p-3.5 rounded-xl bg-blue-950/50 border border-cyan-400/40 flex items-center justify-between gap-2">
                   <div>
                     <span className="text-[10px] font-extrabold uppercase tracking-wider text-cyan-400 block">
-                      Direct Support Contact
+                      Support
                     </span>
                     <p className="font-mono font-bold text-white text-sm">
                       {storeConfig.supportHandle}
                     </p>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => copyToClipboard(storeConfig.supportHandle, 'support-handle')}
-                    className="px-3 py-1.5 rounded-lg bg-slate-900 border border-cyan-400/40 text-cyan-300 font-bold text-xs shadow-[0_2px_0_#040714] cursor-pointer"
-                  >
-                    {copiedKey === 'support-handle' ? 'Copied!' : 'Copy'}
-                  </button>
                 </div>
               )}
 
-              <div className="grid gap-2 sm:grid-cols-2">
-                <a
-                  href="https://t.me/Roshanadminn"
-                  target="_blank"
-                  rel="noreferrer"
-                  className="flex items-center gap-3 rounded-xl border border-sky-400/40 bg-sky-950/40 p-3 text-left hover:bg-sky-900/50"
-                >
-                  <Send className="h-5 w-5 shrink-0 text-sky-300" />
-                  <span className="min-w-0">
-                    <span className="block font-bold text-white">Telegram Support</span>
-                    <span className="block truncate text-[11px] text-sky-200">@Roshanadminn · Message us</span>
-                  </span>
-                </a>
-                <a
-                  href="mailto:delhiclown@gmail.com"
-                  className="flex items-center gap-3 rounded-xl border border-cyan-400/40 bg-cyan-950/40 p-3 text-left hover:bg-cyan-900/50"
-                >
-                  <Mail className="h-5 w-5 shrink-0 text-cyan-300" />
-                  <span className="min-w-0">
-                    <span className="block font-bold text-white">Email Support</span>
-                    <span className="block truncate text-[11px] text-cyan-200">delhiclown@gmail.com</span>
-                  </span>
-                </a>
-              </div>
+              <a
+                href={storeConfig.supportUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center justify-center gap-2 rounded-xl border border-emerald-300/35 bg-emerald-500/15 p-3.5 text-sm font-extrabold text-emerald-100 transition hover:bg-emerald-500/25"
+              >
+                <MessageCircle className="h-5 w-5" />
+                Chat on WhatsApp
+              </a>
             </div>
           </div>
         </div>
@@ -1729,9 +1811,10 @@ export default function App() {
                 checked.
               </li>
               <li>
-                Rental validity starts when credentials are delivered. Ask support for written
-                coverage and refund terms before paying; UTR submission alone does not confirm
-                payment or authorize a refund.
+                If an ID cannot be delivered, a full refund is guaranteed in under one minute.
+                7-day and 1-month coverage starts at delivery; submit a claim from the delivered
+                order page for eligible issues. Rental credentials are hidden by this panel after
+                24 hours, but this does not deactivate the account in IRCTC.
               </li>
               <li>
                 Your UTR and optional contact details are used to identify and support your order.
@@ -1740,6 +1823,34 @@ export default function App() {
               </li>
             </ul>
           </details>
+          <div className="mt-3 flex justify-end">
+            <button
+              type="button"
+              onClick={() => setSupportOpen(true)}
+              className="inline-flex items-center gap-2 rounded-full border border-blue-300/50 bg-gradient-to-r from-blue-700 via-blue-600 to-cyan-500 py-1.5 pl-1.5 pr-4 text-left text-white shadow-[0_5px_18px_rgba(37,99,235,0.3)] transition hover:brightness-110"
+              aria-label="Open support desk"
+            >
+              <span className="flex h-9 w-9 items-center justify-center rounded-full bg-white/15 ring-1 ring-white/20">
+                <MessageCircle className="h-4 w-4" />
+              </span>
+              <span className="flex flex-col">
+                <span className="text-xs font-extrabold leading-tight">Help</span>
+                <span className="text-[10px] font-medium leading-tight text-blue-100">
+                  Support desk
+                </span>
+              </span>
+            </button>
+          </div>
+          <div className="mt-3 rounded-xl border border-emerald-400/20 bg-emerald-950/25 px-3.5 py-3 text-[11px] leading-relaxed text-emerald-100/90">
+            <p>
+              <strong className="text-emerald-200">No delivery?</strong> Full refund guaranteed
+              in under one minute. 7-day and 1-month coverage starts at delivery; issues not
+              caused by the customer qualify for a free replacement or full refund.
+            </p>
+            <p className="mt-1 text-emerald-100/70">
+              Submit guarantee claims from the delivered order page using the “Claim Guarantee” button.
+            </p>
+          </div>
         </div>
       </aside>
 

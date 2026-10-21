@@ -2135,6 +2135,8 @@ async function startServer() {
 
 startServer().catch(async (error: unknown) => {
   console.error('Failed to start server:', error);
-  await postgresPool.end();
+  if (postgresPool) {
+    await postgresPool.end();
+  }
   process.exitCode = 1;
 });

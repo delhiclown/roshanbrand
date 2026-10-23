@@ -344,7 +344,14 @@ export default function App() {
 
   const activeProduct =
     productOptions.find((p) => p.id === openCardId) || productOptions[0];
-  const getAvailableStock = (_option: ProductOption) => totalAvailableStock;
+  const getAvailableStock = (option: ProductOption) =>
+    option.isRental24h
+      ? vaultStock.rental_24h
+      : option.isSevenDayGuarantee
+        ? Math.min(storeConfig.stock7DayGuaranteeAvailable, vaultStock.guarantee_7days)
+        : option.isOneMonthGuarantee
+          ? Math.min(storeConfig.stock1MonthGuaranteeAvailable, vaultStock.guarantee_1month)
+          : Math.min(displayedPermanentStock, vaultStock.permanent);
   const activeStockCount = getAvailableStock(activeProduct);
   const safeQty = Math.max(
     LIMITS.QUANTITY_MIN,
@@ -1101,7 +1108,7 @@ export default function App() {
                                 : 'Loading stock…'
                               : isOutOfStock
                                 ? 'Out of Stock'
-                                : `${stockCount} ID${stockCount === 1 ? '' : 's'} available across all types`}
+                                : `${stockCount} ID${stockCount === 1 ? '' : 's'} available`}
                           </span>
                           {option.isRental24h && (
                             <>
@@ -1149,7 +1156,7 @@ export default function App() {
                               <div className="flex items-center justify-between mb-2">
                                 <p className="text-[11px] font-extrabold uppercase tracking-wider text-emerald-300 flex items-center gap-1.5">
                                   <Clock className="w-3.5 h-3.5 text-emerald-400" />
-                                  <span>Select 24-Hour Rental IRCTC ID Quantity ({activeStockCount} IDs available across all types)</span>
+                                  <span>Select 24-Hour Rental IRCTC ID Quantity</span>
                                 </p>
                                 <span className="text-[11px] text-slate-300 font-medium">
                                   ₹{storeConfig.priceRental24h}/ID · 24 Hours Active Validity
@@ -1202,7 +1209,7 @@ export default function App() {
                             <div>
                               <div className="flex items-center justify-between mb-2">
                                 <p className="text-[11px] font-extrabold uppercase tracking-wider text-emerald-300">
-                                  Select {option.isOneMonthGuarantee ? '1 Month' : '7 Days'} Guarantee ID Quantity ({activeStockCount} IDs available across all types)
+                                  Select {option.isOneMonthGuarantee ? '1 Month' : '7 Days'} Guarantee ID Quantity
                                 </p>
                                 <span className="text-[11px] text-slate-300 font-medium">
                                   ₹{option.isOneMonthGuarantee
@@ -1257,7 +1264,7 @@ export default function App() {
                             <div>
                               <div className="flex items-center justify-between mb-2">
                                 <p className="text-[11px] font-extrabold uppercase tracking-wider text-cyan-300">
-                                  How many IDs do you need? ({activeStockCount} IDs available across all types)
+                                  How many IDs do you need?
                                 </p>
                                 <span className="text-[11px] text-slate-300 font-medium">
                                   Instant QR · No login needed
@@ -1393,10 +1400,6 @@ export default function App() {
                               </div>
                             </div>
                           )}
-
-                          <p className="text-[11px] text-slate-400">
-                            Stock is shared across all ID types. The selected product&apos;s price and terms apply to the order.
-                          </p>
 
                           {/* Stepper + Custom Note */}
                           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">

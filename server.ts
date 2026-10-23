@@ -425,6 +425,23 @@ function getVaultPoolForPackType(packType: PackType): VaultPoolType {
   return 'permanent';
 }
 
+function syncVaultDisplayCounter(poolType: VaultPoolType) {
+  const availableCount = db.vault.filter(
+    (item) =>
+      item.poolType === poolType && !item.isAssigned && !item.reservedOrderId
+  ).length;
+
+  if (poolType === 'rental_24h') {
+    db.storeConfig.rentalStockDisplayAvailable = availableCount;
+  } else if (poolType === 'permanent') {
+    db.storeConfig.stockDisplayAvailable = availableCount;
+  } else if (poolType === 'guarantee_7days') {
+    db.storeConfig.stock7DayGuaranteeAvailable = availableCount;
+  } else {
+    db.storeConfig.stock1MonthGuaranteeAvailable = availableCount;
+  }
+}
+
 function getVaultPoolLabel(poolType: VaultPoolType): string {
   switch (poolType) {
     case 'rental_24h':
@@ -2131,6 +2148,7 @@ async function startServer() {
       });
     }
 
+    syncVaultDisplayCounter(poolType);
     if (poolType === 'rental_24h') {
       db.storeConfig.rentalStockAvailable += parsedLines.length;
     } else if (poolType === 'permanent') {
@@ -2147,7 +2165,9 @@ async function startServer() {
     const { vaultId } = req.params;
     const idx = db.vault.findIndex((v) => v.vaultId === vaultId);
     if (idx !== -1) {
+      const poolType = db.vault[idx].poolType;
       db.vault.splice(idx, 1);
+      syncVaultDisplayCounter(poolType);
       if (!(await persistDbOrRespond(res))) return;
       broadcastStateUpdate('vault_updated', {});
     }

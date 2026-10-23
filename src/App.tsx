@@ -38,6 +38,21 @@ import {
 const orderAccessStorageKey = (orderId: string) => `roshanbrand_order_access_${orderId}`;
 const cookieAuthenticatedOrder = 'http-only-cookie';
 
+const removeRecentOrder = (orderId: string) => {
+  try {
+    const recentOrders: unknown = JSON.parse(
+      localStorage.getItem('roshanbrand_recent_orders') || '[]'
+    );
+    if (!Array.isArray(recentOrders)) return;
+    localStorage.setItem(
+      'roshanbrand_recent_orders',
+      JSON.stringify(recentOrders.filter((id) => id !== orderId))
+    );
+  } catch {
+    // Browser storage may be unavailable.
+  }
+};
+
 interface ProductOption {
   id: string;
   title: string;
@@ -117,6 +132,12 @@ export default function App() {
       document.title = previousTitle;
     };
   }, [trackedOrder?.status]);
+
+  useEffect(() => {
+    if (trackedOrder?.status === 'verified_delivered') {
+      removeRecentOrder(trackedOrder.orderId);
+    }
+  }, [trackedOrder?.orderId, trackedOrder?.status]);
 
   // Keep storefront stock and settings in sync with admin changes.
   useEffect(() => {
@@ -677,8 +698,11 @@ export default function App() {
             onDownload={downloadOrderCsv}
             onGuaranteeClaimsUpdated={setGuaranteeClaims}
             onBack={() => {
+              removeRecentOrder(trackedOrder.orderId);
               setTrackedOrder(null);
               setTrackedOrderId('');
+              setTrackedOrderAccessToken('');
+              setGuaranteeClaims([]);
               setSearchInput('');
             }}
           />

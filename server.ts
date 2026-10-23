@@ -442,19 +442,6 @@ function syncVaultDisplayCounter(poolType: VaultPoolType) {
   }
 }
 
-function getVaultPoolLabel(poolType: VaultPoolType): string {
-  switch (poolType) {
-    case 'rental_24h':
-      return '24H Rental';
-    case 'guarantee_7days':
-      return '7 Days Guarantee';
-    case 'guarantee_1month':
-      return '1 Month Guarantee';
-    default:
-      return 'Permanent';
-  }
-}
-
 function sanitizeVaultNote(note: string): string {
   return note
     .split(/[|·]/)
@@ -499,6 +486,50 @@ function isPackType(value: unknown): value is PackType {
 
 const db = loadDb();
 
+const VAULT_POOL_TYPES: VaultPoolType[] = [
+  'permanent',
+  'rental_24h',
+  'guarantee_7days',
+  'guarantee_1month',
+];
+
+function getAvailableVaultItems(poolType: VaultPoolType): VaultItem[] {
+  return db.vault.filter(
+    (item) =>
+      item.poolType === poolType && !item.isAssigned && !item.reservedOrderId
+  );
+}
+
+function getAvailableVaultStock(): Record<VaultPoolType, number> {
+  const availableCount = (poolType: VaultPoolType) =>
+    getAvailableVaultItems(poolType).length;
+
+  return {
+    permanent: Math.min(db.storeConfig.stockDisplayAvailable, availableCount('permanent')),
+    rental_24h: availableCount('rental_24h'),
+    guarantee_7days: Math.min(
+      db.storeConfig.stock7DayGuaranteeAvailable,
+      availableCount('guarantee_7days')
+    ),
+    guarantee_1month: Math.min(
+      db.storeConfig.stock1MonthGuaranteeAvailable,
+      availableCount('guarantee_1month')
+    ),
+  };
+}
+
+function getPurchasableVaultItems(preferredPool: VaultPoolType): VaultItem[] {
+  const stockByPool = getAvailableVaultStock();
+  const poolOrder = [
+    preferredPool,
+    ...VAULT_POOL_TYPES.filter((poolType) => poolType !== preferredPool),
+  ];
+
+  return poolOrder.flatMap((poolType) =>
+    getAvailableVaultItems(poolType).slice(0, stockByPool[poolType])
+  );
+}
+
 // Real-time SSE clients for instant <50ms Admin & Customer sync
 const sseClients = new Set<express.Response>();
 
@@ -514,7 +545,7 @@ function broadcastStateUpdate(eventType: string, _payload?: unknown) {
 }
 
 /**
- * Pulls credentials only from unassigned items in the matching Ready ID Vault pool.
+ * Pulls reserved credentials first from the selected product pool, then other pools.
  */
 function allocateCredentials(
   quantity: number,
@@ -522,11 +553,17 @@ function allocateCredentials(
   orderId: string
 ): string | null {
   const targetPool = getVaultPoolForPackType(packType);
-  const availableInPool = db.vault.filter(
-    (v) =>
-      !v.isAssigned &&
-      v.poolType === targetPool &&
-      (!v.reservedOrderId || v.reservedOrderId === orderId)
+  const poolOrder = [
+    targetPool,
+    ...VAULT_POOL_TYPES.filter((poolType) => poolType !== targetPool),
+  ];
+  const availableInPool = poolOrder.flatMap((poolType) =>
+    db.vault.filter(
+      (v) =>
+        !v.isAssigned &&
+        v.poolType === poolType &&
+        (!v.reservedOrderId || v.reservedOrderId === orderId)
+    )
   );
   if (availableInPool.length < quantity) {
     return null;
@@ -993,6 +1030,7 @@ async function startServer() {
           item.poolType === 'guarantee_1month' && !item.isAssigned && !item.reservedOrderId
       ).length,
     };
+    const availableStock = getAvailableVaultStock();
     const storeConfig = {
       ...Object.fromEntries(
         Object.entries(db.storeConfig).filter(
@@ -1000,19 +1038,10 @@ async function startServer() {
             key !== 'presetRentalCredentials' && key !== 'presetPermanentCredentials'
         )
       ),
-      stockDisplayAvailable: Math.min(
-        db.storeConfig.stockDisplayAvailable,
-        vaultStock.permanent
-      ),
-      rentalStockDisplayAvailable: vaultStock.rental_24h,
-      stock7DayGuaranteeAvailable: Math.min(
-        db.storeConfig.stock7DayGuaranteeAvailable,
-        vaultStock.guarantee_7days
-      ),
-      stock1MonthGuaranteeAvailable: Math.min(
-        db.storeConfig.stock1MonthGuaranteeAvailable,
-        vaultStock.guarantee_1month
-      ),
+      stockDisplayAvailable: availableStock.permanent,
+      rentalStockDisplayAvailable: availableStock.rental_24h,
+      stock7DayGuaranteeAvailable: availableStock.guarantee_7days,
+      stock1MonthGuaranteeAvailable: availableStock.guarantee_1month,
     };
     res.json({ storeConfig, vaultStock });
   });
@@ -1210,26 +1239,10 @@ async function startServer() {
     }
 
     const isRental24h = packType === 'rental_24h';
-    const availableStock =
-      packType === 'rental_24h'
-        ? db.storeConfig.rentalStockDisplayAvailable
-        : packType === 'guarantee_7days'
-          ? db.storeConfig.stock7DayGuaranteeAvailable
-          : packType === 'guarantee_1month'
-            ? db.storeConfig.stock1MonthGuaranteeAvailable
-            : db.storeConfig.stockDisplayAvailable;
     const targetPool = getVaultPoolForPackType(packType);
-    const availableVaultItems = db.vault.filter(
-      (item) =>
-        !item.isAssigned &&
-        item.poolType === targetPool &&
-        !item.reservedOrderId
-    );
-    if (
-      quantity > availableVaultItems.length ||
-      (packType !== 'rental_24h' && quantity > availableStock)
-    ) {
-      res.status(409).json({ error: 'Not enough stock is available for this package.' });
+    const availableVaultItems = getPurchasableVaultItems(targetPool);
+    if (quantity > availableVaultItems.length) {
+      res.status(409).json({ error: 'Not enough IDs are available across the inventory.' });
       return;
     }
 
@@ -1915,14 +1928,12 @@ async function startServer() {
       });
       return;
     }
-    const targetPool = getVaultPoolForPackType(order.packType);
     if (creds) {
       const credentialLines = creds.split('\n').map((line: string) => line.trim()).filter(Boolean);
       const matchedItems = credentialLines.map((line: string) => {
         const username = (line.split(/[|:,]/)[0] || '').replace(/^Username:\s*/i, '').trim();
         return db.vault.find(
           (item) =>
-            item.poolType === targetPool &&
             item.irctcUsername === username &&
             ((!item.isAssigned && (!item.reservedOrderId || item.reservedOrderId === order.orderId)) ||
               item.assignedOrderId === order.orderId)
@@ -1934,7 +1945,7 @@ async function startServer() {
         new Set(matchedItems.map((item) => item?.vaultId)).size !== order.quantity
       ) {
         res.status(409).json({
-          error: `This order requires ${order.quantity} available ID(s) from the ${getVaultPoolLabel(targetPool)} pool only.`,
+          error: `This order requires ${order.quantity} available ID(s) from the inventory.`,
         });
         return;
       }
@@ -1958,7 +1969,7 @@ async function startServer() {
       const allocated = allocateCredentials(order.quantity, order.packType, order.orderId);
       if (allocated === null) {
         res.status(409).json({
-          error: `Not enough unassigned IDs in the ${getVaultPoolLabel(targetPool)} pool. Add more IDs to that pool before delivery.`,
+          error: 'Not enough unassigned IDs are available in the inventory to deliver this order.',
         });
         return;
       }

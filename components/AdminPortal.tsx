@@ -76,6 +76,10 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   const [activeTab, setActiveTab] = useState<AdminTab>('orders');
   const [orders, setOrders] = useState<OrderRecord[]>([]);
   const [vault, setVault] = useState<VaultItem[]>([]);
+  const availableRentalVaultStock = vault.filter(
+    (item) =>
+      item.poolType === 'rental_24h' && !item.isAssigned && !item.reservedOrderId
+  ).length;
   const [guaranteeClaims, setGuaranteeClaims] = useState<GuaranteeClaim[]>([]);
   const [ordersOffset, setOrdersOffset] = useState(0);
   const [claimsOffset, setClaimsOffset] = useState(0);
@@ -2089,34 +2093,16 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
 
                 <div className="space-y-1.5">
                   <label className="block text-xs font-extrabold text-emerald-300">
-                    24H Rental IDs Display Counter
+                    24H Rental IDs Available
                   </label>
                   <input
                     type="text"
-                    inputMode="numeric"
-                    min={0}
-                    value={stockInputs.rentalStockDisplayAvailable}
-                    onChange={(e) => {
-                      const value = e.target.value;
-                      setStockInputs((current) => ({
-                        ...current,
-                        rentalStockDisplayAvailable: value,
-                      }));
-                      setDirtyStockInputs((current) => ({
-                        ...current,
-                        rentalStockDisplayAvailable: true,
-                      }));
-                      if (/^\d+$/.test(value) && Number(value) <= 100000) {
-                        setFormConfig((current) => ({
-                          ...current,
-                          rentalStockDisplayAvailable: Number(value),
-                        }));
-                      }
-                    }}
+                    value={availableRentalVaultStock}
+                    readOnly
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-emerald-500/40 text-sm text-emerald-400 font-mono font-black"
                   />
                   <p className="text-[11px] text-slate-400">
-                    Customer availability is capped by unassigned IDs in the matching vault pool.
+                    Automatically calculated from unassigned IDs in the rental vault.
                   </p>
                 </div>
 

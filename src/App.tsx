@@ -108,11 +108,7 @@ export default function App() {
   const [supportOpen, setSupportOpen] = useState<boolean>(false);
   const [inlineQrDataUrl, setInlineQrDataUrl] = useState<string>('');
   const displayedPermanentStock = storeConfig.stockDisplayAvailable;
-  const displayedRentalStock = storeConfig.rentalStockDisplayAvailable;
-  const availableRentalStock = Math.max(
-    0,
-    Math.min(displayedRentalStock, vaultStock.rental_24h)
-  );
+  const availableRentalStock = vaultStock.rental_24h;
   const totalAvailableStock =
     Math.min(displayedPermanentStock, vaultStock.permanent) +
     availableRentalStock +
@@ -350,7 +346,7 @@ export default function App() {
     productOptions.find((p) => p.id === openCardId) || productOptions[0];
   const getAvailableStock = (option: ProductOption) =>
     option.isRental24h
-      ? Math.min(displayedRentalStock, vaultStock.rental_24h)
+      ? vaultStock.rental_24h
       : option.isSevenDayGuarantee
         ? Math.min(storeConfig.stock7DayGuaranteeAvailable, vaultStock.guarantee_7days)
         : option.isOneMonthGuarantee

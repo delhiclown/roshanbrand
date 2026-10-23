@@ -1149,7 +1149,7 @@ export default function App() {
                               <div className="flex items-center justify-between mb-2">
                                 <p className="text-[11px] font-extrabold uppercase tracking-wider text-emerald-300 flex items-center gap-1.5">
                                   <Clock className="w-3.5 h-3.5 text-emerald-400" />
-                                  <span>Select 24-Hour Rental IRCTC ID Quantity ({activeStockCount} total IDs available)</span>
+                                  <span>Select 24-Hour Rental IRCTC ID Quantity ({activeStockCount} IDs available across all types)</span>
                                 </p>
                                 <span className="text-[11px] text-slate-300 font-medium">
                                   ₹{storeConfig.priceRental24h}/ID · 24 Hours Active Validity
@@ -1202,7 +1202,7 @@ export default function App() {
                             <div>
                               <div className="flex items-center justify-between mb-2">
                                 <p className="text-[11px] font-extrabold uppercase tracking-wider text-emerald-300">
-                                  Select {option.isOneMonthGuarantee ? '1 Month' : '7 Days'} Guarantee ID Quantity ({activeStockCount} total IDs available)
+                                  Select {option.isOneMonthGuarantee ? '1 Month' : '7 Days'} Guarantee ID Quantity ({activeStockCount} IDs available across all types)
                                 </p>
                                 <span className="text-[11px] text-slate-300 font-medium">
                                   ₹{option.isOneMonthGuarantee
@@ -1257,7 +1257,7 @@ export default function App() {
                             <div>
                               <div className="flex items-center justify-between mb-2">
                                 <p className="text-[11px] font-extrabold uppercase tracking-wider text-cyan-300">
-                                  How many IDs do you need? ({activeStockCount} total IDs available)
+                                  How many IDs do you need? ({activeStockCount} IDs available across all types)
                                 </p>
                                 <span className="text-[11px] text-slate-300 font-medium">
                                   Instant QR · No login needed

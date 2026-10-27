@@ -66,7 +66,7 @@ x-secret: YOUR_SMS_SECRET
 {"sender":"AIRTEL","message":"INR 340.00 credited ... UTR 123456789012"}
 ```
 
-The notification must include a configured sender keyword, `credited` or `received`, a rupee amount prefixed by `Rs`, `INR`, or `₹`, and a labeled 12-digit UTR/ref number. The webhook records every accepted SMS and automatically delivers only when the UTR, amount, order creation time, and pending order status match. Keep `SMS_SECRET` only in the backend and SMS relay; never put it in frontend code. Review the payment directly in the bank account before using **Update Delivered Vault ID** in the logged-in admin panel.
+The notification must include a configured sender keyword, `credited` or `received`, a rupee amount prefixed by `Rs`, `INR`, or `₹`, and a labeled 12-digit UTR/ref number. Debit and OTP messages are ignored, and a missing or incorrect `x-secret` receives HTTP 401. The webhook records every accepted SMS and automatically delivers only when the UTR, amount, order creation time, and pending order status match. Keep `SMS_SECRET` only in the backend and SMS relay; never put it in frontend code. Review the payment directly in the bank account before using **Update Delivered Vault ID** in the logged-in admin panel.
 
 ### Verify the unpaid-order safeguard
 

@@ -486,8 +486,20 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
         method: 'POST',
       });
       if (res.ok) {
+        setOrderErrors((previous) => ({ ...previous, [order.orderId]: '' }));
         await fetchAdminState(false, true);
+      } else {
+        const data = await res.json();
+        setOrderErrors((previous) => ({
+          ...previous,
+          [order.orderId]: data.error || 'The order could not be rejected.',
+        }));
       }
+    } catch {
+      setOrderErrors((previous) => ({
+        ...previous,
+        [order.orderId]: 'Could not connect to the server. Please try again.',
+      }));
     } finally {
       setBusyOrderId(null);
     }
@@ -1383,6 +1395,12 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                                   Verified &amp; Delivered
                                 </span>
                               )}
+                              {order.status === 'verified_delivered' &&
+                                order.adminNote?.includes('SMS notification') && (
+                                  <span className="text-cyan-200 font-extrabold">
+                                    Auto verified
+                                  </span>
+                                )}
                               {order.status === 'rejected' && (
                                 <span className="text-rose-300 font-extrabold flex items-center gap-1">
                                   <XCircle className="w-3.5 h-3.5" />

@@ -6,6 +6,15 @@ export interface DeliveryState {
 export type DeliverySource = 'manual' | 'sms';
 export type DeliveryResult = 'delivered' | 'already-delivered' | 'unavailable';
 
+export interface ParsedSmsPayment {
+  utr: string;
+  amountPaise: number;
+}
+
+export type SmsParseResult =
+  | { ok: true; payment: ParsedSmsPayment }
+  | { ok: false; reason: string };
+
 interface ReservableStockItem {
   poolType: string;
   isAssigned: boolean;
@@ -85,6 +94,69 @@ export function matchesSmsPayment(
     order.amountPaise === payment.amountPaise &&
     receivedAt > createdAt
   );
+}
+
+export function parseCreditedSms(
+  sender: string,
+  message: string,
+  senderKeywords: string[]
+): SmsParseResult {
+  const normalizedSender = sender.toLocaleLowerCase();
+  if (!sender || !senderKeywords.some((keyword) =>
+    keyword && normalizedSender.includes(keyword.toLocaleLowerCase())
+  )) {
+    return { ok: false, reason: 'sender_not_allowed' };
+  }
+  if (/\b(?:otp|one[- ]time password|verification code)\b/i.test(message)) {
+    return { ok: false, reason: 'otp_message' };
+  }
+  if (/\b(?:debit(?:ed)?|withdrawn|withdrawal|sent)\b/i.test(message)) {
+    return { ok: false, reason: 'debit_message' };
+  }
+  if (!/\b(?:credited|received)\b/i.test(message)) {
+    return { ok: false, reason: 'not_a_credit_message' };
+  }
+
+  const amountMatch = message.match(
+    /(?:₹|INR|Rs\.?)\s*((?:\d{1,3}(?:,\d{3})+|\d{1,2}(?:,\d{2})*,\d{3}|\d+)(?:\.\d{1,2})?)/i
+  );
+  const utrMatch = message.match(
+    /(?:UTR|REF(?:ERENCE)?|RRN)\s*(?:NO\.?|NUMBER)?\s*[:#-]?\s*(?<!\d)(\d{12})(?!\d)/i
+  );
+  if (!amountMatch || !utrMatch) return { ok: false, reason: 'parse_failed' };
+
+  const [rupeesText, fraction = ''] = amountMatch[1].replace(/,/g, '').split('.');
+  try {
+    const paise = BigInt(rupeesText) * 100n + BigInt(fraction.padEnd(2, '0') || '0');
+    if (paise <= 0n || paise > 2_147_483_647n) {
+      return { ok: false, reason: 'invalid_amount' };
+    }
+    return {
+      ok: true,
+      payment: { utr: utrMatch[1], amountPaise: Number(paise) },
+    };
+  } catch {
+    return { ok: false, reason: 'invalid_amount' };
+  }
+}
+
+export function smsWebhookStatus(authorized: boolean): 200 | 401 {
+  return authorized ? 200 : 401;
+}
+
+export function rejectOrderAndReleaseStock(
+  order: { status: string; paymentStatus?: string; adminNote: string; updatedAt: string },
+  items: ReservableStockItem[],
+  orderId: string,
+  updatedAt: string
+): boolean {
+  if (order.status !== 'pending_verification') return false;
+  order.status = 'rejected';
+  order.paymentStatus = 'rejected';
+  order.adminNote = 'Payment UTR could not be verified. Please contact support with payment screenshot.';
+  order.updatedAt = updatedAt;
+  releaseStock(items, orderId, updatedAt);
+  return true;
 }
 
 export function deliverOnce(

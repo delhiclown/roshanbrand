@@ -24,8 +24,11 @@ import {
   deliverOnce,
   isOrderExpired,
   matchesSmsPayment,
+  parseCreditedSms,
+  rejectOrderAndReleaseStock,
   releaseStock,
   reserveStock,
+  smsWebhookStatus,
   submitUtr,
 } from './src/paymentDelivery.ts';
 
@@ -997,10 +1000,12 @@ async function startServer() {
     limit: 120,
     standardHeaders: true,
     legacyHeaders: false,
-    handler: (req, res) =>
+    handler: (req, res) => {
+      const authorized = isValidSmsSecret(String(req.get('x-secret') || ''));
       res
-        .status(isValidSmsSecret(String(req.get('x-secret') || '')) ? 200 : 403)
-        .json({ ok: false }),
+        .status(authorized ? 429 : smsWebhookStatus(false))
+        .json({ ok: false, error: authorized ? 'SMS webhook rate limit exceeded.' : 'Unauthorized.' });
+    },
   });
   const getCheckoutClient = () => requestTransaction.getStore()?.client;
   const recordUtrAttempt = async (
@@ -1363,7 +1368,7 @@ async function startServer() {
     res.setHeader('Cache-Control', 'no-store');
     const providedSecret = String(req.get('x-secret') || '');
     if (!isValidSmsSecret(providedSecret)) {
-      res.status(403).json({ error: 'Forbidden.' });
+      res.status(smsWebhookStatus(false)).json({ error: 'Unauthorized.' });
       return;
     }
 
@@ -1373,36 +1378,18 @@ async function startServer() {
       .split(',')
       .map((keyword) => keyword.trim().toLocaleLowerCase())
       .filter(Boolean);
-    if (
-      !sender ||
-      !senderKeywords.some((keyword) => sender.toLocaleLowerCase().includes(keyword)) ||
-      !/\b(?:credited|received)\b/i.test(message)
-    ) {
+    console.log('[sms-webhook] received', { sender });
+    const parsedSms = parseCreditedSms(sender, message, senderKeywords);
+    if (!parsedSms.ok) {
+      console.log('[sms-webhook] skipped', { sender, reason: parsedSms.reason });
+      if (parsedSms.reason === 'parse_failed' || parsedSms.reason === 'invalid_amount') {
+        console.warn('[sms-webhook] could not parse credit message', { sender, message });
+      }
       res.status(200).json({ ok: true, ignored: true });
       return;
     }
-
-    const amountMatch = message.match(
-      /(?:₹|INR|Rs\.?)\s*((?:\d{1,3}(?:,\d{3})+|\d{1,2}(?:,\d{2})*,\d{3}|\d+)(?:\.\d{1,2})?)/i
-    );
-    const utrMatch = message.match(
-      /(?:UTR|REF(?:ERENCE)?|RRN)\s*(?:NO\.?|NUMBER)?\s*[:#-]?\s*(?<!\d)(\d{12})(?!\d)/i
-    );
-    let amountPaise: number | null = null;
-    if (amountMatch) {
-      const [rupeesText, fraction = ''] = amountMatch[1].replace(/,/g, '').split('.');
-      try {
-        const paise = BigInt(rupeesText) * 100n + BigInt(fraction.padEnd(2, '0') || '0');
-        if (paise > 0n && paise <= 2_147_483_647n) amountPaise = Number(paise);
-      } catch {
-        amountPaise = null;
-      }
-    }
-    if (!amountPaise || !utrMatch) {
-      console.warn('Unparsed SMS webhook message:', { sender, message });
-      res.status(200).json({ ok: true, parsed: false });
-      return;
-    }
+    const { utr, amountPaise } = parsedSms.payment;
+    console.log('[sms-webhook] parsed', { utr, amountPaise });
 
     const client = getCheckoutClient();
     if (!postgresPool || !client) {
@@ -1416,12 +1403,15 @@ async function startServer() {
         `INSERT INTO payments (utr, amount_paise, received_at, raw_message)
          VALUES ($1, $2, clock_timestamp(), $3)
          ON CONFLICT (utr) DO NOTHING`,
-        [utrMatch[1], amountPaise, message]
+        [utr, amountPaise, message]
       );
       const savedPayment = await client.query<{ amount_paise: number }>(
         'SELECT amount_paise FROM payments WHERE utr = $1',
-        [utrMatch[1]]
+        [utr]
       );
+      if (savedPayment.rows[0]?.amount_paise !== amountPaise) {
+        console.log('[sms-webhook] skipped', { utr, reason: 'duplicate_utr_amount_mismatch' });
+      }
       const orderResult = await client.query<{
         id: string;
         status: PaymentStatus;
@@ -1430,7 +1420,7 @@ async function startServer() {
         created_at: Date;
         delivered: number;
       }>('SELECT id, status, utr, amount_paise, created_at, delivered FROM orders WHERE utr = $1 FOR UPDATE', [
-        utrMatch[1],
+        utr,
       ]);
       const matchedOrder = orderResult.rows[0];
       let result = 'unmatched';
@@ -1445,7 +1435,7 @@ async function startServer() {
             amountPaise: matchedOrder.amount_paise,
             createdAt: matchedOrder.created_at,
           },
-          { utr: utrMatch[1], amountPaise, receivedAt }
+          { utr, amountPaise, receivedAt }
         );
         if (
           savedPayment.rows[0]?.amount_paise !== amountPaise ||
@@ -1456,9 +1446,10 @@ async function startServer() {
           result = 'received_before_order';
         } else if (matchedOrder.status === 'paid' || matchedOrder.delivered !== 0) {
           result = 'ignored_already_paid';
+          console.log('[sms-webhook] skipped', { utr, orderId: matchedOrder.id, reason: 'already_delivered' });
           await client.query(
             'UPDATE payments SET used_order_id = $2 WHERE utr = $1 AND used_order_id IS NULL',
-            [utrMatch[1], matchedOrder.id]
+            [utr, matchedOrder.id]
           );
         } else if (matchedOrder.status === 'utr_submitted') {
           const delivery = await deliverSubmittedPayment(client, matchedOrder.id, 'sms');
@@ -1474,7 +1465,11 @@ async function startServer() {
       await client.query(
         `INSERT INTO sms_payment_logs (utr, amount_paise, received_at, order_id, result, raw_message)
          VALUES ($1, $2, $3, $4, $5, $6)`,
-        [utrMatch[1], amountPaise, receivedAt, orderId, result, message]
+        [utr, amountPaise, receivedAt, orderId, result, message]
+      );
+      console.log(
+        delivered ? '[sms-webhook] delivered' : matchedOrder ? '[sms-webhook] matched' : '[sms-webhook] skipped',
+        { utr, orderId, result }
       );
       if (delivered) {
         await saveDb(db);
@@ -2574,8 +2569,18 @@ async function startServer() {
            jsonb_array_elements(COALESCE(state->'orders', '[]'::jsonb))
              WITH ORDINALITY AS expanded_orders(item, ordinal)
          ),
+         normalized_order_rows AS (
+           SELECT order_rows.item || jsonb_build_object(
+             'utrNumber',
+             COALESCE(NULLIF(payment_order.utr, ''), NULLIF(order_rows.item->>'utrNumber', ''), '')
+           ) AS item,
+           order_rows.ordinal
+           FROM order_rows
+           LEFT JOIN orders AS payment_order
+             ON payment_order.id = order_rows.item->>'orderId'
+         ),
          filtered_orders AS (
-           SELECT item, ordinal FROM order_rows
+           SELECT item, ordinal FROM normalized_order_rows
            WHERE ($3 = 'all' OR item->>'status' = $3)
              AND ($4 = '' OR POSITION(LOWER($4) IN LOWER(CONCAT_WS(' ',
                item->>'orderId', item->>'utrNumber', item->>'customerReference',
@@ -3070,22 +3075,21 @@ async function startServer() {
         }
         const updated = await client.query(
           `UPDATE orders SET status = 'rejected'
-           WHERE id = $1 AND delivered = 0 AND status = 'utr_submitted'
+           WHERE id = $1 AND delivered = 0
+             AND status IN ('utr_submitted', 'pending')
+             AND utr ~ '^[0-9]{12}$'
            RETURNING id`,
           [order.orderId]
         );
         if (updated.rowCount !== 1) {
-          res.status(409).json({ error: 'Only unpaid submitted orders can be rejected.' });
+          res.status(409).json({
+            error: 'This order is already delivered or has no submitted UTR to reject.',
+          });
           return;
         }
       }
       const now = new Date().toISOString();
-      order.status = 'rejected';
-      order.paymentStatus = 'rejected';
-      order.adminNote =
-        'Payment UTR could not be verified. Please contact support with payment screenshot.';
-      order.updatedAt = now;
-      releaseStock(db.vault, order.orderId, now);
+      rejectOrderAndReleaseStock(order, db.vault, order.orderId, now);
       syncVaultDisplayCounter(getVaultPoolForPackType(order.packType));
       if (!(await persistDbOrRespond(res))) return;
       broadcastStateUpdate('order_rejected', { order });
@@ -3093,10 +3097,7 @@ async function startServer() {
 
       res.json({ order });
     } catch (error) {
-      console.error(
-        'Failed to reject UPI order:',
-        error instanceof Error ? error.message : String(error)
-      );
+      console.error('Failed to reject UPI order:', error);
       res.status(500).json({ error: 'The order could not be rejected right now.' });
     }
   });

@@ -5,8 +5,11 @@ import {
   deliverOnce,
   isOrderExpired,
   matchesSmsPayment,
+  parseCreditedSms,
+  rejectOrderAndReleaseStock,
   releaseStock,
   reserveStock,
+  smsWebhookStatus,
   submitUtr,
   type DeliveryState,
 } from '../src/paymentDelivery.ts';
@@ -122,6 +125,69 @@ test('A matching SMS delivers credentials only once', () => {
   assert.deepEqual(state, { delivered: true, status: 'paid' });
 });
 
+test('SMS parsing accepts configured credit messages and skips debit and OTP messages', () => {
+  const keywords = ['airtel', 'airpay'];
+  assert.deepEqual(
+    parseCreditedSms(
+      'AIRTELBANK',
+      'INR 49.00 credited. UTR 123456789012',
+      keywords
+    ),
+    { ok: true, payment: { utr: '123456789012', amountPaise: 4900 } }
+  );
+  assert.deepEqual(
+    parseCreditedSms(
+      'AIRTELBANK',
+      'INR 49.00 debited. UTR 123456789012',
+      keywords
+    ),
+    { ok: false, reason: 'debit_message' }
+  );
+  assert.deepEqual(
+    parseCreditedSms(
+      'AIRTELBANK',
+      'OTP 123456 sent for INR 49.00 received. UTR 123456789012',
+      keywords
+    ),
+    { ok: false, reason: 'otp_message' }
+  );
+  assert.deepEqual(
+    parseCreditedSms('OTHERBANK', 'INR 49 credited UTR 123456789012', keywords),
+    { ok: false, reason: 'sender_not_allowed' }
+  );
+});
+
+test('Missing or incorrect SMS webhook authorization maps to HTTP 401', () => {
+  assert.equal(smsWebhookStatus(false), 401);
+  assert.equal(smsWebhookStatus(true), 200);
+});
+
+test('An unmatched SMS can be matched and delivered when its UTR is submitted later', () => {
+  const storedPayment = {
+    utr: '123456789012',
+    amountPaise: 4900,
+    receivedAt: new Date('2026-10-27T12:01:00.000Z'),
+  };
+  const order = {
+    utr: storedPayment.utr,
+    amountPaise: storedPayment.amountPaise,
+    createdAt: new Date('2026-10-27T12:00:00.000Z'),
+  };
+  const state: DeliveryState = { delivered: false, status: 'draft' };
+  let credentialAssignments = 0;
+
+  assert.equal(submitUtr(state), true);
+  assert.equal(matchesSmsPayment(order, storedPayment), true);
+  assert.equal(
+    deliverOnce(state, 'sms', () => {
+      credentialAssignments += 1;
+      return true;
+    }),
+    'delivered'
+  );
+  assert.equal(credentialAssignments, 1);
+});
+
 test('Manual delivery followed by SMS does not assign a second ID', () => {
   const state: DeliveryState = { delivered: false, status: 'utr_submitted' };
   let credentialAssignments = 0;
@@ -142,8 +208,20 @@ test('Rejecting an order immediately releases its reserved stock', () => {
   assert.equal(reserveStock(vault, 'permanent', 'order-1', 1), true);
   assert.equal(vault.filter((item) => !item.isAssigned && !item.reservedOrderId).length, 0);
 
-  assert.equal(releaseStock(vault, 'order-1'), 1);
+  const order = {
+    status: 'pending_verification',
+    paymentStatus: 'utr_submitted',
+    adminNote: '',
+    updatedAt: '',
+  };
+  assert.equal(rejectOrderAndReleaseStock(order, vault, 'order-1', '2026-10-27T12:00:00.000Z'), true);
+  assert.equal(order.status, 'rejected');
+  assert.equal(order.paymentStatus, 'rejected');
   assert.equal(vault.filter((item) => !item.isAssigned && !item.reservedOrderId).length, 1);
+  assert.equal(
+    rejectOrderAndReleaseStock(order, vault, 'order-1', '2026-10-27T12:01:00.000Z'),
+    false
+  );
 });
 
 test('Draft cleanup expires only drafts past their 15-minute deadline', () => {

@@ -16,6 +16,14 @@ services:
         value: /var/data
       - key: DATABASE_URL
         sync: false
+      - key: UPI_ID
+        sync: false
+      - key: PAYEE_NAME
+        sync: false
+      - key: SMS_SECRET
+        sync: false
+      - key: SMS_SENDER_KEYWORDS
+        sync: false
       - key: ADMIN_PASSWORD
         sync: false
       - key: ADMIN_RECOVERY_KEY

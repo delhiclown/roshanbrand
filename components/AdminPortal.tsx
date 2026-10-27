@@ -131,6 +131,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   const [newVaultPool, setNewVaultPool] = useState<VaultPoolType>('rental_24h');
   const [addingVault, setAddingVault] = useState(false);
   const [orderErrors, setOrderErrors] = useState<Record<string, string>>({});
+  const [manualPaymentMessages, setManualPaymentMessages] = useState<Record<string, string>>({});
 
   const [formConfig, setFormConfig] = useState<StoreConfig>(storeConfig);
   const [rentalPriceInput, setRentalPriceInput] = useState(
@@ -430,21 +431,32 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     ).trim();
 
     setBusyOrderId(order.orderId);
+    setManualPaymentMessages((previous) => ({ ...previous, [order.orderId]: '' }));
     try {
-      const res = await fetch(`/api/admin/orders/${order.orderId}/verify`, {
+      const res = await fetch('/api/admin/mark-paid', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ deliveredCredentials: credentials }),
+        body: JSON.stringify({ orderId: order.orderId, deliveredCredentials: credentials }),
       });
-      if (res.ok) {
-        setOrderErrors((prev) => ({ ...prev, [order.orderId]: '' }));
+      const data = await res.json();
+      if (!res.ok) {
+        setOrderErrors((previous) => ({
+          ...previous,
+          [order.orderId]: data.error || 'Could not mark this order paid and deliver its ID.',
+        }));
+      } else if (data.alreadyDelivered) {
+        setManualPaymentMessages((previous) => ({
+          ...previous,
+          [order.orderId]: 'Already delivered.',
+        }));
         await fetchAdminState(false, true);
       } else {
-        const data = await res.json();
-        setOrderErrors((prev) => ({
-          ...prev,
-          [order.orderId]: data.error || 'Could not deliver credentials for this order.',
+        setOrderErrors((prev) => ({ ...prev, [order.orderId]: '' }));
+        setManualPaymentMessages((previous) => ({
+          ...previous,
+          [order.orderId]: 'Payment manually confirmed and ID delivered.',
         }));
+        await fetchAdminState(false, true);
       }
     } catch {
       setOrderErrors((prev) => ({
@@ -1445,20 +1457,27 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                                 {orderErrors[order.orderId]}
                               </p>
                             )}
+                            {manualPaymentMessages[order.orderId] && (
+                              <p className="text-xs text-emerald-300" role="status">
+                                {manualPaymentMessages[order.orderId]}
+                              </p>
+                            )}
 
                             <div className="flex flex-wrap items-center gap-2 pt-1">
                               <button
                                 type="button"
                                 disabled={
-                                  busyOrderId === order.orderId || order.status === 'rejected'
+                                  busyOrderId === order.orderId ||
+                                  order.status === 'rejected' ||
+                                  order.status === 'verified_delivered'
                                 }
                                 onClick={() => handleVerifyOrder(order)}
                                 className="flex-1 py-2.5 px-3 rounded-xl text-white font-extrabold text-xs store-pay-pill disabled:opacity-50 flex items-center justify-center gap-1.5 cursor-pointer"
                               >
                                 <CheckCircle2 className="w-3.5 h-3.5" />
                                 {order.status === 'verified_delivered'
-                                  ? 'Update Delivered Vault ID'
-                                  : 'Confirm Received Payment & Deliver ID'}
+                                  ? 'Already delivered'
+                                  : 'Update Delivered Vault ID'}
                               </button>
 
                               {order.status === 'pending_verification' && (

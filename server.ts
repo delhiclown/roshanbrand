@@ -6,6 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { Pool } from 'pg';
+import { rateLimit } from 'express-rate-limit';
 import { createServer as createViteServer } from 'vite';
 import { DEFAULT_STORE_CONFIG, LIMITS } from './src/constants.ts';
 import {
@@ -17,6 +18,7 @@ import {
   VaultItem,
   VaultPoolType,
 } from './src/types.ts';
+import { deliverOnce } from './src/paymentDelivery.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -236,6 +238,50 @@ async function initializePersistence(db: PersistedDatabase): Promise<void> {
     CREATE TABLE IF NOT EXISTS roshanbrand_admin_sessions (
       token_hash TEXT PRIMARY KEY,
       expires_at TIMESTAMPTZ NOT NULL
+    )
+  `);
+  await postgresPool.query(`
+    CREATE TABLE IF NOT EXISTS orders (
+      id TEXT PRIMARY KEY,
+      product TEXT NOT NULL,
+      quantity INTEGER NOT NULL CHECK (quantity > 0),
+      amount_paise INTEGER NOT NULL CHECK (amount_paise > 0),
+      status TEXT NOT NULL CHECK (status IN ('pending', 'paid', 'expired')),
+      utr TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at TIMESTAMPTZ NOT NULL,
+      delivered SMALLINT NOT NULL DEFAULT 0 CHECK (delivered IN (0, 1)),
+      pack_label TEXT NOT NULL,
+      customer_reference TEXT NOT NULL,
+      custom_spec TEXT NOT NULL
+    )
+  `);
+  await postgresPool.query(`
+    CREATE TABLE IF NOT EXISTS payments (
+      utr TEXT PRIMARY KEY,
+      amount_paise INTEGER NOT NULL CHECK (amount_paise > 0),
+      received_at TIMESTAMPTZ NOT NULL,
+      used_order_id TEXT REFERENCES orders(id),
+      raw_message TEXT NOT NULL
+    )
+  `);
+  await postgresPool.query(`
+    CREATE TABLE IF NOT EXISTS verify_attempts (
+      order_id TEXT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+      client_key TEXT NOT NULL,
+      failed_attempts INTEGER NOT NULL DEFAULT 0,
+      blocked_until TIMESTAMPTZ,
+      last_utr TEXT,
+      PRIMARY KEY (order_id, client_key)
+    )
+  `);
+  await postgresPool.query('ALTER TABLE verify_attempts ADD COLUMN IF NOT EXISTS last_utr TEXT');
+  await postgresPool.query(`
+    CREATE TABLE IF NOT EXISTS manual_payment_logs (
+      id BIGSERIAL PRIMARY KEY,
+      order_id TEXT NOT NULL,
+      action_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      source TEXT NOT NULL CHECK (source = 'manual')
     )
   `);
 
@@ -551,12 +597,83 @@ function allocateCredentials(
   return allocatedLines.join('\n');
 }
 
+function deliverOrder(
+  order: OrderRecord,
+  source: 'sms' | 'manual',
+  requestedCredentials = ''
+): boolean {
+  let credentials: string | null;
+  if (requestedCredentials.trim()) {
+    const targetPool = getVaultPoolForPackType(order.packType);
+    const credentialLines = requestedCredentials
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const matchedItems = credentialLines.map((line) => {
+      const username = (line.split(/[|:,]/)[0] || '').replace(/^Username:\s*/i, '').trim();
+      return db.vault.find(
+        (item) =>
+          item.poolType === targetPool &&
+          item.irctcUsername === username &&
+          ((!item.isAssigned && (!item.reservedOrderId || item.reservedOrderId === order.orderId)) ||
+            item.assignedOrderId === order.orderId)
+      );
+    });
+    if (
+      credentialLines.length !== order.quantity ||
+      matchedItems.some((item) => !item) ||
+      new Set(matchedItems.map((item) => item?.vaultId)).size !== order.quantity
+    ) {
+      return false;
+    }
+
+    const nowIso = new Date().toISOString();
+    credentials = matchedItems
+      .map((item) => {
+        if (!item) return '';
+        item.isAssigned = true;
+        item.assignedOrderId = order.orderId;
+        item.reservedOrderId = undefined;
+        item.updatedAt = nowIso;
+        return `Username: ${item.irctcUsername} | Password: ${item.irctcPassword}${
+          item.accountNote ? ` | ${item.accountNote}` : ''
+        }`;
+      })
+      .join('\n');
+  } else {
+    credentials = allocateCredentials(order.quantity, order.packType, order.orderId);
+  }
+  if (credentials === null) return false;
+
+  const now = new Date();
+  order.status = 'verified_delivered';
+  order.deliveredCredentials = sanitizeDeliveredCredentials(credentials).slice(
+    0,
+    LIMITS.CREDENTIALS_MAX
+  );
+  order.updatedAt = now.toISOString();
+  order.verifiedAt ||= now.toISOString();
+  if (order.isRental24h && !order.rentalExpiresAt) {
+    order.rentalExpiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString();
+  }
+  order.adminNote = source === 'manual'
+    ? 'Payment manually confirmed by admin; Ready Vault ID delivered.'
+    : 'Payment verified from SMS notification; Ready Vault ID delivered.';
+
+  if (!db.orders.some((existing) => existing.orderId === order.orderId)) {
+    db.orders.unshift(order);
+  }
+  if (order.utrNumber) db.utrIndex[order.utrNumber] = order.orderId;
+  return true;
+}
+
 /**
  * Preview what credentials will be used for an order from Ready Vault without mutating state yet.
  */
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
+  app.set('trust proxy', process.env.NODE_ENV === 'production' ? 1 : false);
 
   if (process.env.NODE_ENV === 'production' && !postgresPool) {
     throw new Error('DATABASE_URL is required when NODE_ENV is production.');
@@ -592,6 +709,17 @@ async function startServer() {
     await saveDb(db);
   }
   app.use(express.json({ limit: '2mb' }));
+  app.use((req, _res, next) => {
+    if (
+      req.path === '/create-order' ||
+      req.path === '/sms-webhook' ||
+      req.path === '/verify-utr' ||
+      /^\/order-status\/[^/]+$/.test(req.path)
+    ) {
+      req.url = `/api${req.url}`;
+    }
+    next();
+  });
 
   app.use('/api', async (req, res, next) => {
     if (!postgresPool) {
@@ -787,6 +915,531 @@ async function startServer() {
       next(error);
     }
   };
+
+  const isValidSmsSecret = (providedSecret: string) => {
+    const configuredSecret = process.env.SMS_SECRET || '';
+    return configuredSecret.length > 0 &&
+      timingSafeEqual(
+        createHash('sha256').update(providedSecret).digest(),
+        createHash('sha256').update(configuredSecret).digest()
+      );
+  };
+  const createOrderLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+  });
+  const verifyUtrLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+  });
+  const orderStatusLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+  });
+  const smsWebhookLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: 120,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (req, res) =>
+      res
+        .status(isValidSmsSecret(String(req.get('x-secret') || '')) ? 200 : 403)
+        .json({ ok: false }),
+  });
+  const getCheckoutClient = () => requestTransaction.getStore()?.client;
+  const recordUtrAttempt = async (
+    client: import('pg').PoolClient,
+    orderId: string,
+    clientKey: string,
+    utr: string
+  ) => {
+    const result = await client.query<{ failed_attempts: number; blocked_until: Date | null }>(
+      `INSERT INTO verify_attempts (order_id, client_key, failed_attempts, last_utr)
+       VALUES ($1, $2, 1, $3)
+       ON CONFLICT (order_id, client_key) DO UPDATE SET
+         failed_attempts = CASE
+           WHEN verify_attempts.blocked_until IS NOT NULL
+             AND verify_attempts.blocked_until <= NOW() THEN 1
+           WHEN verify_attempts.last_utr = $3 THEN verify_attempts.failed_attempts
+           ELSE verify_attempts.failed_attempts + 1
+         END,
+         blocked_until = CASE
+           WHEN verify_attempts.blocked_until IS NOT NULL
+             AND verify_attempts.blocked_until <= NOW() THEN NULL
+           WHEN verify_attempts.last_utr = $3 THEN verify_attempts.blocked_until
+           WHEN verify_attempts.failed_attempts + 1 >= 5 THEN NOW() + INTERVAL '10 minutes'
+           ELSE verify_attempts.blocked_until
+         END,
+         last_utr = $3
+       RETURNING failed_attempts, blocked_until`,
+      [orderId, clientKey, utr]
+    );
+    return result.rows[0];
+  };
+  const commitCheckoutTransaction = async () => {
+    const transaction = requestTransaction.getStore();
+    if (transaction && !transaction.committed) {
+      await transaction.client.query('COMMIT');
+      transaction.committed = true;
+    }
+  };
+
+  app.post('/api/create-order', createOrderLimiter, async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const client = getCheckoutClient();
+    if (!postgresPool || !client) {
+      res.status(503).json({ error: 'Payment database is not configured.' });
+      return;
+    }
+
+    const { UPI_ID, PAYEE_NAME } = process.env;
+    if (
+      !UPI_ID ||
+      !PAYEE_NAME ||
+      !LIMITS.UPI_ID_REGEX.test(UPI_ID.trim()) ||
+      PAYEE_NAME.trim().length < 2 ||
+      PAYEE_NAME.trim().length > LIMITS.PAYEE_NAME_MAX
+    ) {
+      res.status(503).json({ error: 'UPI_ID and PAYEE_NAME must be configured on the server.' });
+      return;
+    }
+
+    const body = req.body || {};
+    const product = String(body.product || '');
+    const quantity = Number(body.quantity);
+    if (
+      !isPackType(product) ||
+      !Number.isInteger(quantity) ||
+      quantity < LIMITS.QUANTITY_MIN ||
+      quantity > LIMITS.QUANTITY_MAX
+    ) {
+      res.status(400).json({ error: 'Invalid product or quantity.' });
+      return;
+    }
+
+    let unitPrice: number;
+    switch (product) {
+      case 'pack_1':
+        if (quantity !== 1) {
+          res.status(400).json({ error: 'The 1-ID package requires quantity 1.' });
+          return;
+        }
+        unitPrice = db.storeConfig.price1Id;
+        break;
+      case 'pack_2':
+        if (quantity !== 2) {
+          res.status(400).json({ error: 'The 2-ID package requires quantity 2.' });
+          return;
+        }
+        unitPrice = db.storeConfig.price2Id / quantity;
+        break;
+      case 'pack_5':
+        if (quantity !== 5) {
+          res.status(400).json({ error: 'The 5-ID package requires quantity 5.' });
+          return;
+        }
+        unitPrice = db.storeConfig.price5Id / quantity;
+        break;
+      case 'pack_10':
+        if (quantity !== 10) {
+          res.status(400).json({ error: 'The 10-ID package requires quantity 10.' });
+          return;
+        }
+        unitPrice = db.storeConfig.price10Id / quantity;
+        break;
+      case 'bulk':
+        unitPrice = db.storeConfig.priceBulkPerId;
+        break;
+      case 'custom':
+        unitPrice = db.storeConfig.priceCustomPerId;
+        break;
+      case 'rental_24h':
+        unitPrice = db.storeConfig.priceRental24h;
+        break;
+      case 'guarantee_7days':
+        unitPrice = db.storeConfig.price7DayGuaranteePerId;
+        break;
+      case 'guarantee_1month':
+        unitPrice = db.storeConfig.price1MonthGuaranteePerId;
+        break;
+    }
+    const amountRupees = Math.round(unitPrice * quantity);
+    if (!Number.isSafeInteger(amountRupees) || amountRupees < 1 || amountRupees > 5_000_000) {
+      res.status(400).json({ error: 'Order total is outside the allowed range.' });
+      return;
+    }
+
+    const isRental24h = product === 'rental_24h';
+    const availableStock =
+      isRental24h
+        ? db.storeConfig.rentalStockDisplayAvailable
+        : product === 'guarantee_7days'
+          ? db.storeConfig.stock7DayGuaranteeAvailable
+          : product === 'guarantee_1month'
+            ? db.storeConfig.stock1MonthGuaranteeAvailable
+            : db.storeConfig.stockDisplayAvailable;
+    const targetPool = getVaultPoolForPackType(product);
+    const availableVaultItems = db.vault.filter(
+      (item) =>
+        !item.isAssigned &&
+        item.poolType === targetPool &&
+        !item.reservedOrderId
+    );
+    if (quantity > availableVaultItems.length || quantity > availableStock) {
+      res.status(409).json({ error: 'Not enough stock is available for this package.' });
+      return;
+    }
+
+    const orderId = `RB_${Date.now()}_${randomBytes(6).toString('hex').toUpperCase()}`;
+    const accessToken = randomBytes(32).toString('hex');
+    const createdAt = new Date();
+    const expiresAt = new Date(createdAt.getTime() + 30 * 60 * 1000);
+    const packLabel = String(body.packLabel || `${quantity} ${product} ID Pack`).trim().slice(0, 80);
+    const customerReference = String(body.customerReference || 'Direct UPI Buyer')
+      .trim()
+      .slice(0, LIMITS.CUSTOMER_REF_MAX);
+    const customSpec = String(body.customSpec || '').trim().slice(0, LIMITS.CUSTOM_SPEC_MAX);
+    const amountPaise = amountRupees * 100;
+    const upiLink = `upi://pay?${new URLSearchParams({
+      pa: UPI_ID.trim(),
+      pn: PAYEE_NAME.trim(),
+      am: amountRupees.toFixed(2),
+      cu: 'INR',
+      tn: orderId,
+    }).toString()}`;
+
+    try {
+      await client.query(
+        `INSERT INTO orders
+          (id, product, quantity, amount_paise, status, created_at, expires_at,
+           pack_label, customer_reference, custom_spec)
+         VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9)`,
+        [orderId, product, quantity, amountPaise, createdAt, expiresAt, packLabel, customerReference, customSpec]
+      );
+      for (const item of availableVaultItems.slice(0, quantity)) {
+        item.reservedOrderId = orderId;
+        item.updatedAt = createdAt.toISOString();
+      }
+      syncVaultDisplayCounter(targetPool);
+      db.orderAccessTokens[orderId] = createHash('sha256').update(accessToken).digest('hex');
+      db.orders.unshift({
+        orderId,
+        packLabel,
+        packType: product,
+        isRental24h,
+        rentalDurationHours: isRental24h ? 24 : undefined,
+        quantity,
+        unitPrice: amountRupees / quantity,
+        totalAmount: amountRupees,
+        paymentUpiId: UPI_ID.trim(),
+        utrNumber: '',
+        upiAppUsed: 'UPI QR',
+        customerReference,
+        customSpec,
+        status: 'pending_verification',
+        deliveredCredentials: '',
+        adminNote: 'Awaiting payment verification.',
+        createdAt: createdAt.toISOString(),
+        updatedAt: createdAt.toISOString(),
+      });
+      await saveDb(db);
+      broadcastStateUpdate('vault_updated', {});
+      setOrderAccessCookie(res, orderId, accessToken);
+      res.status(201).json({
+        orderId,
+        amount: amountRupees,
+        amountPaise,
+        upiLink,
+        upiId: UPI_ID.trim(),
+        payeeName: PAYEE_NAME.trim(),
+        accessToken,
+        expiresAt: expiresAt.toISOString(),
+      });
+    } catch (error) {
+      console.error('Failed to create UPI order:', error);
+      res.status(500).json({ error: 'The order could not be created.' });
+    }
+  });
+
+  app.post('/api/sms-webhook', smsWebhookLimiter, async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const providedSecret = String(req.get('x-secret') || '');
+    if (!isValidSmsSecret(providedSecret)) {
+      res.status(403).json({ error: 'Forbidden.' });
+      return;
+    }
+
+    const sender = String(req.body?.sender || '');
+    const message = String(req.body?.message || '');
+    const senderKeywords = (process.env.SMS_SENDER_KEYWORDS || '')
+      .split(',')
+      .map((keyword) => keyword.trim().toLocaleLowerCase())
+      .filter(Boolean);
+    if (
+      !sender ||
+      !senderKeywords.some((keyword) => sender.toLocaleLowerCase().includes(keyword)) ||
+      !/\b(?:credited|received)\b/i.test(message)
+    ) {
+      res.status(200).json({ ok: true, ignored: true });
+      return;
+    }
+
+    const amountMatch = message.match(
+      /(?:₹|INR|Rs\.?)\s*((?:\d{1,3}(?:,\d{3})+|\d{1,2}(?:,\d{2})*,\d{3}|\d+)(?:\.\d{1,2})?)/i
+    );
+    const utrMatch = message.match(
+      /(?:UTR|REF(?:ERENCE)?|RRN)\s*(?:NO\.?|NUMBER)?\s*[:#-]?\s*(?<!\d)(\d{12})(?!\d)/i
+    );
+    let amountPaise: number | null = null;
+    if (amountMatch) {
+      const [rupeesText, fraction = ''] = amountMatch[1].replace(/,/g, '').split('.');
+      try {
+        const paise = BigInt(rupeesText) * 100n + BigInt(fraction.padEnd(2, '0') || '0');
+        if (paise > 0n && paise <= 2_147_483_647n) amountPaise = Number(paise);
+      } catch {
+        amountPaise = null;
+      }
+    }
+    if (!amountPaise || !utrMatch) {
+      console.warn('Unparsed SMS webhook message:', { sender, message });
+      res.status(200).json({ ok: true, parsed: false });
+      return;
+    }
+
+    const client = getCheckoutClient();
+    if (!postgresPool || !client) {
+      console.error('SMS payment could not be stored because the payment database is unavailable.');
+      res.status(200).json({ ok: false });
+      return;
+    }
+    try {
+      await client.query(
+        `INSERT INTO payments (utr, amount_paise, received_at, raw_message)
+         VALUES ($1, $2, clock_timestamp(), $3)
+         ON CONFLICT (utr) DO NOTHING`,
+        [utrMatch[1], amountPaise, message]
+      );
+      await commitCheckoutTransaction();
+      res.status(200).json({ ok: true });
+    } catch (error) {
+      console.error('Failed to save SMS payment notification:', error);
+      res.status(200).json({ ok: false });
+    }
+  });
+
+  app.post('/api/verify-utr', verifyUtrLimiter, async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const client = getCheckoutClient();
+    if (!postgresPool || !client) {
+      res.status(503).json({ error: 'Payment database is not configured.' });
+      return;
+    }
+    const orderId = String(req.body?.orderId || '').trim();
+    const utr = String(req.body?.utr || '').trim();
+    if (!orderId || orderId.length > 100 || !LIMITS.UTR_REGEX.test(utr)) {
+      res.status(400).json({ error: 'A valid order ID and 12-digit UTR are required.' });
+      return;
+    }
+
+    try {
+      const orderResult = await client.query<{
+        id: string;
+        product: PackType;
+        quantity: number;
+        amount_paise: number;
+        status: 'pending' | 'paid' | 'expired';
+        utr: string | null;
+        created_at: Date;
+        expires_at: Date;
+        delivered: number;
+        pack_label: string;
+        customer_reference: string;
+        custom_spec: string;
+      }>('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
+      const paymentOrder = orderResult.rows[0];
+      if (!paymentOrder) {
+        res.status(404).json({ error: 'Order not found.' });
+        return;
+      }
+
+      const authorizedToken = getAuthorizedOrderAccessToken(
+        req,
+        orderId,
+        db.orderAccessTokens[orderId],
+        req.body?.accessToken
+      );
+      if (paymentOrder.status === 'paid' || paymentOrder.delivered !== 0) {
+        const deliveredOrder = db.orders.find((order) => order.orderId === orderId);
+        res.json({
+          status: paymentOrder.status,
+          ...(authorizedToken && deliveredOrder ? { order: deliveredOrder } : {}),
+        });
+        return;
+      }
+      if (paymentOrder.status === 'expired' || paymentOrder.expires_at.getTime() <= Date.now()) {
+        if (paymentOrder.status !== 'expired') {
+          await client.query("UPDATE orders SET status = 'expired' WHERE id = $1", [orderId]);
+          for (const item of db.vault) {
+            if (item.reservedOrderId === orderId) {
+              item.reservedOrderId = undefined;
+              item.updatedAt = new Date().toISOString();
+            }
+          }
+          syncVaultDisplayCounter(getVaultPoolForPackType(paymentOrder.product));
+          await saveDb(db);
+          broadcastStateUpdate('vault_updated', {});
+        }
+        res.json({ status: 'expired' });
+        return;
+      }
+
+      const clientKey = createHash('sha256').update(req.ip || 'unknown').digest('hex');
+      const attemptResult = await client.query<{ blocked_until: Date | null }>(
+        'SELECT blocked_until FROM verify_attempts WHERE order_id = $1 AND client_key = $2',
+        [orderId, clientKey]
+      );
+      const blockedUntil = attemptResult.rows[0]?.blocked_until;
+      if (blockedUntil && blockedUntil.getTime() > Date.now()) {
+        res.setHeader('Retry-After', String(Math.ceil((blockedUntil.getTime() - Date.now()) / 1000)));
+        res.status(429).json({ error: 'Too many incorrect UTR attempts. Try again in 10 minutes.' });
+        return;
+      }
+
+      const paymentResult = await client.query<{
+        utr: string;
+        amount_paise: number;
+        received_at: Date;
+        used_order_id: string | null;
+      }>('SELECT utr, amount_paise, received_at, used_order_id FROM payments WHERE utr = $1 FOR UPDATE', [utr]);
+      const payment = paymentResult.rows[0];
+      if (!payment) {
+        const failed = await recordUtrAttempt(client, orderId, clientKey, utr);
+        await commitCheckoutTransaction();
+        if (failed?.blocked_until && failed.blocked_until.getTime() > Date.now()) {
+          res.setHeader('Retry-After', String(Math.ceil((failed.blocked_until.getTime() - Date.now()) / 1000)));
+          res.status(429).json({ error: 'Too many incorrect UTR attempts. Try again in 10 minutes.' });
+          return;
+        }
+        res.json({ status: 'pending' });
+        return;
+      }
+
+      const paymentValid =
+        BigInt(payment.amount_paise) === BigInt(paymentOrder.amount_paise) &&
+        payment.received_at.getTime() > paymentOrder.created_at.getTime() &&
+        payment.used_order_id === null &&
+        !db.orders.some((order) => order.utrNumber === utr);
+      if (!paymentValid) {
+        const failed = await recordUtrAttempt(client, orderId, clientKey, utr);
+        await commitCheckoutTransaction();
+        if (failed?.blocked_until && failed.blocked_until.getTime() > Date.now()) {
+          res.setHeader('Retry-After', String(Math.ceil((failed.blocked_until.getTime() - Date.now()) / 1000)));
+          res.status(429).json({ error: 'Too many incorrect UTR attempts. Try again in 10 minutes.' });
+          return;
+        }
+        res.json({ status: 'pending' });
+        return;
+      }
+
+      const orderCreatedAt = paymentOrder.created_at.toISOString();
+      const verifiedAt = new Date().toISOString();
+      const rentalExpiresAt =
+        paymentOrder.product === 'rental_24h'
+          ? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+          : undefined;
+      const order = db.orders.find((existing) => existing.orderId === orderId) || {
+        orderId,
+        packLabel: paymentOrder.pack_label,
+        packType: paymentOrder.product,
+        isRental24h: paymentOrder.product === 'rental_24h',
+        rentalDurationHours: paymentOrder.product === 'rental_24h' ? 24 : undefined,
+        rentalExpiresAt,
+        quantity: paymentOrder.quantity,
+        unitPrice: Number(paymentOrder.amount_paise) / 100 / paymentOrder.quantity,
+        totalAmount: Number(paymentOrder.amount_paise) / 100,
+        paymentUpiId: process.env.UPI_ID,
+        utrNumber: utr,
+        upiAppUsed: 'UPI QR',
+        customerReference: paymentOrder.customer_reference,
+        customSpec: paymentOrder.custom_spec,
+        status: 'verified_delivered',
+        deliveredCredentials: '',
+        adminNote: 'Payment was verified from the SMS notification.',
+        verifiedAt,
+        createdAt: orderCreatedAt,
+        updatedAt: verifiedAt,
+      };
+      order.utrNumber = utr;
+      order.paymentUpiId = process.env.UPI_ID;
+      const deliveryState = { delivered: paymentOrder.delivered !== 0, status: paymentOrder.status };
+      const deliveryResult = deliverOnce(deliveryState, 'sms', (source) =>
+        deliverOrder(order, source)
+      );
+      if (deliveryResult === 'unavailable') {
+        res.status(409).json({ error: 'Paid order is awaiting available delivery IDs. Please contact support.' });
+        return;
+      }
+      if (deliveryResult === 'already-delivered') {
+        res.json({ status: deliveryState.status });
+        return;
+      }
+
+      const paymentOrderUpdate = await client.query(
+        "UPDATE orders SET status = 'paid', utr = $2, delivered = 1 WHERE id = $1 AND delivered = 0",
+        [orderId, utr]
+      );
+      if (paymentOrderUpdate.rowCount !== 1) {
+        throw new Error(`Payment order ${orderId} was delivered by another transaction.`);
+      }
+      await client.query('UPDATE payments SET used_order_id = $2 WHERE utr = $1 AND used_order_id IS NULL', [
+        utr,
+        orderId,
+      ]);
+      await client.query('DELETE FROM verify_attempts WHERE order_id = $1 AND client_key = $2', [
+        orderId,
+        clientKey,
+      ]);
+      db.orders.unshift(order);
+      db.utrIndex[utr] = orderId;
+      syncVaultDisplayCounter(getVaultPoolForPackType(order.packType));
+      await saveDb(db);
+      broadcastStateUpdate('order_created', { order });
+      broadcastStateUpdate('vault_updated', {});
+      res.json({ status: 'paid', order });
+    } catch (error) {
+      console.error('Failed to verify UPI UTR:', error);
+      res.status(500).json({ error: 'The UTR could not be verified right now.' });
+    }
+  });
+
+  app.get('/api/order-status/:id', orderStatusLimiter, async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const client = getCheckoutClient();
+    if (!postgresPool || !client) {
+      res.status(503).json({ error: 'Payment database is not configured.' });
+      return;
+    }
+    try {
+      const result = await client.query<{ status: 'pending' | 'paid' | 'expired' }>(
+        'SELECT status FROM orders WHERE id = $1',
+        [req.params.id]
+      );
+      if (!result.rows[0]) {
+        res.status(404).json({ status: 'not_found' });
+        return;
+      }
+      res.json({ status: result.rows[0].status });
+    } catch (error) {
+      console.error('Failed to read payment order status:', error);
+      res.status(500).json({ error: 'Order status is temporarily unavailable.' });
+    }
+  });
 
   app.use('/api/admin', (req, res, next) => {
     if (['/auth/status', '/auth/login', '/auth/recover'].includes(req.path)) {
@@ -1888,6 +2541,183 @@ async function startServer() {
     res.json({ claim, order });
   });
 
+  app.post('/api/admin/mark-paid', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const client = getCheckoutClient();
+    const orderId = String(req.body?.orderId || '').trim();
+    if (!postgresPool || !client) {
+      res.status(503).json({ error: 'Payment database is not configured.' });
+      return;
+    }
+    if (!orderId || orderId.length > 100) {
+      res.status(400).json({ error: 'A valid order ID is required.' });
+      return;
+    }
+
+    try {
+      let paymentOrderResult = await client.query<{
+        id: string;
+        product: PackType;
+        quantity: number;
+        amount_paise: number;
+        status: 'pending' | 'paid' | 'expired';
+        utr: string | null;
+        created_at: Date;
+        expires_at: Date;
+        delivered: number;
+        pack_label: string;
+        customer_reference: string;
+        custom_spec: string;
+      }>('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
+      let paymentOrder = paymentOrderResult.rows[0];
+      let order = db.orders.find((existing) => existing.orderId === orderId);
+
+      if (!paymentOrder) {
+        if (!order) {
+          res.status(404).json({ error: 'Order not found.' });
+          return;
+        }
+        if (order.status === 'rejected') {
+          res.status(409).json({ error: 'Rejected orders cannot be manually marked as paid.' });
+          return;
+        }
+        if (!isPackType(order.packType)) {
+          res.status(409).json({ error: 'Order has an invalid product type.' });
+          return;
+        }
+        const amountPaise = Math.round(order.totalAmount * 100);
+        const createdAt = new Date(order.createdAt);
+        if (!Number.isSafeInteger(amountPaise) || amountPaise <= 0 || !Number.isFinite(createdAt.getTime())) {
+          res.status(409).json({ error: 'Order payment details are invalid.' });
+          return;
+        }
+        const expiresAt = new Date(createdAt.getTime() + 30 * 60 * 1000);
+        const status =
+          order.status === 'verified_delivered'
+            ? 'paid'
+            : expiresAt.getTime() <= Date.now()
+              ? 'expired'
+              : 'pending';
+        await client.query(
+          `INSERT INTO orders
+            (id, product, quantity, amount_paise, status, utr, created_at, expires_at,
+             delivered, pack_label, customer_reference, custom_spec)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+           ON CONFLICT (id) DO NOTHING`,
+          [
+            orderId,
+            order.packType,
+            order.quantity,
+            amountPaise,
+            status,
+            order.utrNumber || null,
+            createdAt,
+            expiresAt,
+            order.status === 'verified_delivered' ? 1 : 0,
+            order.packLabel,
+            order.customerReference,
+            order.customSpec,
+          ]
+        );
+        paymentOrderResult = await client.query(
+          'SELECT * FROM orders WHERE id = $1 FOR UPDATE',
+          [orderId]
+        );
+        paymentOrder = paymentOrderResult.rows[0];
+      }
+
+      if (!paymentOrder) {
+        throw new Error(`Could not load payment order ${orderId} after creating its record.`);
+      }
+
+      await client.query(
+        "INSERT INTO manual_payment_logs (order_id, source) VALUES ($1, 'manual')",
+        [orderId]
+      );
+
+      if (paymentOrder.delivered !== 0) {
+        await commitCheckoutTransaction();
+        res.json({ status: 'paid', alreadyDelivered: true });
+        return;
+      }
+
+      if (order?.status === 'rejected') {
+        res.status(409).json({ error: 'Rejected orders cannot be manually marked as paid.' });
+        return;
+      }
+
+      if (!order) {
+        const now = new Date().toISOString();
+        order = {
+          orderId,
+          packLabel: paymentOrder.pack_label,
+          packType: paymentOrder.product,
+          isRental24h: paymentOrder.product === 'rental_24h',
+          rentalDurationHours: paymentOrder.product === 'rental_24h' ? 24 : undefined,
+          quantity: paymentOrder.quantity,
+          unitPrice: paymentOrder.amount_paise / 100 / paymentOrder.quantity,
+          totalAmount: paymentOrder.amount_paise / 100,
+          paymentUpiId: process.env.UPI_ID,
+          utrNumber: paymentOrder.utr || '',
+          upiAppUsed: 'UPI QR',
+          customerReference: paymentOrder.customer_reference,
+          customSpec: paymentOrder.custom_spec,
+          status: 'pending_verification',
+          deliveredCredentials: '',
+          adminNote: 'Awaiting payment verification.',
+          createdAt: paymentOrder.created_at.toISOString(),
+          updatedAt: now,
+        };
+      }
+
+      const verifiedOrderId = order.utrNumber ? db.utrIndex[order.utrNumber] : undefined;
+      if (verifiedOrderId && verifiedOrderId !== orderId) {
+        res.status(409).json({ error: 'This UTR has already been used for another order.' });
+        return;
+      }
+
+      const deliveryState = { delivered: paymentOrder.delivered !== 0, status: paymentOrder.status };
+      const requestedCredentials = String(req.body?.deliveredCredentials || '').trim();
+      const deliveryResult = deliverOnce(deliveryState, 'manual', (source) =>
+        deliverOrder(order!, source, requestedCredentials)
+      );
+      if (deliveryResult === 'already-delivered') {
+        await commitCheckoutTransaction();
+        res.json({ status: deliveryState.status, alreadyDelivered: true });
+        return;
+      }
+      if (deliveryResult === 'unavailable') {
+        await commitCheckoutTransaction();
+        res.status(409).json({
+          error: 'Not enough available IDs in the matching vault pool to deliver this order.',
+        });
+        return;
+      }
+
+      const updated = await client.query(
+        "UPDATE orders SET status = 'paid', delivered = 1, utr = COALESCE(utr, $2) WHERE id = $1 AND delivered = 0",
+        [orderId, order.utrNumber || null]
+      );
+      if (updated.rowCount !== 1) {
+        throw new Error(`Payment order ${orderId} was delivered by another transaction.`);
+      }
+      if (order.utrNumber) {
+        await client.query(
+          'UPDATE payments SET used_order_id = $2 WHERE utr = $1 AND used_order_id IS NULL',
+          [order.utrNumber, orderId]
+        );
+      }
+      syncVaultDisplayCounter(getVaultPoolForPackType(order.packType));
+      await saveDb(db);
+      broadcastStateUpdate('order_verified', { order, source: 'manual' });
+      broadcastStateUpdate('vault_updated', {});
+      res.json({ status: 'paid', alreadyDelivered: false, order });
+    } catch (error) {
+      console.error('Failed to manually mark UPI order as paid:', error);
+      res.status(500).json({ error: 'The order could not be marked paid.' });
+    }
+  });
+
   // Admin 1-Click Verify / Update Order Credentials (Automatically uses Ready ID Vault if not manually overridden)
   app.post('/api/admin/orders/:orderId/verify', async (req, res) => {
     const { orderId } = req.params;
@@ -2176,6 +3006,65 @@ async function startServer() {
     }
     res.json({ ok: true });
   });
+
+  const expirePendingPaymentOrders = async () => {
+    if (!postgresPool) return;
+    const client = await postgresPool.connect();
+    try {
+      await client.query('BEGIN');
+      const stateResult = await client.query<{ state: PersistedDatabase }>(
+        'SELECT state FROM roshanbrand_state WHERE id = 1 FOR UPDATE'
+      );
+      if (!stateResult.rows[0]) throw new Error('Persistent application state is missing.');
+      Object.assign(db, stateResult.rows[0].state);
+      db.orderAccessTokens ||= {};
+      db.guaranteeClaims ||= [];
+
+      const expiredResult = await client.query<{ id: string; product: PackType }>(
+        `UPDATE orders SET status = 'expired'
+         WHERE status = 'pending' AND expires_at <= NOW()
+         RETURNING id, product`
+      );
+      if (expiredResult.rowCount) {
+        const expiredIds = new Set(expiredResult.rows.map((row) => row.id));
+        const expiredPools = new Set(
+          expiredResult.rows.map((row) => getVaultPoolForPackType(row.product))
+        );
+        const now = new Date().toISOString();
+        for (const item of db.vault) {
+          if (item.reservedOrderId && expiredIds.has(item.reservedOrderId)) {
+            item.reservedOrderId = undefined;
+            item.updatedAt = now;
+          }
+        }
+        for (const pool of expiredPools) syncVaultDisplayCounter(pool);
+        const state = JSON.stringify(db);
+        await client.query(
+          'UPDATE roshanbrand_state SET state = $1::jsonb, updated_at = NOW() WHERE id = 1',
+          [state]
+        );
+        await client.query('COMMIT');
+        lastPersistedState = state;
+        broadcastStateUpdate('orders_expired', { count: expiredResult.rowCount });
+        broadcastStateUpdate('vault_updated', {});
+      } else {
+        await client.query('COMMIT');
+      }
+    } catch (error) {
+      await client.query('ROLLBACK').catch((rollbackError: unknown) => {
+        console.error('Failed to rollback order-expiry transaction:', rollbackError);
+      });
+      throw error;
+    } finally {
+      client.release();
+    }
+  };
+  const expiryTimer = setInterval(() => {
+    void expirePendingPaymentOrders().catch((error: unknown) => {
+      console.error('Failed to expire pending payment orders:', error);
+    });
+  }, 60_000);
+  expiryTimer.unref();
 
   // Vite Middleware (Development) or Static Dist (Production)
   if (process.env.NODE_ENV !== 'production') {

@@ -1,16 +1,12 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   AlertCircle,
   Check,
   CheckCircle2,
   ClipboardPaste,
-  Clock,
   Copy,
   Download,
-  KeyRound,
   Loader2,
-  QrCode,
-  ShieldCheck,
   X,
 } from 'lucide-react';
 import { LIMITS } from '../src/constants';
@@ -25,657 +21,396 @@ interface CheckoutModalProps {
   onOrderCreated: (order: OrderRecord, accessToken?: string) => void;
 }
 
-/**
- * Extracts a 12-digit numeric UPI UTR from any raw input or SMS/UPI message text.
- */
-function extract12DigitUtr(raw: string): string | null {
-  const match = raw.match(/\b(\d{12})\b/);
-  if (match && match[1]) return match[1];
-  const digitsOnly = raw.replace(/\D/g, '');
-  if (digitsOnly.length === 12) return digitsOnly;
-  return null;
+interface CreatedPaymentOrder {
+  orderId: string;
+  amount: number;
+  upiLink: string;
+  upiId: string;
+  payeeName: string;
+  accessToken: string;
 }
 
-function getRentalExpiry(order: OrderRecord): Date | null {
-  if (!order.isRental24h) return null;
-  const savedExpiry = order.rentalExpiresAt ? new Date(order.rentalExpiresAt) : null;
-  if (savedExpiry && Number.isFinite(savedExpiry.getTime())) return savedExpiry;
-  const deliveredAt = new Date(order.verifiedAt || order.createdAt);
-  return Number.isFinite(deliveredAt.getTime())
-    ? new Date(deliveredAt.getTime() + 24 * 60 * 60 * 1000)
-    : null;
-}
+const wait = (milliseconds: number) =>
+  new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
 
 export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   draft,
-  activeOrder,
   storeConfig,
   onClose,
   onOrderCreated,
 }) => {
-  const [utrNumber, setUtrNumber] = useState('');
-  const [upiAppUsed, setUpiAppUsed] = useState('Google Pay (GPay)');
-  const [customerRef, setCustomerRef] = useState('');
-  const [customSpec, setCustomSpec] = useState(draft?.initialCustomSpec || '');
-  const [submitting, setSubmitting] = useState(false);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [copiedKey, setCopiedKey] = useState<string | null>(null);
-  const [completedOrder, setCompletedOrder] = useState<OrderRecord | null>(activeOrder);
-  const [orderAccessToken, setOrderAccessToken] = useState('');
-  const [orderAccessTokenUtr, setOrderAccessTokenUtr] = useState('');
+  const [paymentOrder, setPaymentOrder] = useState<CreatedPaymentOrder | null>(null);
+  const [utr, setUtr] = useState('');
+  const [creatingOrder, setCreatingOrder] = useState(true);
+  const [verifying, setVerifying] = useState(false);
+  const [completedOrder, setCompletedOrder] = useState<OrderRecord | null>(null);
+  const [message, setMessage] = useState('');
+  const [error, setError] = useState('');
+  const [copied, setCopied] = useState(false);
+  const verificationRun = useRef(0);
 
-  const submitUtrForReview = useCallback(
-    async (rawUtrToVerify: string) => {
-      if (!draft || submitting || completedOrder) return;
-      setErrorMsg(null);
+  useEffect(() => {
+    let active = true;
+    if (!draft) return () => { active = false; };
 
-      const extracted12 = extract12DigitUtr(rawUtrToVerify);
-      const cleanedUtr = extracted12 || rawUtrToVerify.trim().replace(/\s+/g, '');
-
-      if (!LIMITS.UTR_REGEX.test(cleanedUtr)) {
-        setErrorMsg('Kripya apna valid 12-digit numeric UPI UTR dalein.');
-        return;
-      }
-
-      setSubmitting(true);
-
+    const createOrder = async () => {
       try {
-        const accessCheck = await fetch('/api/orders/access', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ orderId: 'deployment-check', accessToken: '0'.repeat(64) }),
-        });
-        if (accessCheck.status !== 401) {
-          setErrorMsg(
-            'Secure order tracking is not ready yet. Please try again later; do not submit another payment.'
-          );
-          return;
-        }
-
-        const accessToken =
-          (orderAccessTokenUtr === cleanedUtr && orderAccessToken) ||
-          Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) =>
-            byte.toString(16).padStart(2, '0')
-          ).join('');
-        setOrderAccessToken(accessToken);
-        setOrderAccessTokenUtr(cleanedUtr);
-        const response = await fetch('/api/orders/verify-upi', {
+        const response = await fetch('/api/create-order', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            packType: draft.packType,
-            packLabel: draft.packLabel,
-            isRental24h: Boolean(draft.isRental24h),
+            product: draft.packType,
             quantity: draft.quantity,
-            unitPrice: draft.unitPrice,
-            totalAmount: draft.totalAmount,
-            utrNumber: cleanedUtr,
-            accessToken,
-            upiAppUsed,
-            customerReference: customerRef.trim() || 'Direct UPI Buyer',
-            customSpec: customSpec.trim(),
+            packLabel: draft.packLabel,
+            customSpec: draft.initialCustomSpec,
           }),
         });
-
         const data = await response.json();
         if (!response.ok) {
-          setErrorMsg(data.error || 'UTR submission failed. Please check your UTR number.');
-          return;
+          throw new Error(data.error || 'Order create nahi ho saka. Dobara try karein.');
         }
-
-        const order: OrderRecord = data.order;
-        const returnedAccessToken = String(data.accessToken || '');
-        if (returnedAccessToken !== accessToken) {
-          throw new Error('Order was created, but its secure access key was not returned.');
+        if (active) {
+          const createdOrder = data as CreatedPaymentOrder;
+          setPaymentOrder(createdOrder);
+          try {
+            const recent = JSON.parse(localStorage.getItem('roshanbrand_recent_orders') || '[]');
+            const recentIds = Array.isArray(recent)
+              ? recent.filter((id) => typeof id === 'string')
+              : [];
+            localStorage.setItem(
+              'roshanbrand_recent_orders',
+              JSON.stringify(
+                [
+                  createdOrder.orderId,
+                  ...recentIds.filter((id) => id !== createdOrder.orderId),
+                ].slice(0, 10)
+              )
+            );
+          } catch (storageError) {
+            console.error('Could not save recent payment order ID:', storageError);
+          }
         }
-        setOrderAccessToken(returnedAccessToken);
-        try {
-          const recent = JSON.parse(
-            localStorage.getItem('roshanbrand_recent_orders') || '[]'
-          ) as string[];
-          const updated = [order.orderId, ...recent.filter((id) => id !== order.orderId)].slice(
-            0,
-            15
+      } catch (requestError) {
+        if (active) {
+          setError(
+            requestError instanceof Error
+              ? requestError.message
+              : 'Order create nahi ho saka. Dobara try karein.'
           );
-          localStorage.setItem('roshanbrand_recent_orders', JSON.stringify(updated));
-          localStorage.removeItem(`roshanbrand_order_access_${order.orderId}`);
-        } catch {
-          // Order access keys are kept in memory and an HttpOnly cookie.
         }
-
-        setCompletedOrder(order);
-        onOrderCreated(order, returnedAccessToken);
-      } catch (err) {
-        setErrorMsg(
-          err instanceof Error
-            ? err.message
-            : 'Network error while submitting your UTR. Please try again.'
-        );
       } finally {
-        setSubmitting(false);
-      }
-    },
-    [
-      draft,
-      submitting,
-      completedOrder,
-      orderAccessToken,
-      orderAccessTokenUtr,
-      upiAppUsed,
-      customerRef,
-      customSpec,
-      onOrderCreated,
-    ]
-  );
-
-  // Real-time SSE + 1s live sync if order is awaiting 1-click admin verification
-  useEffect(() => {
-    if (!completedOrder || completedOrder.status === 'verified_delivered') return;
-
-    let active = true;
-    const checkLiveStatus = async () => {
-      try {
-        const lookupResponse = await fetch(
-          `/api/orders/lookup?q=${encodeURIComponent(completedOrder.orderId)}`
-        );
-        if (!active || !lookupResponse.ok) return;
-        const lookupData = await lookupResponse.json();
-        let order: OrderRecord = lookupData.order;
-        const accessResponse = await fetch('/api/orders/access', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            orderId: completedOrder.orderId,
-            ...(orderAccessToken ? { accessToken: orderAccessToken } : {}),
-          }),
-        });
-        if (!active || !accessResponse.ok) return;
-        const accessData = await accessResponse.json();
-        order = accessData.order;
-        if (order && order.status !== completedOrder.status) {
-          setCompletedOrder(order);
-          onOrderCreated(order, orderAccessToken);
-        }
-      } catch {
-        // ignore
+        if (active) setCreatingOrder(false);
       }
     };
 
-    const es = new EventSource('/api/events');
-    es.onmessage = () => {
-      checkLiveStatus();
-    };
-
-    const interval = setInterval(checkLiveStatus, 10000);
+    void createOrder();
     return () => {
       active = false;
-      es.close();
-      clearInterval(interval);
+      verificationRun.current += 1;
     };
-  }, [completedOrder, onOrderCreated, orderAccessToken]);
+  }, [draft]);
 
-  useEffect(() => {
-    if (
-      !completedOrder?.isRental24h ||
-      completedOrder.status !== 'verified_delivered' ||
-      completedOrder.credentialsExpired
-    ) {
-      return;
-    }
-    const expiry = getRentalExpiry(completedOrder)?.getTime();
-    if (!expiry) return;
-    const expireCredentials = () => {
-      const expiredOrder = {
-        ...completedOrder,
-        deliveredCredentials: '',
-        credentialsExpired: true,
-      };
-      setCompletedOrder(expiredOrder);
-      onOrderCreated(expiredOrder, orderAccessToken);
-    };
-    const delay = expiry - Date.now();
-    if (delay <= 0) {
-      expireCredentials();
-      return;
-    }
-    const timer = window.setTimeout(expireCredentials, delay);
-    return () => window.clearTimeout(timer);
-  }, [completedOrder, onOrderCreated]);
-
-  if (!draft && !completedOrder) return null;
-
-  const copyText = (text: string, key: string) => {
-    navigator.clipboard.writeText(text);
-    setCopiedKey(key);
-    setTimeout(() => setCopiedKey(null), 1800);
+  const checkUtr = async (order: CreatedPaymentOrder, submittedUtr: string) => {
+    const response = await fetch('/api/verify-utr', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        orderId: order.orderId,
+        utr: submittedUtr,
+        accessToken: order.accessToken,
+      }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'UTR verify nahi ho saka.');
+    return data as { status: string; order?: OrderRecord };
   };
 
-  const downloadCsv = (order: OrderRecord) => {
-    const lines = (order.deliveredCredentials || '')
-      .split('\n')
-      .map((l) => l.trim())
-      .filter(Boolean);
+  const finishAsPaid = (verifiedOrder: OrderRecord, accessToken: string) => {
+    setCompletedOrder(verifiedOrder);
+    setMessage('');
+    onOrderCreated(verifiedOrder, accessToken);
+  };
+
+  const pasteUtr = async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      const extracted = text.match(/(?:UTR|REF(?:ERENCE)?|RRN)\D*(\d{12})/i)?.[1] ||
+        text.match(/\b\d{12}\b/)?.[0];
+      if (!extracted) {
+        setError('Clipboard me 12-digit UTR nahi mila.');
+        return;
+      }
+      setUtr(extracted);
+      setError('');
+    } catch {
+      setError('Clipboard access nahi mila. UTR manually paste ya type karein.');
+    }
+  };
+
+  const copyCredentials = async () => {
+    if (!completedOrder?.deliveredCredentials) return;
+    try {
+      await navigator.clipboard.writeText(completedOrder.deliveredCredentials);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1800);
+    } catch {
+      setError('Clipboard access nahi mila. ID details manually copy karein.');
+    }
+  };
+
+  const downloadCredentials = () => {
+    if (!completedOrder) return;
+    const lines = completedOrder.deliveredCredentials.split('\n').filter(Boolean);
     const csvRows = [
       'Sr,Order_ID,Pack_Type,Account_Credentials,Validity_Expires',
       ...lines.map(
-        (line, idx) =>
-          `${idx + 1},${order.orderId},"${order.packLabel.replace(/"/g, '""')}","${line.replace(
-            /"/g,
-            '""'
-          )}","${
-            order.rentalExpiresAt
-              ? new Date(order.rentalExpiresAt).toLocaleString()
-              : 'Lifetime'
-          }"`
+        (line, index) =>
+          `${index + 1},${completedOrder.orderId},"${completedOrder.packLabel.replace(/"/g, '""')}","${line.replace(/"/g, '""')}","${completedOrder.rentalExpiresAt || ''}"`
       ),
-    ].join('\n');
-
-    const blob = new Blob([csvRows], { type: 'text/csv;charset=utf-8;' });
+    ];
+    const blob = new Blob([csvRows.join('\n')], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${order.orderId}-irctc-credentials.csv`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${completedOrder.orderId}-credentials.csv`;
+    anchor.click();
     URL.revokeObjectURL(url);
   };
 
-  const handlePasteFromClipboard = async () => {
+  const handleVerify = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!paymentOrder || verifying || completedOrder) return;
+    const submittedUtr = utr.trim();
+    if (!LIMITS.UTR_REGEX.test(submittedUtr)) {
+      setError('Kripya apna valid 12-digit numeric UTR dalein.');
+      return;
+    }
+
+    setError('');
+    setMessage('Verification ho rahi hai');
+    setVerifying(true);
+    const run = ++verificationRun.current;
+    const isCurrentRun = () => verificationRun.current === run;
+
     try {
-      const text = await navigator.clipboard.readText();
-      if (text) {
-        const extracted = extract12DigitUtr(text);
-        if (!extracted) {
-          setErrorMsg('Clipboard me 12-digit UTR nahi mila. Apna payment receipt check karein.');
+      const firstCheck = await checkUtr(paymentOrder, submittedUtr);
+      if (firstCheck.status === 'paid' && firstCheck.order) {
+        finishAsPaid(firstCheck.order, paymentOrder.accessToken);
+        return;
+      }
+      if (firstCheck.status === 'expired') {
+        setMessage('Order expire ho gaya. Naya order banane ke liye support se contact karein.');
+        return;
+      }
+
+      const deadline = Date.now() + 3 * 60 * 1000;
+      while (Date.now() < deadline && isCurrentRun()) {
+        await wait(Math.min(5000, deadline - Date.now()));
+        if (!isCurrentRun()) return;
+
+        const statusResponse = await fetch(
+          `/api/order-status/${encodeURIComponent(paymentOrder.orderId)}`,
+          { cache: 'no-store' }
+        );
+        const statusData = await statusResponse.json();
+        if (!statusResponse.ok) {
+          throw new Error(statusData.error || 'Order status check nahi ho saka.');
+        }
+        if (statusData.status === 'expired') {
+          setMessage('Order expire ho gaya. Support se contact karein.');
           return;
         }
-        setUtrNumber(extracted);
+        if (statusData.status === 'paid') {
+          const paidCheck = await checkUtr(paymentOrder, submittedUtr);
+          if (paidCheck.status === 'paid' && paidCheck.order) {
+            finishAsPaid(paidCheck.order, paymentOrder.accessToken);
+            return;
+          }
+        }
       }
-    } catch {
-      setErrorMsg('Clipboard access nahi mila. UTR ko manually paste ya type karein.');
+
+      if (isCurrentRun()) {
+        setMessage('Payment abhi confirm nahi hua. Support se contact karein.');
+      }
+    } catch (requestError) {
+      if (isCurrentRun()) {
+        setError(
+          requestError instanceof Error
+            ? requestError.message
+            : 'UTR verify nahi ho saka. Dobara try karein.'
+        );
+        setMessage('');
+      }
+    } finally {
+      if (isCurrentRun()) setVerifying(false);
     }
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    await submitUtrForReview(utrNumber);
-  };
+  if (!draft) return null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/80 backdrop-blur-md overflow-y-auto">
-      <div className="fixed inset-0" onClick={onClose} />
-
-      <div className="relative z-10 w-full max-w-3xl neon-card-3d border-sky-400/50 overflow-hidden my-auto">
-        {/* Top Modal Header */}
-        <div className="px-5 py-4 border-b border-sky-400/25 flex items-center justify-between bg-slate-950/80">
-          <div className="flex items-center gap-2.5 min-w-0">
-            <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-blue-600 to-cyan-500 text-white flex items-center justify-center shadow-[0_3px_0_#0f296b] shrink-0">
-              {completedOrder ? (
-                <CheckCircle2 className="w-5 h-5 text-emerald-300" />
-              ) : (
-                <QrCode className="w-5 h-5" />
-              )}
-            </div>
-            <div className="min-w-0">
-              <h3 className="text-sm sm:text-base font-extrabold text-white truncate">
-                {completedOrder
-                  ? completedOrder.status === 'verified_delivered'
-                    ? 'Payment Confirmed — IRCTC ID Delivered'
-                    : completedOrder.status === 'rejected'
-                    ? 'Payment UTR Rejected'
-                    : 'UTR Submitted — Payment Review Pending'
-                  : draft?.isRental24h
-                  ? '24-Hour Rental IRCTC ID · UPI Checkout'
-                  : draft?.packType === 'guarantee_7days'
-                  ? 'IRCTC ID · 7 Days Guarantee · UPI Checkout'
-                  : draft?.packType === 'guarantee_1month'
-                  ? 'IRCTC ID · 1 Month Guarantee · UPI Checkout'
-                  : 'UPI Checkout & Manual Payment Confirmation'}
-              </h3>
-              <p className="text-[11px] text-cyan-300/85 truncate">
-                {completedOrder
-                  ? `Order #${completedOrder.orderId} · UTR: ${completedOrder.utrNumber}`
-                  : `Payment sirf ${storeConfig.upiId} par karein; UTR receipt ke baad submit karein.`}
-              </p>
-            </div>
+      <button
+        type="button"
+        aria-label="Close checkout"
+        onClick={onClose}
+        className="fixed inset-0 cursor-default"
+      />
+      <section className="relative z-10 w-full max-w-3xl neon-card-3d border-sky-400/50 overflow-hidden my-auto">
+        <header className="px-5 py-4 border-b border-sky-400/25 flex items-center justify-between bg-slate-950/80">
+          <div>
+            <h2 className="text-lg font-extrabold text-white">
+              {completedOrder ? 'Payment confirmed' : 'UPI Checkout'}
+            </h2>
+            <p className="text-xs text-slate-300 mt-1">
+              {paymentOrder ? `Order #${paymentOrder.orderId}` : 'Secure UPI payment'}
+            </p>
           </div>
-
           <button
             type="button"
             onClick={onClose}
-            className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 cursor-pointer"
-            aria-label="Close modal"
+            className="p-2 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800"
+            aria-label="Close"
           >
-            <X className="w-4 h-4" />
+            <X className="w-5 h-5" />
           </button>
-        </div>
+        </header>
 
-        {/* Completed Order View */}
-        {completedOrder ? (
-          <div className="p-5 sm:p-6 space-y-5">
-            {completedOrder.status === 'verified_delivered' && completedOrder.credentialsExpired ? (
-              <div className="rounded-2xl border border-amber-400/40 bg-amber-950/40 p-4 text-sm text-amber-100">
-                <strong>24-hour rental expired.</strong> The panel no longer displays these credentials. Expiry here does not disable the account in IRCTC.
-              </div>
-            ) : completedOrder.status === 'verified_delivered' ? (
-              <div className="space-y-4">
-                <div className="p-4 rounded-2xl bg-emerald-950/50 border border-emerald-400/50 flex flex-wrap items-center justify-between gap-3">
-                  <div className="flex items-center gap-3">
-                    <div className="w-11 h-11 rounded-xl bg-emerald-500/20 border border-emerald-400/50 text-emerald-300 flex items-center justify-center shrink-0">
-                      <CheckCircle2 className="w-6 h-6" />
-                    </div>
-                    <div>
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <span className="text-sm font-extrabold text-white">
-                          UPI Payment ₹{completedOrder.totalAmount} Confirmed
-                        </span>
-                        <span className="text-[11px] font-mono font-bold text-emerald-300">
-                          UTR {completedOrder.utrNumber}
-                        </span>
-                      </div>
-                      <p className="text-xs text-emerald-200/90 mt-0.5">
-                        {completedOrder.isRental24h
-                          ? `24-Hour Rental Active · Valid until ${
-                              completedOrder.rentalExpiresAt
-                                ? new Date(completedOrder.rentalExpiresAt).toLocaleString()
-                                : '24 Hours from now'
-                            }`
-                          : 'Your IRCTC credentials are ready below.'}
-                      </p>
-                    </div>
-                  </div>
-
-                  {completedOrder.isRental24h && (
-                    <div className="px-3 py-1.5 rounded-xl bg-slate-950/90 border border-emerald-400/40 flex items-center gap-1.5 text-xs font-bold text-emerald-300">
-                      <Clock className="w-3.5 h-3.5 text-emerald-400" />
-                      <span>24H Active Rental</span>
-                    </div>
-                  )}
-                </div>
-
-                <div className="rounded-xl border border-emerald-400/35 bg-emerald-950/25 p-4">
-                  <div className="flex items-center justify-between gap-2 text-xs font-bold text-emerald-300 mb-2">
-                    <div className="flex items-center gap-2">
-                      <KeyRound className="w-4 h-4 text-emerald-400" />
-                      <span>
-                        Your Delivered IRCTC Login ID{completedOrder.quantity > 1 ? 's' : ''} &amp;
-                        Password{completedOrder.quantity > 1 ? 's' : ''}
-                      </span>
-                    </div>
-                    <span className="font-mono text-[11px] text-sky-300">
-                      {completedOrder.packLabel}
-                    </span>
-                  </div>
-                  <pre className="p-3.5 bg-[#060a1d] border border-sky-400/25 rounded-xl font-mono text-xs sm:text-sm text-sky-200 whitespace-pre-wrap break-words leading-relaxed select-all">
-                    {completedOrder.deliveredCredentials}
-                  </pre>
-                  {completedOrder.adminNote && (
-                    <p className="mt-2.5 text-xs text-slate-300">
-                      <span className="font-semibold text-white">Payment status:</span>{' '}
-                      {completedOrder.adminNote}
-                    </p>
-                  )}
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <button
-                    type="button"
-                    onClick={() => copyText(completedOrder.deliveredCredentials, 'all')}
-                    className="h-11 rounded-xl store-pay-pill text-white font-bold text-xs sm:text-sm inline-flex items-center justify-center gap-1.5 cursor-pointer"
-                  >
-                    {copiedKey === 'all' ? (
-                      <>
-                        <Check className="w-4 h-4 text-emerald-300" />
-                        <span>Copied Credentials!</span>
-                      </>
-                    ) : (
-                      <>
-                        <Copy className="w-4 h-4" />
-                        <span>Copy All IDs &amp; Passwords</span>
-                      </>
-                    )}
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => downloadCsv(completedOrder)}
-                    className="h-11 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs sm:text-sm inline-flex items-center justify-center gap-1.5 cursor-pointer transition-colors"
-                  >
-                    <Download className="w-4 h-4" />
-                    <span>Download CSV Backup</span>
-                  </button>
-                </div>
-              </div>
-            ) : (
-              <div className="p-4 rounded-2xl bg-amber-950/45 border border-amber-400/50 space-y-2">
-                <div className="flex items-center gap-2 text-sm font-extrabold text-amber-200">
-                  {completedOrder.status === 'rejected' ? (
-                    <AlertCircle className="w-5 h-5 text-rose-400" />
-                  ) : (
-                    <Clock className="w-5 h-5 text-amber-300" />
-                  )}
-                  <span>
-                    {completedOrder.status === 'rejected'
-                      ? 'Payment UTR rejected'
-                      : 'UTR received — payment confirmation pending'}
-                  </span>
-                </div>
-                <p className="text-xs text-slate-200">
-                  {completedOrder.status === 'rejected'
-                    ? completedOrder.adminNote || 'Please contact support.'
-                    : `Order #${completedOrder.orderId} · ₹${completedOrder.totalAmount} · UTR ${completedOrder.utrNumber}. Credentials release only after an admin confirms this exact payment arrived at ${completedOrder.paymentUpiId || storeConfig.upiId}.`}
-                </p>
-                {completedOrder.status === 'pending_verification' && (
-                  <p className="text-[11px] text-amber-200">
-                    UTR submit karna payment proof nahi hai. Apne payment app ki receipt sambhal kar rakhein.
-                  </p>
-                )}
-                {orderAccessToken && (
-                  <div className="rounded-lg border border-amber-300/30 bg-slate-950/50 p-3 space-y-2">
-                    <p className="text-[11px] font-bold text-amber-100">
-                      Save this private order access key to view your order on another device.
-                    </p>
-                    <div className="flex items-center gap-2">
-                      <code className="min-w-0 flex-1 break-all text-[10px] text-slate-200">
-                        {orderAccessToken}
-                      </code>
-                      <button
-                        type="button"
-                        onClick={() => copyText(orderAccessToken, 'access-key')}
-                        className="shrink-0 rounded-lg border border-amber-300/40 px-2.5 py-1.5 text-[11px] font-bold text-amber-100"
-                      >
-                        {copiedKey === 'access-key' ? 'Copied' : 'Copy key'}
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
-
-            <div className="flex items-center justify-end pt-2 border-t border-white/10">
-              <button
-                type="button"
-                onClick={onClose}
-                className="w-full sm:w-auto px-5 py-2.5 text-xs font-bold text-slate-200 bg-white/10 hover:bg-white/20 rounded-xl transition-colors cursor-pointer"
-              >
-                {completedOrder.status === 'verified_delivered'
-                  ? 'View Order Details'
-                  : 'Done & View on Storefront'}
-              </button>
+        <div className="p-4 sm:p-6 max-h-[82vh] overflow-y-auto">
+          {creatingOrder ? (
+            <div className="flex items-center justify-center gap-2 py-12 text-sky-200">
+              <Loader2 className="w-5 h-5 animate-spin" />
+              <span>Order ban raha hai...</span>
             </div>
-          </div>
-        ) : (
-          draft && (
-            <div className="p-5 sm:p-6 grid grid-cols-1 md:grid-cols-12 gap-6 items-start">
-              <div className="md:col-span-5">
-                <UpiQrBox
-                  upiId={storeConfig.upiId}
-                  payeeName={storeConfig.payeeName}
-                  amount={draft.totalAmount}
-                  orderNote={`${storeConfig.siteTitle} ${
-                    draft.isRental24h
-                      ? '24H Rental'
-                      : draft.packType === 'guarantee_7days'
-                      ? '7 Days Guarantee'
-                      : draft.packType === 'guarantee_1month'
-                      ? '1 Month Guarantee'
-                      : ''
-                  } ${draft.quantity} ID`}
-                />
+          ) : error && !paymentOrder ? (
+            <div className="rounded-xl border border-red-400/40 bg-red-950/40 p-4 text-red-200">
+              <AlertCircle className="inline w-4 h-4 mr-2" />
+              {error}
+            </div>
+          ) : completedOrder ? (
+            <div className="space-y-4">
+              <div className="rounded-xl border border-emerald-400/40 bg-emerald-950/40 p-4 text-emerald-200">
+                <CheckCircle2 className="inline w-5 h-5 mr-2" />
+                Payment verify ho gaya. Aapki ID:
+              </div>
+              <pre className="whitespace-pre-wrap break-words rounded-xl bg-slate-950 border border-emerald-400/30 p-4 text-sm text-white">
+                {completedOrder.deliveredCredentials}
+              </pre>
+              {completedOrder.rentalExpiresAt && (
+                <p className="text-sm text-amber-200">
+                  Rental expires: {new Date(completedOrder.rentalExpiresAt).toLocaleString()}
+                </p>
+              )}
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={() => void copyCredentials()}
+                  className="flex items-center gap-2 rounded-lg border border-sky-400/40 px-3 py-2 text-sm text-sky-200"
+                >
+                  {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                  {copied ? 'Copied' : 'Copy ID details'}
+                </button>
+                <button
+                  type="button"
+                  onClick={downloadCredentials}
+                  className="flex items-center gap-2 rounded-lg border border-sky-400/40 px-3 py-2 text-sm text-sky-200"
+                >
+                  <Download className="w-4 h-4" />
+                  Download CSV
+                </button>
+              </div>
+              <p className="text-xs text-slate-300">
+                Order #{completedOrder.orderId} · UTR {completedOrder.utrNumber}
+              </p>
+            </div>
+          ) : paymentOrder ? (
+            <div className="space-y-5">
+              <div className="text-center rounded-xl border border-emerald-400/30 bg-emerald-950/30 p-3">
+                <div className="text-xs uppercase tracking-wide text-emerald-200">
+                  Exact amount to pay
+                </div>
+                <div className="text-3xl font-extrabold text-white">
+                  ₹{paymentOrder.amount.toLocaleString('en-IN')}
+                </div>
+                <div className="text-xs text-slate-300">{draft.packLabel}</div>
               </div>
 
-              <form onSubmit={handleSubmit} className="md:col-span-7 space-y-4">
-                {/* Package Summary */}
-                <div className="bg-[#091029] border border-sky-400/25 rounded-xl p-3.5 space-y-1.5">
-                  <div className="flex items-center justify-between text-xs text-slate-300">
-                    <span>Selected Package</span>
-                    <span className="font-bold text-white">{draft.packLabel}</span>
-                  </div>
-                  <div className="flex items-center justify-between text-xs text-slate-300">
-                    <span>Quantity &amp; Rate</span>
-                    <span className="font-mono font-bold text-white tabular-nums">
-                      {draft.quantity} IRCTC ID{draft.quantity > 1 ? 's' : ''} (₹
-                      {draft.unitPrice}/ID)
-                    </span>
-                  </div>
-                  {draft.isRental24h && (
-                    <div className="flex items-center justify-between text-xs text-emerald-300 pt-0.5">
-                      <span>Rental Validity</span>
-                      <span className="font-bold flex items-center gap-1">
-                        <Clock className="w-3.5 h-3.5 text-emerald-400" />
-                        24 Hours Full Access (Tatkal &amp; Normal)
-                      </span>
-                    </div>
-                  )}
-                  <div className="pt-2 border-t border-sky-400/20 flex items-center justify-between">
-                    <span className="text-xs font-bold text-sky-200">Total Payable via UPI</span>
-                    <span className="text-lg font-mono font-extrabold text-sky-400 tabular-nums">
-                      ₹{draft.totalAmount.toLocaleString('en-IN')}
-                    </span>
-                  </div>
+              <UpiQrBox
+                upiId={paymentOrder.upiId}
+                payeeName={paymentOrder.payeeName}
+                amount={paymentOrder.amount}
+                orderNote={paymentOrder.orderId}
+                paymentLink={paymentOrder.upiLink}
+              />
+
+              <form onSubmit={handleVerify} className="space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <label htmlFor="payment-utr" className="text-sm font-bold text-white">
+                    Payment receipt ka 12-digit UTR number
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => void pasteUtr()}
+                    className="flex items-center gap-1 text-xs text-sky-300 hover:text-white"
+                  >
+                    <ClipboardPaste className="w-3.5 h-3.5" />
+                    Paste UTR
+                  </button>
                 </div>
-
-                <div className="px-3.5 py-2.5 rounded-xl bg-amber-950/45 border border-amber-400/40 text-xs text-amber-100">
-                  <strong>Manual payment check:</strong> Sirf {storeConfig.upiId} par payment karein.
-                  UTR submit karne se pehle apni UPI receipt me sahi amount aur receiver check karein.
-                </div>
-
-                {errorMsg && (
-                  <div className="p-3 bg-red-500/15 border border-red-400/40 rounded-xl flex items-start gap-2 text-xs text-red-200">
-                    <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
-                    <span>{errorMsg}</span>
-                  </div>
-                )}
-
-                {/* Submit the UTR for a manual payment check. */}
-                <div className="space-y-3">
-                  <div>
-                    <div className="flex items-center justify-between gap-2 mb-1.5">
-                      <label className="block text-xs font-bold text-sky-200">
-                        Enter your 12-digit UPI UTR *
-                      </label>
-                      <div className="flex items-center gap-2">
-                        <button
-                          type="button"
-                          onClick={handlePasteFromClipboard}
-                          className="text-[11px] font-bold text-emerald-300 hover:text-white flex items-center gap-1 cursor-pointer"
-                        >
-                          <ClipboardPaste className="w-3 h-3 text-emerald-400" />
-                          <span>Paste UTR</span>
-                        </button>
-                      </div>
-                    </div>
-
-                    <div className="relative">
-                      <input
-                        type="text"
-                        required
-                        inputMode="numeric"
-                        value={utrNumber}
-                        onChange={(e) => {
-                          setUtrNumber(e.target.value.replace(/\D/g, '').slice(0, 12));
-                        }}
-                        placeholder="Enter 12-digit UTR from your payment receipt"
-                        maxLength={12}
-                        className="w-full px-3.5 py-2.5 pr-24 text-sm font-mono bg-[#070c21] border border-sky-400/40 rounded-xl text-white placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-400/35 focus:border-emerald-400"
-                      />
-                      <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[11px] font-mono font-bold text-emerald-400">
-                        {utrNumber.replace(/\D/g, '').length}/12 digits
-                      </span>
-                    </div>
-
-                    <p className="mt-1 text-[11px] text-slate-400">
-                      UTR submit hone ke baad payment ko {storeConfig.upiId} account me manually check kiya jayega.
-                    </p>
-                  </div>
-
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-xs font-semibold text-slate-300 mb-1">
-                        Paid via UPI App
-                      </label>
-                      <select
-                        value={upiAppUsed}
-                        onChange={(e) => setUpiAppUsed(e.target.value)}
-                        className="w-full px-3 py-2 text-xs bg-[#070c21] border border-sky-400/25 rounded-xl text-white focus:outline-none focus:border-sky-400"
-                      >
-                        <option value="Google Pay (GPay)">Google Pay (GPay)</option>
-                        <option value="PhonePe">PhonePe</option>
-                        <option value="Paytm UPI">Paytm UPI</option>
-                        <option value="BHIM / Bank UPI">BHIM / Bank UPI</option>
-                      </select>
-                    </div>
-
-                    <div>
-                      <label className="block text-xs font-semibold text-slate-300 mb-1">
-                        Your Name / WhatsApp (Optional)
-                      </label>
-                      <input
-                        type="text"
-                        value={customerRef}
-                        onChange={(e) => setCustomerRef(e.target.value)}
-                        placeholder="e.g. Rahul / 98XXXXXX"
-                        maxLength={LIMITS.CUSTOMER_REF_MAX}
-                        className="w-full px-3 py-2 text-xs bg-[#070c21] border border-sky-400/25 rounded-xl text-white placeholder:text-slate-500 focus:outline-none focus:border-sky-400"
-                      />
-                    </div>
-                  </div>
-                </div>
-
-                {submitting && (
-                  <div className="p-3.5 rounded-xl bg-slate-950/90 border border-emerald-400/50 space-y-2">
-                    <div className="flex items-center gap-2 text-xs font-bold text-emerald-300">
-                      <Loader2 className="w-4 h-4 animate-spin text-emerald-400" />
-                      <span>Submitting UTR for payment review...</span>
-                    </div>
-                  </div>
-                )}
-
+                <input
+                  id="payment-utr"
+                  type="text"
+                  inputMode="numeric"
+                  autoComplete="off"
+                  maxLength={12}
+                  value={utr}
+                  onChange={(event) => {
+                    setUtr(event.target.value.replace(/\D/g, '').slice(0, 12));
+                    setError('');
+                  }}
+                  placeholder="12-digit UTR"
+                  className="w-full rounded-xl border border-sky-400/40 bg-slate-950 px-4 py-3 font-mono text-lg tracking-widest text-white outline-none focus:border-sky-300"
+                />
                 <button
                   type="submit"
-                  disabled={submitting}
-                  className="w-full py-3 px-5 text-sm font-extrabold text-white store-pay-pill rounded-xl flex items-center justify-center gap-2 disabled:opacity-50 cursor-pointer"
+                  disabled={verifying || creatingOrder}
+                  className="w-full rounded-xl bg-sky-500 px-4 py-3 font-extrabold text-slate-950 hover:bg-sky-400 disabled:cursor-not-allowed disabled:opacity-60"
                 >
-                  {submitting ? (
-                    <>
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                      <span>Submitting UTR...</span>
-                    </>
-                  ) : (
-                    <>
-                      <ShieldCheck className="w-4 h-4" />
-                      <span>
-                        Submit UTR for Payment Review
-                      </span>
-                    </>
-                  )}
+                  {verifying ? 'Verification ho rahi hai...' : 'Verify'}
                 </button>
               </form>
+
+              {message && (
+                <p className="rounded-lg bg-slate-950/70 p-3 text-center text-sm text-sky-200">
+                  {verifying && <Loader2 className="inline w-4 h-4 mr-2 animate-spin" />}
+                  {message}
+                </p>
+              )}
+              {error && (
+                <p className="rounded-lg border border-red-400/30 bg-red-950/30 p-3 text-sm text-red-200">
+                  {error}
+                </p>
+              )}
+              <p className="text-center text-xs text-slate-400">
+                Payment sirf server par SMS se verify hone ke baad confirm hoga. Order 30 minute valid hai.
+                {' '}
+                <a
+                  href={storeConfig.supportUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-sky-300 underline"
+                >
+                  Support se contact karein
+                </a>
+              </p>
             </div>
-          )
-        )}
-      </div>
+          ) : (
+            <div className="text-center text-sm text-red-200 py-8">
+              {error || 'Order create nahi ho saka.'}
+            </div>
+          )}
+        </div>
+      </section>
     </div>
   );
 };

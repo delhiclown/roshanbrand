@@ -7,6 +7,7 @@ interface UpiQrBoxProps {
   payeeName: string;
   amount: number;
   orderNote?: string;
+  paymentLink?: string;
 }
 
 export function buildDynamicUpiUri({
@@ -35,6 +36,7 @@ export const UpiQrBox: React.FC<UpiQrBoxProps> = ({
   payeeName,
   amount,
   orderNote = 'Roshanbrand IRCTC ID Order',
+  paymentLink,
 }) => {
   const [copied, setCopied] = useState(false);
   const [qrDataUrl, setQrDataUrl] = useState<string>('');
@@ -45,14 +47,14 @@ export const UpiQrBox: React.FC<UpiQrBoxProps> = ({
   );
 
   const upiUri = useMemo(
-    () =>
+    () => paymentLink ||
       buildDynamicUpiUri({
         upiId,
         payeeName,
         amount,
         orderNote,
       }),
-    [upiId, payeeName, amount, orderNote]
+    [upiId, payeeName, amount, orderNote, paymentLink]
   );
 
   useEffect(() => {

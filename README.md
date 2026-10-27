@@ -38,6 +38,30 @@ For a Render-only deployment, point the custom domain directly to the Render ser
 
 Stock shown in the storefront is capped by both the configured display limit and the number of unassigned credentials in that product's vault pool. Add real credentials to the Admin Vault before making a product available; a fresh database starts with an empty vault.
 
+## UPI Payment Verification
+
+Checkout creates a 30-minute pending order on the existing PostgreSQL database. The server calculates the whole-rupee price from the selected product and quantity; the browser never supplies the amount used for payment verification. It returns an order-specific UPI link and QR. An order is marked paid, and the existing vault delivery runs once, only after an SMS notification has been stored and its UTR, amount, and received time match that order.
+
+Configure these values in the Render service's **Environment** settings (or in an uncommitted local `.env`):
+
+- `DATABASE_URL`: the same PostgreSQL database already used by the app. The payment tables are created automatically at startup.
+- `UPI_ID`: the merchant UPI ID used to generate checkout links.
+- `PAYEE_NAME`: the payee name shown in UPI apps.
+- `SMS_SECRET`: a private, high-entropy secret sent in the webhook's `x-secret` header.
+- `SMS_SENDER_KEYWORDS`: comma-separated sender text accepted from bank/UPI SMS notifications, for example `airtel,airpay`.
+
+Deploy the existing Render service after setting the environment values. For Vercel-hosted frontend deployments, keep the backend URL configured in `vercel.json`; browser API calls use `/api/...` and are forwarded to that same server. Configure a trusted SMS relay on a device/service that receives the account's bank SMS notifications to send:
+
+```text
+POST https://YOUR_BACKEND_HOST/api/sms-webhook
+Content-Type: application/json
+x-secret: YOUR_SMS_SECRET
+
+{"sender":"AIRTEL","message":"INR 340.00 credited ... UTR 123456789012"}
+```
+
+The notification must include a configured sender keyword, `credited` or `received`, a rupee amount prefixed by `Rs`, `INR`, or `₹`, and a labeled 12-digit UTR/ref number. The webhook ignores duplicate UTRs. Keep `SMS_SECRET` only in the backend and SMS relay; never put it in frontend code. Test the relay against the actual SMS wording used by the payment account before accepting live orders. A pending order expires after 30 minutes, and five distinct invalid UTR submissions from the same IP/order are blocked for 10 minutes.
+
 ## Guarantee Claims
 
 Delivered 7-day and 1-month guarantee orders show the original expiry date and allow one open claim per order. Customers can report an issue and attach an optional PNG, JPEG, or WebP screenshot up to 1 MB. Claims and their audit/replacement history are persisted with the existing PostgreSQL `roshanbrand_state` JSONB state; screenshots are excluded from the polled admin state and loaded only when an admin views them.

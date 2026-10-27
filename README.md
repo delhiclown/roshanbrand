@@ -40,7 +40,9 @@ Stock shown in the storefront is capped by both the configured display limit and
 
 ## UPI Payment Verification
 
-Checkout creates a 30-minute pending order on the existing PostgreSQL database. The server calculates the whole-rupee price from the selected product and quantity; the browser never supplies the amount used for payment verification. It returns an order-specific UPI link and QR. An order is marked paid, and the existing vault delivery runs once, only after an SMS notification has been stored and its UTR, amount, and received time match that order.
+Checkout creates a 30-minute `pending` order on the existing PostgreSQL database. The server calculates the whole-rupee price from the selected product and quantity; the browser never supplies the amount. It returns an order-specific UPI link and QR. Scanning the QR or submitting a UTR never marks an order paid and never delivers credentials. A valid, unused 12-digit UTR changes the status to `utr_submitted`; the existing admin panel must then approve payment after checking the bank account. Only that authenticated manual approval can mark the order paid and run the existing vault delivery, once.
+
+The SMS webhook stores matching bank SMS notifications as payment evidence only. SMS content and customer-submitted UTRs are not trusted as payment approval. No payment-gateway webhook is configured in this project; do not enable automatic fulfillment without integrating a gateway with verified webhook signatures. Credential access rechecks the persisted `paid` status and one-time `delivered` flag on the server.
 
 Configure these values in the Render service's **Environment** settings (or in an uncommitted local `.env`):
 
@@ -50,7 +52,7 @@ Configure these values in the Render service's **Environment** settings (or in a
 - `SMS_SECRET`: a private, high-entropy secret sent in the webhook's `x-secret` header.
 - `SMS_SENDER_KEYWORDS`: comma-separated sender text accepted from bank/UPI SMS notifications, for example `airtel,airpay`.
 
-Deploy the existing Render service after setting the environment values. For Vercel-hosted frontend deployments, keep the backend URL configured in `vercel.json`; browser API calls use `/api/...` and are forwarded to that same server. Configure a trusted SMS relay on a device/service that receives the account's bank SMS notifications to send:
+Set `UPI_ID` to the exact valid merchant VPA (the server trims whitespace and lowercases it) and `PAYEE_NAME` before deployment. Both QR and payment link parameters are URL-encoded and generated from these environment values. Deploy the existing Render service after setting the environment values. For Vercel-hosted frontend deployments, keep the backend URL configured in `vercel.json`; browser API calls use `/api/...` and are forwarded to that same server. A trusted SMS relay may record bank SMS evidence by sending:
 
 ```text
 POST https://YOUR_BACKEND_HOST/api/sms-webhook
@@ -60,7 +62,16 @@ x-secret: YOUR_SMS_SECRET
 {"sender":"AIRTEL","message":"INR 340.00 credited ... UTR 123456789012"}
 ```
 
-The notification must include a configured sender keyword, `credited` or `received`, a rupee amount prefixed by `Rs`, `INR`, or `₹`, and a labeled 12-digit UTR/ref number. The webhook ignores duplicate UTRs. Keep `SMS_SECRET` only in the backend and SMS relay; never put it in frontend code. Test the relay against the actual SMS wording used by the payment account before accepting live orders. A pending order expires after 30 minutes, and five distinct invalid UTR submissions from the same IP/order are blocked for 10 minutes.
+The notification must include a configured sender keyword, `credited` or `received`, a rupee amount prefixed by `Rs`, `INR`, or `₹`, and a labeled 12-digit UTR/ref number. The webhook ignores duplicate UTRs and never approves or delivers an order. Keep `SMS_SECRET` only in the backend and SMS relay; never put it in frontend code. Review payment directly in the bank account before using **Update Delivered Vault ID** in the logged-in admin panel. Expired orders can still be manually approved if payment arrived late; expired pending orders release their reserved stock.
+
+### Verify the unpaid-order safeguard
+
+1. Deploy the server with `DATABASE_URL`, `UPI_ID`, and `PAYEE_NAME` set, and add at least one test credential to the vault.
+2. Create an order and note its ID. Confirm `/api/order-status/<id>` reports `pending`.
+3. Scan or open the QR without paying. Confirm the status remains `pending`; no credentials appear.
+4. Submit any syntactically valid 12-digit UTR. Confirm the response/status is `utr_submitted`, and try the private access endpoint with the order access token; it must not return credentials.
+5. Wait for a matching SMS notification if testing the relay. Confirm it is stored as evidence only and the order still is not paid.
+6. Only after an authorized admin approves the payment from the bank, confirm the status becomes `paid` and the credentials appear. Repeat the approval and confirm the same order does not receive another vault ID.
 
 ## Guarantee Claims
 

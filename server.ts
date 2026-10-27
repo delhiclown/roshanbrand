@@ -13,12 +13,13 @@ import {
   CustomerGuaranteeClaim,
   GuaranteeClaim,
   OrderRecord,
+  PaymentStatus,
   PackType,
   StoreConfig,
   VaultItem,
   VaultPoolType,
 } from './src/types.ts';
-import { deliverOnce } from './src/paymentDelivery.ts';
+import { deliverOnce, submitUtr } from './src/paymentDelivery.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -246,7 +247,7 @@ async function initializePersistence(db: PersistedDatabase): Promise<void> {
       product TEXT NOT NULL,
       quantity INTEGER NOT NULL CHECK (quantity > 0),
       amount_paise INTEGER NOT NULL CHECK (amount_paise > 0),
-      status TEXT NOT NULL CHECK (status IN ('pending', 'paid', 'expired')),
+      status TEXT NOT NULL CHECK (status IN ('pending', 'utr_submitted', 'paid', 'expired', 'rejected')),
       utr TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       expires_at TIMESTAMPTZ NOT NULL,
@@ -255,6 +256,16 @@ async function initializePersistence(db: PersistedDatabase): Promise<void> {
       customer_reference TEXT NOT NULL,
       custom_spec TEXT NOT NULL
     )
+  `);
+  await postgresPool.query('ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_status_check');
+  await postgresPool.query(`
+    ALTER TABLE orders
+    ADD CONSTRAINT orders_status_check
+    CHECK (status IN ('pending', 'utr_submitted', 'paid', 'expired', 'rejected'))
+  `);
+  await postgresPool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS orders_utr_unique
+    ON orders (utr) WHERE utr IS NOT NULL
   `);
   await postgresPool.query(`
     CREATE TABLE IF NOT EXISTS payments (
@@ -599,7 +610,6 @@ function allocateCredentials(
 
 function deliverOrder(
   order: OrderRecord,
-  source: 'sms' | 'manual',
   requestedCredentials = ''
 ): boolean {
   let credentials: string | null;
@@ -647,6 +657,7 @@ function deliverOrder(
 
   const now = new Date();
   order.status = 'verified_delivered';
+  order.paymentStatus = 'paid';
   order.deliveredCredentials = sanitizeDeliveredCredentials(credentials).slice(
     0,
     LIMITS.CREDENTIALS_MAX
@@ -656,9 +667,7 @@ function deliverOrder(
   if (order.isRental24h && !order.rentalExpiresAt) {
     order.rentalExpiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString();
   }
-  order.adminNote = source === 'manual'
-    ? 'Payment manually confirmed by admin; Ready Vault ID delivered.'
-    : 'Payment verified from SMS notification; Ready Vault ID delivered.';
+  order.adminNote = 'Payment manually confirmed by admin; Ready Vault ID delivered.';
 
   if (!db.orders.some((existing) => existing.orderId === order.orderId)) {
     db.orders.unshift(order);
@@ -998,13 +1007,14 @@ async function startServer() {
       return;
     }
 
-    const { UPI_ID, PAYEE_NAME } = process.env;
+    const upiId = String(process.env.UPI_ID || '').trim().toLowerCase();
+    const payeeName = String(process.env.PAYEE_NAME || '').trim();
     if (
-      !UPI_ID ||
-      !PAYEE_NAME ||
-      !LIMITS.UPI_ID_REGEX.test(UPI_ID.trim()) ||
-      PAYEE_NAME.trim().length < 2 ||
-      PAYEE_NAME.trim().length > LIMITS.PAYEE_NAME_MAX
+      !upiId ||
+      !payeeName ||
+      !LIMITS.UPI_ID_REGEX.test(upiId) ||
+      payeeName.length < 2 ||
+      payeeName.length > LIMITS.PAYEE_NAME_MAX
     ) {
       res.status(503).json({ error: 'UPI_ID and PAYEE_NAME must be configured on the server.' });
       return;
@@ -1107,9 +1117,9 @@ async function startServer() {
     const customSpec = String(body.customSpec || '').trim().slice(0, LIMITS.CUSTOM_SPEC_MAX);
     const amountPaise = amountRupees * 100;
     const upiLink = `upi://pay?${new URLSearchParams({
-      pa: UPI_ID.trim(),
-      pn: PAYEE_NAME.trim(),
-      am: amountRupees.toFixed(2),
+      pa: upiId,
+      pn: payeeName,
+      am: String(amountRupees),
       cu: 'INR',
       tn: orderId,
     }).toString()}`;
@@ -1137,12 +1147,13 @@ async function startServer() {
         quantity,
         unitPrice: amountRupees / quantity,
         totalAmount: amountRupees,
-        paymentUpiId: UPI_ID.trim(),
+        paymentUpiId: upiId,
         utrNumber: '',
         upiAppUsed: 'UPI QR',
         customerReference,
         customSpec,
         status: 'pending_verification',
+        paymentStatus: 'pending',
         deliveredCredentials: '',
         adminNote: 'Awaiting payment verification.',
         createdAt: createdAt.toISOString(),
@@ -1156,8 +1167,8 @@ async function startServer() {
         amount: amountRupees,
         amountPaise,
         upiLink,
-        upiId: UPI_ID.trim(),
-        payeeName: PAYEE_NAME.trim(),
+        upiId,
+        payeeName,
         accessToken,
         expiresAt: expiresAt.toISOString(),
       });
@@ -1253,7 +1264,7 @@ async function startServer() {
         product: PackType;
         quantity: number;
         amount_paise: number;
-        status: 'pending' | 'paid' | 'expired';
+        status: 'pending' | 'utr_submitted' | 'paid' | 'expired' | 'rejected';
         utr: string | null;
         created_at: Date;
         expires_at: Date;
@@ -1274,12 +1285,16 @@ async function startServer() {
         db.orderAccessTokens[orderId],
         req.body?.accessToken
       );
+      if (!authorizedToken) {
+        res.status(401).json({ error: 'The order access key is invalid.' });
+        return;
+      }
       if (paymentOrder.status === 'paid' || paymentOrder.delivered !== 0) {
-        const deliveredOrder = db.orders.find((order) => order.orderId === orderId);
-        res.json({
-          status: paymentOrder.status,
-          ...(authorizedToken && deliveredOrder ? { order: deliveredOrder } : {}),
-        });
+        res.json({ status: 'paid' });
+        return;
+      }
+      if (paymentOrder.status === 'rejected') {
+        res.status(409).json({ error: 'This order was rejected.' });
         return;
       }
       if (paymentOrder.status === 'expired' || paymentOrder.expires_at.getTime() <= Date.now()) {
@@ -1299,6 +1314,12 @@ async function startServer() {
         return;
       }
 
+      const state = { status: paymentOrder.status, delivered: paymentOrder.delivered !== 0 };
+      if (paymentOrder.utr === utr && paymentOrder.status === 'utr_submitted') {
+        await commitCheckoutTransaction();
+        res.json({ status: 'utr_submitted' });
+        return;
+      }
       const clientKey = createHash('sha256').update(req.ip || 'unknown').digest('hex');
       const attemptResult = await client.query<{ blocked_until: Date | null }>(
         'SELECT blocked_until FROM verify_attempts WHERE order_id = $1 AND client_key = $2',
@@ -1307,115 +1328,62 @@ async function startServer() {
       const blockedUntil = attemptResult.rows[0]?.blocked_until;
       if (blockedUntil && blockedUntil.getTime() > Date.now()) {
         res.setHeader('Retry-After', String(Math.ceil((blockedUntil.getTime() - Date.now()) / 1000)));
-        res.status(429).json({ error: 'Too many incorrect UTR attempts. Try again in 10 minutes.' });
+        res.status(429).json({ error: 'Too many UTR attempts. Try again in 10 minutes.' });
         return;
       }
-
-      const paymentResult = await client.query<{
-        utr: string;
-        amount_paise: number;
-        received_at: Date;
-        used_order_id: string | null;
-      }>('SELECT utr, amount_paise, received_at, used_order_id FROM payments WHERE utr = $1 FOR UPDATE', [utr]);
-      const payment = paymentResult.rows[0];
-      if (!payment) {
-        const failed = await recordUtrAttempt(client, orderId, clientKey, utr);
-        await commitCheckoutTransaction();
-        if (failed?.blocked_until && failed.blocked_until.getTime() > Date.now()) {
-          res.setHeader('Retry-After', String(Math.ceil((failed.blocked_until.getTime() - Date.now()) / 1000)));
-          res.status(429).json({ error: 'Too many incorrect UTR attempts. Try again in 10 minutes.' });
-          return;
-        }
-        res.json({ status: 'pending' });
-        return;
-      }
-
-      const paymentValid =
-        BigInt(payment.amount_paise) === BigInt(paymentOrder.amount_paise) &&
-        payment.received_at.getTime() > paymentOrder.created_at.getTime() &&
-        payment.used_order_id === null &&
-        !db.orders.some((order) => order.utrNumber === utr);
-      if (!paymentValid) {
-        const failed = await recordUtrAttempt(client, orderId, clientKey, utr);
-        await commitCheckoutTransaction();
-        if (failed?.blocked_until && failed.blocked_until.getTime() > Date.now()) {
-          res.setHeader('Retry-After', String(Math.ceil((failed.blocked_until.getTime() - Date.now()) / 1000)));
-          res.status(429).json({ error: 'Too many incorrect UTR attempts. Try again in 10 minutes.' });
-          return;
-        }
-        res.json({ status: 'pending' });
-        return;
-      }
-
-      const orderCreatedAt = paymentOrder.created_at.toISOString();
-      const verifiedAt = new Date().toISOString();
-      const rentalExpiresAt =
-        paymentOrder.product === 'rental_24h'
-          ? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
-          : undefined;
-      const order = db.orders.find((existing) => existing.orderId === orderId) || {
-        orderId,
-        packLabel: paymentOrder.pack_label,
-        packType: paymentOrder.product,
-        isRental24h: paymentOrder.product === 'rental_24h',
-        rentalDurationHours: paymentOrder.product === 'rental_24h' ? 24 : undefined,
-        rentalExpiresAt,
-        quantity: paymentOrder.quantity,
-        unitPrice: Number(paymentOrder.amount_paise) / 100 / paymentOrder.quantity,
-        totalAmount: Number(paymentOrder.amount_paise) / 100,
-        paymentUpiId: process.env.UPI_ID,
-        utrNumber: utr,
-        upiAppUsed: 'UPI QR',
-        customerReference: paymentOrder.customer_reference,
-        customSpec: paymentOrder.custom_spec,
-        status: 'verified_delivered',
-        deliveredCredentials: '',
-        adminNote: 'Payment was verified from the SMS notification.',
-        verifiedAt,
-        createdAt: orderCreatedAt,
-        updatedAt: verifiedAt,
-      };
-      order.utrNumber = utr;
-      order.paymentUpiId = process.env.UPI_ID;
-      const deliveryState = { delivered: paymentOrder.delivered !== 0, status: paymentOrder.status };
-      const deliveryResult = deliverOnce(deliveryState, 'sms', (source) =>
-        deliverOrder(order, source)
+      const duplicateUtr = await client.query<{ id: string }>(
+        'SELECT id FROM orders WHERE utr = $1 AND id <> $2',
+        [utr, orderId]
       );
-      if (deliveryResult === 'unavailable') {
-        res.status(409).json({ error: 'Paid order is awaiting available delivery IDs. Please contact support.' });
+      if (
+        duplicateUtr.rows.length > 0 ||
+        db.orders.some((order) => order.utrNumber === utr && order.orderId !== orderId)
+      ) {
+        const failed = await recordUtrAttempt(client, orderId, clientKey, utr);
+        await commitCheckoutTransaction();
+        if (failed?.blocked_until && failed.blocked_until.getTime() > Date.now()) {
+          res.setHeader('Retry-After', String(Math.ceil((failed.blocked_until.getTime() - Date.now()) / 1000)));
+          res.status(429).json({ error: 'Too many UTR attempts. Try again in 10 minutes.' });
+          return;
+        }
+        res.status(409).json({ error: 'This UTR has already been submitted for another order.' });
         return;
       }
-      if (deliveryResult === 'already-delivered') {
-        res.json({ status: deliveryState.status });
+      const failed = await recordUtrAttempt(client, orderId, clientKey, utr);
+      if (failed?.blocked_until && failed.blocked_until.getTime() > Date.now()) {
+        await commitCheckoutTransaction();
+        res.setHeader('Retry-After', String(Math.ceil((failed.blocked_until.getTime() - Date.now()) / 1000)));
+        res.status(429).json({ error: 'Too many UTR attempts. Try again in 10 minutes.' });
         return;
       }
-
-      const paymentOrderUpdate = await client.query(
-        "UPDATE orders SET status = 'paid', utr = $2, delivered = 1 WHERE id = $1 AND delivered = 0",
+      if (!submitUtr(state)) {
+        res.status(409).json({ error: 'This order cannot accept a UTR in its current state.' });
+        return;
+      }
+      const submitted = await client.query(
+        `UPDATE orders SET status = 'utr_submitted', utr = $2
+         WHERE id = $1 AND status IN ('pending', 'utr_submitted') AND delivered = 0`,
         [orderId, utr]
       );
-      if (paymentOrderUpdate.rowCount !== 1) {
-        throw new Error(`Payment order ${orderId} was delivered by another transaction.`);
+      if (submitted.rowCount !== 1) {
+        throw new Error(`Could not submit UTR for payment order ${orderId}.`);
       }
-      await client.query('UPDATE payments SET used_order_id = $2 WHERE utr = $1 AND used_order_id IS NULL', [
-        utr,
-        orderId,
-      ]);
-      await client.query('DELETE FROM verify_attempts WHERE order_id = $1 AND client_key = $2', [
-        orderId,
-        clientKey,
-      ]);
-      db.orders.unshift(order);
-      db.utrIndex[utr] = orderId;
-      syncVaultDisplayCounter(getVaultPoolForPackType(order.packType));
+      const order = db.orders.find((existing) => existing.orderId === orderId);
+      if (order) {
+        order.utrNumber = utr;
+        order.paymentStatus = 'utr_submitted';
+        order.updatedAt = new Date().toISOString();
+      }
       await saveDb(db);
-      broadcastStateUpdate('order_created', { order });
-      broadcastStateUpdate('vault_updated', {});
-      res.json({ status: 'paid', order });
+      await commitCheckoutTransaction();
+      broadcastStateUpdate('order_utr_submitted', { orderId });
+      res.json({ status: 'utr_submitted' });
+      return;
     } catch (error) {
-      console.error('Failed to verify UPI UTR:', error);
-      res.status(500).json({ error: 'The UTR could not be verified right now.' });
+      console.error('Failed to submit UPI UTR:', error);
+      res.status(500).json({ error: 'The UTR could not be submitted right now.' });
     }
+
   });
 
   app.get('/api/order-status/:id', orderStatusLimiter, async (req, res) => {
@@ -1426,7 +1394,7 @@ async function startServer() {
       return;
     }
     try {
-      const result = await client.query<{ status: 'pending' | 'paid' | 'expired' }>(
+      const result = await client.query<{ status: PaymentStatus }>(
         'SELECT status FROM orders WHERE id = $1',
         [req.params.id]
       );
@@ -1669,6 +1637,8 @@ async function startServer() {
         db.storeConfig.stock1MonthGuaranteeAvailable,
         vaultStock.guarantee_1month
       ),
+      upiId: String(process.env.UPI_ID || '').trim().toLowerCase(),
+      payeeName: String(process.env.PAYEE_NAME || '').trim(),
     };
     res.json({ storeConfig, vaultStock });
   });
@@ -1808,6 +1778,11 @@ async function startServer() {
   });
 
   // Record submitted UTRs as pending; payment receipt must be confirmed by an admin.
+  app.post('/api/orders/verify-upi', (_req, res) => {
+    res.status(410).json({
+      error: 'Create an order first, then submit its UTR using the order-specific checkout.',
+    });
+  });
   app.post('/api/orders/verify-upi', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     const body = req.body || {};
@@ -1995,7 +1970,7 @@ async function startServer() {
   });
 
   // Lookup Order by Order ID or 12-Digit UTR Number
-  app.get('/api/orders/lookup', (req, res) => {
+  app.get('/api/orders/lookup', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     const q = String(req.query.q || '').trim();
     if (!q) {
@@ -2012,9 +1987,19 @@ async function startServer() {
       return;
     }
 
+    let paymentStatus = found.paymentStatus || 'pending';
+    if (postgresPool) {
+      const paymentOrder = await postgresPool.query<{ status: PaymentStatus }>(
+        'SELECT status FROM orders WHERE id = $1',
+        [found.orderId]
+      );
+      paymentStatus = paymentOrder.rows[0]?.status || 'pending';
+    }
+
     res.json({
       order: {
         ...found,
+        paymentStatus,
         utrNumber: '',
         customerReference: '',
         customSpec: '',
@@ -2027,7 +2012,7 @@ async function startServer() {
     });
   });
 
-  app.post('/api/orders/access', (req, res) => {
+  app.post('/api/orders/access', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     const orderId = String(req.body?.orderId || '').trim();
     const accessToken = String(req.body?.accessToken || '').trim();
@@ -2044,11 +2029,27 @@ async function startServer() {
       res.status(404).json({ error: 'Order not found.' });
       return;
     }
+    if (!postgresPool) {
+      res.status(503).json({ error: 'Payment database is not configured.' });
+      return;
+    }
+    const paymentOrder = await postgresPool.query<{
+      status: PaymentStatus;
+      delivered: number;
+    }>('SELECT status, delivered FROM orders WHERE id = $1', [orderId]);
+    if (paymentOrder.rows[0]?.status !== 'paid' || paymentOrder.rows[0].delivered !== 1) {
+      res.status(409).json({
+        error: 'Credentials are available only after an authorized payment approval.',
+        status: paymentOrder.rows[0]?.status || 'pending',
+      });
+      return;
+    }
     const rentalExpiry = getRentalExpiry(order);
     if (rentalExpiry && rentalExpiry.getTime() <= Date.now()) {
       res.json({
         order: {
           ...order,
+          paymentStatus: 'paid',
           utrNumber: '',
           customerReference: '',
           customSpec: '',
@@ -2063,7 +2064,7 @@ async function startServer() {
 
     setOrderAccessCookie(res, orderId, authorizedToken);
     res.json({
-      order,
+      order: { ...order, paymentStatus: 'paid' },
       guaranteeClaims: db.guaranteeClaims
         .filter((claim) => claim.orderId === orderId)
         .map(toCustomerGuaranteeClaim),
@@ -2560,7 +2561,7 @@ async function startServer() {
         product: PackType;
         quantity: number;
         amount_paise: number;
-        status: 'pending' | 'paid' | 'expired';
+        status: 'pending' | 'utr_submitted' | 'paid' | 'expired' | 'rejected';
         utr: string | null;
         created_at: Date;
         expires_at: Date;
@@ -2630,6 +2631,11 @@ async function startServer() {
         throw new Error(`Could not load payment order ${orderId} after creating its record.`);
       }
 
+      if (paymentOrder.status === 'rejected') {
+        res.status(409).json({ error: 'Rejected orders cannot be manually marked as paid.' });
+        return;
+      }
+
       await client.query(
         "INSERT INTO manual_payment_logs (order_id, source) VALUES ($1, 'manual')",
         [orderId]
@@ -2678,8 +2684,8 @@ async function startServer() {
 
       const deliveryState = { delivered: paymentOrder.delivered !== 0, status: paymentOrder.status };
       const requestedCredentials = String(req.body?.deliveredCredentials || '').trim();
-      const deliveryResult = deliverOnce(deliveryState, 'manual', (source) =>
-        deliverOrder(order!, source, requestedCredentials)
+      const deliveryResult = deliverOnce(deliveryState, 'manual', () =>
+        deliverOrder(order!, requestedCredentials)
       );
       if (deliveryResult === 'already-delivered') {
         await commitCheckoutTransaction();
@@ -2706,6 +2712,7 @@ async function startServer() {
           'UPDATE payments SET used_order_id = $2 WHERE utr = $1 AND used_order_id IS NULL',
           [order.utrNumber, orderId]
         );
+        await client.query('DELETE FROM verify_attempts WHERE order_id = $1', [orderId]);
       }
       syncVaultDisplayCounter(getVaultPoolForPackType(order.packType));
       await saveDb(db);
@@ -2719,6 +2726,11 @@ async function startServer() {
   });
 
   // Admin 1-Click Verify / Update Order Credentials (Automatically uses Ready ID Vault if not manually overridden)
+  app.post('/api/admin/orders/:orderId/verify', (_req, res) => {
+    res.status(409).json({
+      error: 'Use the authenticated mark-paid action to approve payment and deliver this order.',
+    });
+  });
   app.post('/api/admin/orders/:orderId/verify', async (req, res) => {
     const { orderId } = req.params;
     const order = db.orders.find((o) => o.orderId === orderId);
@@ -2832,7 +2844,14 @@ async function startServer() {
       return;
     }
 
+    if (postgresPool) {
+      await postgresPool.query(
+        "UPDATE orders SET status = 'rejected' WHERE id = $1 AND delivered = 0 AND status <> 'paid'",
+        [order.orderId]
+      );
+    }
     order.status = 'rejected';
+    order.paymentStatus = 'rejected';
     order.adminNote =
       'Payment UTR could not be verified. Please contact support with payment screenshot.';
     order.updatedAt = new Date().toISOString();
@@ -3022,7 +3041,7 @@ async function startServer() {
 
       const expiredResult = await client.query<{ id: string; product: PackType }>(
         `UPDATE orders SET status = 'expired'
-         WHERE status = 'pending' AND expires_at <= NOW()
+         WHERE status IN ('pending', 'utr_submitted') AND expires_at <= NOW()
          RETURNING id, product`
       );
       if (expiredResult.rowCount) {

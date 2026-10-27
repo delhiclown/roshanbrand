@@ -10,6 +10,7 @@ export type PackType =
   | 'guarantee_1month';
 
 export type OrderStatus = 'pending_verification' | 'verified_delivered' | 'rejected';
+export type PaymentStatus = 'pending' | 'utr_submitted' | 'paid' | 'expired' | 'rejected';
 export type GuaranteeType = 'guarantee_7days' | 'guarantee_1month';
 export type GuaranteeClaimStatus = 'pending' | 'approved' | 'rejected' | 'resolved';
 
@@ -114,6 +115,7 @@ export interface OrderRecord {
   customerReference: string;
   customSpec: string;
   status: OrderStatus;
+  paymentStatus?: PaymentStatus;
   deliveredCredentials: string;
   adminNote: string;
   verifiedAt?: string;

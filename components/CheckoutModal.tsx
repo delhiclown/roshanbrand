@@ -122,7 +122,21 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || 'UTR verify nahi ho saka.');
-    return data as { status: string; order?: OrderRecord };
+    return data as { status: string };
+  };
+
+  const fetchPaidOrder = async (order: CreatedPaymentOrder) => {
+    const response = await fetch('/api/orders/access', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orderId: order.orderId, accessToken: order.accessToken }),
+      cache: 'no-store',
+    });
+    const data = await response.json();
+    if (!response.ok || data.order?.paymentStatus !== 'paid' || !data.order.deliveredCredentials) {
+      throw new Error(data.error || 'Payment approved, but order details are not available yet.');
+    }
+    return data.order as OrderRecord;
   };
 
   const finishAsPaid = (verifiedOrder: OrderRecord, accessToken: string) => {
@@ -194,8 +208,8 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
 
     try {
       const firstCheck = await checkUtr(paymentOrder, submittedUtr);
-      if (firstCheck.status === 'paid' && firstCheck.order) {
-        finishAsPaid(firstCheck.order, paymentOrder.accessToken);
+      if (firstCheck.status === 'paid') {
+        finishAsPaid(await fetchPaidOrder(paymentOrder), paymentOrder.accessToken);
         return;
       }
       if (firstCheck.status === 'expired') {
@@ -203,6 +217,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         return;
       }
 
+      setMessage('UTR submitted. Payment confirmation is in progress.');
       const deadline = Date.now() + 3 * 60 * 1000;
       while (Date.now() < deadline && isCurrentRun()) {
         await wait(Math.min(5000, deadline - Date.now()));
@@ -220,12 +235,13 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
           setMessage('Order expire ho gaya. Support se contact karein.');
           return;
         }
+        if (statusData.status === 'rejected') {
+          setMessage('Payment review complete nahi hua. Support se contact karein.');
+          return;
+        }
         if (statusData.status === 'paid') {
-          const paidCheck = await checkUtr(paymentOrder, submittedUtr);
-          if (paidCheck.status === 'paid' && paidCheck.order) {
-            finishAsPaid(paidCheck.order, paymentOrder.accessToken);
-            return;
-          }
+          finishAsPaid(await fetchPaidOrder(paymentOrder), paymentOrder.accessToken);
+          return;
         }
       }
 

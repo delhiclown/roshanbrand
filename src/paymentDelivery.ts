@@ -3,8 +3,14 @@ export interface DeliveryState {
   status: string;
 }
 
-export type DeliverySource = 'sms' | 'manual';
+export type DeliverySource = 'manual';
 export type DeliveryResult = 'delivered' | 'already-delivered' | 'unavailable';
+
+export function submitUtr(state: DeliveryState): boolean {
+  if (state.status !== 'pending' && state.status !== 'utr_submitted') return false;
+  state.status = 'utr_submitted';
+  return true;
+}
 
 export function deliverOnce(
   state: DeliveryState,

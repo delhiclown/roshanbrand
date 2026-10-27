@@ -1,5 +1,4 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import QRCode from 'qrcode';
 import {
   Check,
   CheckCircle2,
@@ -24,7 +23,6 @@ import {
 import { AdminPortal } from '../components/AdminPortal';
 import { CheckoutModal } from '../components/CheckoutModal';
 import { DeliveredOrderDetails } from '../components/DeliveredOrderDetails';
-import { buildDynamicUpiUri } from '../components/UpiQrBox';
 import { DEFAULT_STORE_CONFIG, LIMITS } from './constants';
 import {
   CheckoutDraft,
@@ -106,7 +104,6 @@ export default function App() {
   const [trackError, setTrackError] = useState<string>('');
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [supportOpen, setSupportOpen] = useState<boolean>(false);
-  const [inlineQrDataUrl, setInlineQrDataUrl] = useState<string>('');
   const displayedPermanentStock = storeConfig.stockDisplayAvailable;
   const availableRentalStock = vaultStock.rental_24h;
   const totalAvailableStock =
@@ -440,72 +437,6 @@ export default function App() {
     : selectedTier === 'bulk'
     ? `Bulk Order (${safeQty} IRCTC IDs)`
     : `Custom Order (${safeQty} IRCTC IDs)`;
-
-  const dynamicInlineUpiUri = useMemo(
-    () =>
-      buildDynamicUpiUri({
-        upiId: storeConfig.upiId,
-        payeeName: storeConfig.payeeName,
-        amount: totalPayable,
-        orderNote: `${storeConfig.siteTitle} ${
-          activeProduct.isRental24h
-            ? '24H Rental'
-            : activeProduct.isSevenDayGuarantee
-            ? '7 Days Guarantee'
-            : activeProduct.isOneMonthGuarantee
-            ? '1 Month Guarantee'
-            : ''
-        } ${safeQty} ID`,
-      }),
-    [
-      storeConfig.upiId,
-      storeConfig.payeeName,
-      storeConfig.siteTitle,
-      totalPayable,
-      activeProduct.isRental24h,
-      activeProduct.isSevenDayGuarantee,
-      activeProduct.isOneMonthGuarantee,
-      safeQty,
-    ]
-  );
-
-  useEffect(() => {
-    if (
-      !storeConfigLoaded ||
-      activeStockCount <= 0 ||
-      safeQty > activeStockCount ||
-      !hasEnoughStock
-    ) {
-      setInlineQrDataUrl('');
-      return;
-    }
-
-    let active = true;
-    QRCode.toDataURL(dynamicInlineUpiUri, {
-      width: 220,
-      margin: 1,
-      errorCorrectionLevel: 'M',
-      color: {
-        dark: '#050816',
-        light: '#FFFFFF',
-      },
-    })
-      .then((url) => {
-        if (active) setInlineQrDataUrl(url);
-      })
-      .catch(() => {
-        if (active) setInlineQrDataUrl('');
-      });
-    return () => {
-      active = false;
-    };
-  }, [
-    dynamicInlineUpiUri,
-    hasEnoughStock,
-    storeConfigLoaded,
-    activeStockCount,
-    safeQty,
-  ]);
 
   const handleSelectTier = (tier: string, qty: number) => {
     if (!storeConfigLoaded) return;
@@ -909,27 +840,24 @@ export default function App() {
                       <div>
                         <div className="flex items-center gap-2">
                           <h3 className="text-sm font-extrabold text-white">
-                            UTR submitted — waiting for payment confirmation
+                            {trackedOrder.paymentStatus === 'expired'
+                              ? 'Order expired'
+                              : trackedOrder.paymentStatus === 'utr_submitted'
+                                ? 'UTR submitted — waiting for payment confirmation'
+                                : 'Order created — payment not confirmed'}
                           </h3>
                           <span className="text-[11px] font-mono font-bold text-amber-300">
                             {trackedOrder.orderId}
                           </span>
                         </div>
                         <p className="text-xs text-slate-300 mt-0.5">
-                          {trackedOrder.utrNumber ? (
-                            <>
-                              UTR{' '}
-                              <span className="font-mono font-bold text-cyan-300">
-                                {trackedOrder.utrNumber}
-                              </span>{' '}
-                            </>
-                          ) : (
-                            'Payment reference is private. '
-                          )}
-                          (₹{trackedOrder.totalAmount} for {trackedOrder.quantity} ID
-                          {trackedOrder.quantity > 1 ? 's' : ''}) submitted. Credentials will be
-                          released only after this payment is confirmed in{' '}
-                          {trackedOrder.paymentUpiId || storeConfig.upiId}.
+                          {trackedOrder.paymentStatus === 'expired'
+                            ? 'This order expired before payment was approved. Contact support if you already paid.'
+                            : trackedOrder.paymentStatus === 'utr_submitted'
+                            ? 'Payment reference received. Credentials will be released only after an administrator confirms the payment.'
+                            : 'No UTR has been submitted. Credentials are released only after an administrator confirms payment.'}
+                          {' '}(₹{trackedOrder.totalAmount} for {trackedOrder.quantity} ID
+                          {trackedOrder.quantity > 1 ? 's' : ''}).
                         </p>
                       </div>
                     </div>
@@ -951,6 +879,10 @@ export default function App() {
                       )}
                     </button>
                   </div>
+                </div>
+              ) : trackedOrder.paymentStatus === 'expired' ? (
+                <div className="neon-card-3d border-rose-500/50 p-4 text-sm text-rose-200">
+                  Order {trackedOrder.orderId} has expired. Contact support if you already paid.
                 </div>
               ) : trackedOrder.status === 'rejected' ? (
                 <div className="neon-card-3d border-rose-500/50 p-4 flex items-center justify-between gap-3">
@@ -1490,19 +1422,14 @@ export default function App() {
                           {/* Total & Dynamic Amount QR + Pay CTA */}
                           <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3.5 pt-3 border-t border-cyan-500/25">
                             <div className="flex items-center gap-3">
-                              {hasEnoughStock && inlineQrDataUrl && (
+                              {hasEnoughStock && (
                                 <button
                                   type="button"
                                   onClick={handleOpenCheckout}
-                                  title={`Click to open full ₹${totalPayable} payment QR`}
-                                  className="w-16 h-16 rounded-xl bg-white p-1 border-2 border-sky-400 shrink-0 shadow-[0_0_18px_rgba(56,189,248,0.35)] hover:scale-105 transition-transform cursor-pointer"
+                                  title={`Create an order and open the exact ₹${totalPayable} payment QR`}
+                                  className="w-16 h-16 rounded-xl bg-slate-900 border-2 border-sky-400 shrink-0 shadow-[0_0_18px_rgba(56,189,248,0.35)] hover:scale-105 transition-transform cursor-pointer flex items-center justify-center"
                                 >
-                                  <img
-                                    src={inlineQrDataUrl}
-                                    alt={`Dynamic UPI QR for ₹${totalPayable}`}
-                                    referrerPolicy="no-referrer"
-                                    className="w-full h-full object-contain rounded"
-                                  />
+                                  <QrCode className="w-8 h-8 text-sky-300" />
                                 </button>
                               )}
                               <div>
@@ -1520,11 +1447,10 @@ export default function App() {
                                 </div>
                                 {hasEnoughStock && (
                                   <p className="text-[11px] text-emerald-300 font-medium mt-0.5">
-                                    Dynamic QR Auto-Generated for{' '}
+                                    Order-specific QR generated after checkout for{' '}
                                     <strong className="font-mono">
                                       ₹{totalPayable.toFixed(2)}
-                                    </strong>{' '}
-                                    ({storeConfig.upiId})
+                                    </strong>
                                   </p>
                                 )}
                               </div>

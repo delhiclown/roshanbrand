@@ -1,38 +1,25 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { deliverOnce, type DeliveryState } from '../src/paymentDelivery.ts';
+import { deliverOnce, submitUtr, type DeliveryState } from '../src/paymentDelivery.ts';
 
-function createDeliveryHarness() {
+test('Submitting a UTR never marks an order paid or delivers credentials', () => {
   const state: DeliveryState = { delivered: false, status: 'pending' };
-  const deliverySources: string[] = [];
-  const deliverOrder = (source: 'sms' | 'manual') => {
-    deliverySources.push(source);
-    return true;
-  };
-  return {
-    state,
-    smsPayment: () => deliverOnce(state, 'sms', deliverOrder),
-    manualPayment: () => deliverOnce(state, 'manual', deliverOrder),
-    get deliverySources() { return deliverySources; },
-  };
-}
-
-test('SMS delivery followed by manual payment delivers the ID only once', () => {
-  const harness = createDeliveryHarness();
-
-  assert.equal(harness.smsPayment(), 'delivered');
-  assert.equal(harness.manualPayment(), 'already-delivered');
-  assert.deepEqual(harness.deliverySources, ['sms']);
-  assert.equal(harness.state.status, 'paid');
+  assert.equal(submitUtr(state), true);
+  assert.deepEqual(state, { delivered: false, status: 'utr_submitted' });
 });
 
-test('Manual payment followed by a late SMS delivers the ID only once', () => {
-  const harness = createDeliveryHarness();
+test('Manual approval delivers an ID only once', () => {
+  const state: DeliveryState = { delivered: false, status: 'utr_submitted' };
+  let deliveryCount = 0;
+  const deliverOrder = () => {
+    deliveryCount += 1;
+    return true;
+  };
 
-  assert.equal(harness.manualPayment(), 'delivered');
-  assert.equal(harness.smsPayment(), 'already-delivered');
-  assert.deepEqual(harness.deliverySources, ['manual']);
-  assert.equal(harness.state.status, 'paid');
+  assert.equal(deliverOnce(state, 'manual', deliverOrder), 'delivered');
+  assert.equal(deliverOnce(state, 'manual', deliverOrder), 'already-delivered');
+  assert.equal(deliveryCount, 1);
+  assert.deepEqual(state, { delivered: true, status: 'paid' });
 });
 
 test('A failed delivery leaves the order eligible for retry', () => {

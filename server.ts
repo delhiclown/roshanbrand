@@ -20,8 +20,9 @@ import {
   VaultPoolType,
 } from './src/types.ts';
 import {
+  createSubmittedOrderUpdate,
   deliverOnce,
-  isDraftExpired,
+  isOrderExpired,
   matchesSmsPayment,
   releaseStock,
   reserveStock,
@@ -276,6 +277,13 @@ async function initializePersistence(db: PersistedDatabase): Promise<void> {
     ADD CONSTRAINT orders_status_check
     CHECK (status IN ('draft', 'pending', 'utr_submitted', 'paid', 'expired', 'rejected'))
   `);
+  await postgresPool.query(`
+    UPDATE orders
+    SET expires_at = COALESCE(created_at, NOW()) +
+      CASE WHEN status = 'draft' THEN INTERVAL '15 minutes' ELSE INTERVAL '30 minutes' END
+    WHERE expires_at IS NULL
+  `);
+  await postgresPool.query('ALTER TABLE orders ALTER COLUMN expires_at SET NOT NULL');
   await postgresPool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS orders_utr_unique
     ON orders (utr) WHERE utr IS NOT NULL
@@ -1068,7 +1076,7 @@ async function startServer() {
       status: PaymentStatus;
       utr: string | null;
       created_at: Date;
-      expires_at: Date;
+      expires_at: Date | null;
       delivered: number;
       pack_label: string;
       customer_reference: string;
@@ -1343,7 +1351,10 @@ async function startServer() {
       await commitCheckoutTransaction();
       res.json({ status: paymentOrder.status, cancelled: false });
     } catch (error) {
-      console.error('Failed to cancel UPI order:', error);
+      console.error(
+        'Failed to cancel UPI order:',
+        error instanceof Error ? error.message : String(error)
+      );
       res.status(500).json({ error: 'The order could not be cancelled.' });
     }
   });
@@ -1502,7 +1513,7 @@ async function startServer() {
         status: PaymentStatus;
         utr: string | null;
         created_at: Date;
-        expires_at: Date;
+        expires_at: Date | null;
         delivered: number;
         pack_label: string;
         customer_reference: string;
@@ -1533,7 +1544,7 @@ async function startServer() {
         return;
       }
       await reconcileVaultReservations(client);
-      if (paymentOrder.status === 'draft' && isDraftExpired(paymentOrder.expires_at)) {
+      if (paymentOrder.status === 'draft' && isOrderExpired(paymentOrder.expires_at)) {
         await client.query("DELETE FROM orders WHERE id = $1 AND status = 'draft'", [orderId]);
         delete db.orderAccessTokens[orderId];
         await saveDb(db);
@@ -1543,7 +1554,7 @@ async function startServer() {
       }
       if (
         paymentOrder.status === 'expired' ||
-        (paymentOrder.status === 'utr_submitted' && paymentOrder.expires_at.getTime() <= Date.now())
+        (paymentOrder.status === 'utr_submitted' && isOrderExpired(paymentOrder.expires_at))
       ) {
         if (paymentOrder.status !== 'expired') {
           await client.query(
@@ -1618,13 +1629,8 @@ async function startServer() {
         return;
       }
       const submittedAt = new Date();
-      const submitted = await client.query(
-        `UPDATE orders SET status = 'utr_submitted', utr = $2,
-             expires_at = $3 + INTERVAL '30 minutes'
-         WHERE id = $1 AND status IN ('draft', 'pending') AND delivered = 0
-         RETURNING id`,
-        [orderId, utr, submittedAt]
-      );
+      const update = createSubmittedOrderUpdate(orderId, utr, submittedAt);
+      const submitted = await client.query(update.text, [...update.values]);
       if (submitted.rowCount !== 1) {
         res.status(409).json({ error: 'This order is no longer available for UTR submission.' });
         return;
@@ -1701,7 +1707,10 @@ async function startServer() {
       res.json({ status: paidImmediately ? 'paid' : 'utr_submitted', order });
       return;
     } catch (error) {
-      console.error('Failed to submit UPI UTR:', error);
+      console.error(
+        'Failed to submit UPI UTR:',
+        error instanceof Error ? error.message : String(error)
+      );
       res.status(500).json({ error: 'The UTR could not be submitted right now.' });
     }
 
@@ -3039,49 +3048,57 @@ async function startServer() {
 
   // Admin Reject Order
   app.post('/api/admin/orders/:orderId/reject', async (req, res) => {
-    const { orderId } = req.params;
-    const order = db.orders.find((o) => o.orderId === orderId);
-    if (!order) {
-      res.status(404).json({ error: 'Order not found' });
-      return;
-    }
-    if (order.status !== 'pending_verification') {
-      res.status(409).json({
-        error: 'Only orders awaiting payment review can be rejected.',
-      });
-      return;
-    }
-
-    if (postgresPool) {
-      const client = getCheckoutClient();
-      if (!client) {
-        res.status(503).json({ error: 'Payment database is not configured.' });
+    try {
+      const { orderId } = req.params;
+      const order = db.orders.find((o) => o.orderId === orderId);
+      if (!order) {
+        res.status(404).json({ error: 'Order not found' });
         return;
       }
-      const updated = await client.query(
-        `UPDATE orders SET status = 'rejected'
-         WHERE id = $1 AND delivered = 0 AND status = 'utr_submitted'
-         RETURNING id`,
-        [order.orderId]
+      if (order.status !== 'pending_verification') {
+        res.status(409).json({
+          error: 'Only orders awaiting payment review can be rejected.',
+        });
+        return;
+      }
+
+      if (postgresPool) {
+        const client = getCheckoutClient();
+        if (!client) {
+          res.status(503).json({ error: 'Payment database is not configured.' });
+          return;
+        }
+        const updated = await client.query(
+          `UPDATE orders SET status = 'rejected'
+           WHERE id = $1 AND delivered = 0 AND status = 'utr_submitted'
+           RETURNING id`,
+          [order.orderId]
+        );
+        if (updated.rowCount !== 1) {
+          res.status(409).json({ error: 'Only unpaid submitted orders can be rejected.' });
+          return;
+        }
+      }
+      const now = new Date().toISOString();
+      order.status = 'rejected';
+      order.paymentStatus = 'rejected';
+      order.adminNote =
+        'Payment UTR could not be verified. Please contact support with payment screenshot.';
+      order.updatedAt = now;
+      releaseStock(db.vault, order.orderId, now);
+      syncVaultDisplayCounter(getVaultPoolForPackType(order.packType));
+      if (!(await persistDbOrRespond(res))) return;
+      broadcastStateUpdate('order_rejected', { order });
+      broadcastStateUpdate('vault_updated', {});
+
+      res.json({ order });
+    } catch (error) {
+      console.error(
+        'Failed to reject UPI order:',
+        error instanceof Error ? error.message : String(error)
       );
-      if (updated.rowCount !== 1) {
-        res.status(409).json({ error: 'Only unpaid submitted orders can be rejected.' });
-        return;
-      }
+      res.status(500).json({ error: 'The order could not be rejected right now.' });
     }
-    const now = new Date().toISOString();
-    order.status = 'rejected';
-    order.paymentStatus = 'rejected';
-    order.adminNote =
-      'Payment UTR could not be verified. Please contact support with payment screenshot.';
-    order.updatedAt = now;
-    releaseStock(db.vault, order.orderId, now);
-    syncVaultDisplayCounter(getVaultPoolForPackType(order.packType));
-    if (!(await persistDbOrRespond(res))) return;
-    broadcastStateUpdate('order_rejected', { order });
-    broadcastStateUpdate('vault_updated', {});
-
-    res.json({ order });
   });
 
   app.post('/api/admin/orders/cleanup-fake-utrs', async (req, res) => {
@@ -3094,41 +3111,49 @@ async function startServer() {
       return;
     }
 
-    const client = getCheckoutClient();
-    if (postgresPool && !client) {
-      res.status(503).json({ error: 'Payment database is not configured.' });
-      return;
-    }
-    const rejected: string[] = [];
-    const now = new Date().toISOString();
-    for (const orderId of orderIds) {
-      const order = db.orders.find((item) => item.orderId === orderId);
-      if (!order || order.status !== 'pending_verification' || !LIMITS.UTR_REGEX.test(order.utrNumber)) {
-        continue;
+    try {
+      const client = getCheckoutClient();
+      if (postgresPool && !client) {
+        res.status(503).json({ error: 'Payment database is not configured.' });
+        return;
       }
-      if (client) {
-        const updated = await client.query(
-          `UPDATE orders SET status = 'rejected'
-           WHERE id = $1 AND status = 'utr_submitted' AND delivered = 0 AND utr IS NOT NULL
-           RETURNING id`,
-          [orderId]
-        );
-        if (updated.rowCount !== 1) continue;
+      const rejected: string[] = [];
+      const now = new Date().toISOString();
+      for (const orderId of orderIds) {
+        const order = db.orders.find((item) => item.orderId === orderId);
+        if (!order || order.status !== 'pending_verification' || !LIMITS.UTR_REGEX.test(order.utrNumber)) {
+          continue;
+        }
+        if (client) {
+          const updated = await client.query(
+            `UPDATE orders SET status = 'rejected'
+             WHERE id = $1 AND status = 'utr_submitted' AND delivered = 0 AND utr IS NOT NULL
+             RETURNING id`,
+            [orderId]
+          );
+          if (updated.rowCount !== 1) continue;
+        }
+        order.status = 'rejected';
+        order.paymentStatus = 'rejected';
+        order.adminNote = 'Legacy UTR order rejected during one-time fake-order cleanup.';
+        order.updatedAt = now;
+        releaseStock(db.vault, orderId, now);
+        syncVaultDisplayCounter(getVaultPoolForPackType(order.packType));
+        rejected.push(orderId);
       }
-      order.status = 'rejected';
-      order.paymentStatus = 'rejected';
-      order.adminNote = 'Legacy UTR order rejected during one-time fake-order cleanup.';
-      order.updatedAt = now;
-      releaseStock(db.vault, orderId, now);
-      syncVaultDisplayCounter(getVaultPoolForPackType(order.packType));
-      rejected.push(orderId);
+      if (!(await persistDbOrRespond(res))) return;
+      if (rejected.length) {
+        broadcastStateUpdate('orders_rejected', { orderIds: rejected });
+        broadcastStateUpdate('vault_updated', {});
+      }
+      res.json({ rejectedOrderIds: rejected });
+    } catch (error) {
+      console.error(
+        'Failed to clean up legacy UPI orders:',
+        error instanceof Error ? error.message : String(error)
+      );
+      res.status(500).json({ error: 'Legacy payment orders could not be cleaned up.' });
     }
-    if (!(await persistDbOrRespond(res))) return;
-    if (rejected.length) {
-      broadcastStateUpdate('orders_rejected', { orderIds: rejected });
-      broadcastStateUpdate('vault_updated', {});
-    }
-    res.json({ rejectedOrderIds: rejected });
   });
 
   // Admin Delete Order
@@ -3367,12 +3392,18 @@ async function startServer() {
   };
   const expiryTimer = setInterval(() => {
     void expirePendingPaymentOrders().catch((error: unknown) => {
-      console.error('Failed to expire pending payment orders:', error);
+      console.error(
+        'Failed to expire pending payment orders:',
+        error instanceof Error ? error.message : String(error)
+      );
     });
   }, 60_000);
   expiryTimer.unref();
   void expirePendingPaymentOrders().catch((error: unknown) => {
-    console.error('Failed to run startup order cleanup:', error);
+    console.error(
+      'Failed to run startup order cleanup:',
+      error instanceof Error ? error.message : String(error)
+    );
   });
 
   // Vite Middleware (Development) or Static Dist (Production)

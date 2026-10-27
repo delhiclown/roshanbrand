@@ -51,6 +51,27 @@ export function isDraftExpired(expiresAt: Date | number, now = Date.now()): bool
   return expiryTime <= now;
 }
 
+export function isOrderExpired(
+  expiresAt: Date | number | null | undefined,
+  now = Date.now()
+): boolean {
+  if (expiresAt == null) return true;
+  return isDraftExpired(expiresAt, now);
+}
+
+export function createSubmittedOrderUpdate(orderId: string, utr: string, submittedAt: Date) {
+  return {
+    text: `UPDATE orders SET status = 'utr_submitted', utr = $2, expires_at = $3
+           WHERE id = $1 AND status IN ('draft', 'pending') AND delivered = 0
+           RETURNING id`,
+    values: [
+      orderId,
+      utr,
+      new Date(submittedAt.getTime() + 30 * 60 * 1000),
+    ] as const,
+  };
+}
+
 export function matchesSmsPayment(
   order: { utr: string | null; amountPaise: number; createdAt: Date | number },
   payment: { utr: string; amountPaise: number; receivedAt: Date | number }

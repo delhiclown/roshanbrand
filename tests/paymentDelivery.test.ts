@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  createSubmittedOrderUpdate,
   deliverOnce,
-  isDraftExpired,
+  isOrderExpired,
   matchesSmsPayment,
   releaseStock,
   reserveStock,
@@ -71,6 +72,28 @@ test('Submitting a valid UTR creates the order and reserves the required stock',
   assert.equal(flow.submit('draft-2', ''), false);
 });
 
+test('UTR SQL update passes a Date for the TIMESTAMPTZ expires_at column', async () => {
+  const submittedAt = new Date('2026-10-27T12:00:00.000Z');
+  const saved = { expiresAt: null as unknown };
+  const mockPostgres = {
+    async query(text: string, values: readonly unknown[]) {
+      assert.match(text, /expires_at = \$3/);
+      const expiresAt = values[2];
+      if (!(expiresAt instanceof Date)) {
+        throw new TypeError('TIMESTAMPTZ value must be a JavaScript Date.');
+      }
+      saved.expiresAt = expiresAt;
+      return { rowCount: 1 };
+    },
+  };
+  const update = createSubmittedOrderUpdate('order-ts', '123456789012', submittedAt);
+  const result = await mockPostgres.query(update.text, update.values);
+
+  assert.equal(result.rowCount, 1);
+  assert.ok(saved.expiresAt instanceof Date);
+  assert.equal(saved.expiresAt.toISOString(), '2026-10-27T12:30:00.000Z');
+});
+
 test('A matching SMS delivers credentials only once', () => {
   assert.equal(
     matchesSmsPayment(
@@ -124,12 +147,36 @@ test('Rejecting an order immediately releases its reserved stock', () => {
 });
 
 test('Draft cleanup expires only drafts past their 15-minute deadline', () => {
-  const now = Date.now();
+  const now = new Date('2026-10-27T12:15:00.000Z').getTime();
   const drafts = [
-    { orderId: 'old', expiresAt: now - 1 },
-    { orderId: 'current', expiresAt: now + 1 },
+    { orderId: 'old', expiresAt: new Date(now - 1) },
+    { orderId: 'current', expiresAt: new Date(now + 1) },
+    { orderId: 'legacy-null', expiresAt: null },
   ];
-  const remaining = drafts.filter((draft) => !isDraftExpired(draft.expiresAt, now));
+  const remaining = drafts.filter((draft) => !isOrderExpired(draft.expiresAt, now));
 
   assert.deepEqual(remaining.map((draft) => draft.orderId), ['current']);
+});
+
+test('Expiry cleanup uses timestamp values and releases expired-order reservations', () => {
+  const now = new Date('2026-10-27T12:30:00.000Z');
+  const rows = [
+    { id: 'expired', status: 'utr_submitted', expiresAt: new Date('2026-10-27T12:29:00.000Z') },
+    { id: 'active', status: 'utr_submitted', expiresAt: new Date('2026-10-27T12:31:00.000Z') },
+  ];
+  const vault: { poolType: string; isAssigned: boolean; reservedOrderId?: string }[] = [
+    { poolType: 'permanent', isAssigned: false, reservedOrderId: 'expired' },
+    { poolType: 'permanent', isAssigned: false, reservedOrderId: 'active' },
+  ];
+  for (const row of rows) {
+    if (isOrderExpired(row.expiresAt, now.getTime())) {
+      row.status = 'expired';
+      releaseStock(vault, row.id);
+    }
+  }
+
+  assert.equal(rows[0].status, 'expired');
+  assert.equal(rows[1].status, 'utr_submitted');
+  assert.equal(vault.find((item) => item.reservedOrderId === 'expired'), undefined);
+  assert.equal(vault.find((item) => item.reservedOrderId === 'active')?.reservedOrderId, 'active');
 });

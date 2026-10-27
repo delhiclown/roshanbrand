@@ -1,7 +1,5 @@
 import { StoreConfig } from './types';
 
-export const PAYMENT_UPI_ID = 'rodex@airtel';
-
 export const LIMITS = {
   ID_REGEX: /^[a-zA-Z0-9_-]+$/,
   UTR_REGEX: /^[0-9]{12}$/,
@@ -11,8 +9,6 @@ export const LIMITS = {
   SITE_TITLE_MAX: 80,
   ANNOUNCEMENT_MIN: 2,
   ANNOUNCEMENT_MAX: 200,
-  UPI_ID_MIN: 3,
-  UPI_ID_MAX: 100,
   UPI_ID_REGEX: /^[A-Za-z0-9][A-Za-z0-9._+-]*@[A-Za-z0-9][A-Za-z0-9.-]*$/,
   PAYEE_NAME_MIN: 2,
   PAYEE_NAME_MAX: 80,
@@ -33,7 +29,7 @@ export const LIMITS = {
 export const DEFAULT_STORE_CONFIG: StoreConfig = {
   siteTitle: 'Roshanbrand',
   announcementText: '',
-  upiId: PAYMENT_UPI_ID,
+  upiId: '',
   payeeName: 'Roshanbrand Official',
   qrCodeUrl: '',
   supportHandle: 'WhatsApp Support',

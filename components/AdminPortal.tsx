@@ -1851,11 +1851,9 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                       type="text"
                       value={formConfig.upiId}
                       required
-                      minLength={LIMITS.UPI_ID_MIN}
-                      maxLength={LIMITS.UPI_ID_MAX}
                       pattern={LIMITS.UPI_ID_REGEX.source}
                       onChange={(e) =>
-                        setFormConfig({ ...formConfig, upiId: e.target.value.trim() })
+                        setFormConfig({ ...formConfig, upiId: e.target.value })
                       }
                       className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-cyan-500/35 text-sm text-cyan-200 font-mono"
                     />

@@ -21,7 +21,7 @@ export function buildDynamicUpiUri({
   amount: number;
   orderNote?: string;
 }): string {
-  const cleanUpiId = encodeURIComponent(upiId.trim());
+  const cleanUpiId = encodeURIComponent(upiId);
   const cleanPayee = encodeURIComponent((payeeName || 'Roshanbrand Official').trim());
   const exactAmount = Math.max(1, Number(amount) || 49).toFixed(2);
   const cleanNote = encodeURIComponent(

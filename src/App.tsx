@@ -209,18 +209,22 @@ export default function App() {
         if (res.ok) {
           const lookupData = await res.json();
           let order: OrderRecord = lookupData.order;
-          const accessResponse = await fetch('/api/orders/access', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              orderId: order.orderId,
-            }),
-          });
-          if (accessResponse.ok) {
-            const accessData = await accessResponse.json();
-            order = accessData.order;
-            setTrackedOrderAccessToken(cookieAuthenticatedOrder);
-            setGuaranteeClaims(accessData.guaranteeClaims || []);
+          if (order.paymentStatus === 'paid') {
+            const accessResponse = await fetch('/api/orders/access', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ orderId: order.orderId }),
+              cache: 'no-store',
+            });
+            if (accessResponse.ok) {
+              const accessData = await accessResponse.json();
+              order = accessData.order;
+              setTrackedOrderAccessToken(cookieAuthenticatedOrder);
+              setGuaranteeClaims(accessData.guaranteeClaims || []);
+            } else {
+              setTrackedOrderAccessToken('');
+              setGuaranteeClaims([]);
+            }
           } else {
             setTrackedOrderAccessToken('');
             setGuaranteeClaims([]);

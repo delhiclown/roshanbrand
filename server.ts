@@ -167,7 +167,10 @@ function loadDb(): PersistedDatabase {
                     .replace(/\s*[·•-]?\s*PAYMENT CONFIRMATION REQUIRED/gi, '')
                     .trim()
               : DEFAULT_STORE_CONFIG.announcementText,
-          upiId: normalizeUpiId(savedStoreConfig.upiId, DEFAULT_STORE_CONFIG.upiId),
+          upiId:
+            (typeof savedStoreConfig.upiId === 'string' && savedStoreConfig.upiId) ||
+            process.env.UPI_ID ||
+            '',
           instantAutoVerify: false,
           instantDeliveryNote: DEFAULT_STORE_CONFIG.instantDeliveryNote,
           stockDisplayAvailable: normalizeStock(
@@ -208,7 +211,10 @@ function loadDb(): PersistedDatabase {
   }
 
   return {
-    storeConfig: { ...DEFAULT_STORE_CONFIG },
+    storeConfig: {
+      ...DEFAULT_STORE_CONFIG,
+      upiId: process.env.UPI_ID || '',
+    },
     orders: [],
     vault: buildInitialVault(),
     utrIndex: {},
@@ -397,15 +403,6 @@ function normalizeReplacementLimit(value: unknown, fallback: number): number {
     : fallback;
 }
 
-function normalizeUpiId(value: unknown, fallback: string): string {
-  const upiId = String(value ?? '').trim();
-  return upiId.length >= LIMITS.UPI_ID_MIN &&
-    upiId.length <= LIMITS.UPI_ID_MAX &&
-    LIMITS.UPI_ID_REGEX.test(upiId)
-    ? upiId
-    : fallback;
-}
-
 function normalizeSupportUrl(value: unknown, fallback: string): string {
   const supportUrl = String(value ?? '').trim();
   try {
@@ -555,6 +552,7 @@ function isPackType(value: unknown): value is PackType {
 }
 
 const db = loadDb();
+const getMerchantUpiId = () => db.storeConfig.upiId || process.env.UPI_ID || '';
 
 // Real-time SSE clients for instant <50ms Admin & Customer sync
 const sseClients = new Set<express.Response>();
@@ -939,6 +937,12 @@ async function startServer() {
     standardHeaders: true,
     legacyHeaders: false,
   });
+  const cancelOrderLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: 20,
+    standardHeaders: true,
+    legacyHeaders: false,
+  });
   const verifyUtrLimiter = rateLimit({
     windowMs: 60_000,
     limit: 30,
@@ -1007,10 +1011,9 @@ async function startServer() {
       return;
     }
 
-    const upiId = String(process.env.UPI_ID || '').trim().toLowerCase();
+    const upiId = getMerchantUpiId();
     const payeeName = String(process.env.PAYEE_NAME || '').trim();
     if (
-      !upiId ||
       !payeeName ||
       !LIMITS.UPI_ID_REGEX.test(upiId) ||
       payeeName.length < 2 ||
@@ -1132,11 +1135,6 @@ async function startServer() {
          VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9)`,
         [orderId, product, quantity, amountPaise, createdAt, expiresAt, packLabel, customerReference, customSpec]
       );
-      for (const item of availableVaultItems.slice(0, quantity)) {
-        item.reservedOrderId = orderId;
-        item.updatedAt = createdAt.toISOString();
-      }
-      syncVaultDisplayCounter(targetPool);
       db.orderAccessTokens[orderId] = createHash('sha256').update(accessToken).digest('hex');
       db.orders.unshift({
         orderId,
@@ -1160,7 +1158,6 @@ async function startServer() {
         updatedAt: createdAt.toISOString(),
       });
       await saveDb(db);
-      broadcastStateUpdate('vault_updated', {});
       setOrderAccessCookie(res, orderId, accessToken);
       res.status(201).json({
         orderId,
@@ -1177,6 +1174,78 @@ async function startServer() {
     } catch (error) {
       console.error('Failed to create UPI order:', error);
       res.status(500).json({ error: 'The order could not be created.' });
+    }
+  });
+
+  app.post('/api/cancel-order', cancelOrderLimiter, async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const client = getCheckoutClient();
+    if (!postgresPool || !client) {
+      res.status(503).json({ error: 'Payment database is not configured.' });
+      return;
+    }
+
+    const orderId = String(req.body?.orderId || '').trim();
+    if (!orderId || orderId.length > 100) {
+      res.status(400).json({ error: 'A valid order ID is required.' });
+      return;
+    }
+
+    try {
+      const result = await client.query<{ status: PaymentStatus; product: PackType }>(
+        'SELECT status, product FROM orders WHERE id = $1 FOR UPDATE',
+        [orderId]
+      );
+      const paymentOrder = result.rows[0];
+      if (!paymentOrder) {
+        res.status(404).json({ error: 'Order not found.' });
+        return;
+      }
+
+      if (
+        !getAuthorizedOrderAccessToken(
+          req,
+          orderId,
+          db.orderAccessTokens[orderId],
+          req.body?.accessToken
+        )
+      ) {
+        res.status(401).json({ error: 'The order access key is invalid.' });
+        return;
+      }
+
+      if (paymentOrder.status === 'paid') {
+        await commitCheckoutTransaction();
+        res.json({ status: 'paid', cancelled: false });
+        return;
+      }
+      if (paymentOrder.status === 'rejected') {
+        await commitCheckoutTransaction();
+        res.json({ status: 'rejected', cancelled: false });
+        return;
+      }
+
+      await client.query(
+        `UPDATE orders SET status = 'expired'
+         WHERE id = $1 AND status IN ('pending', 'utr_submitted') AND delivered = 0`,
+        [orderId]
+      );
+      for (const item of db.vault) {
+        if (item.reservedOrderId === orderId) {
+          item.reservedOrderId = undefined;
+          item.updatedAt = new Date().toISOString();
+        }
+      }
+      syncVaultDisplayCounter(getVaultPoolForPackType(paymentOrder.product));
+      const order = db.orders.find((item) => item.orderId === orderId);
+      if (order) order.paymentStatus = 'expired';
+      await saveDb(db);
+      broadcastStateUpdate('order_cancelled', { orderId });
+      broadcastStateUpdate('vault_updated', {});
+      res.json({ status: 'expired', cancelled: true });
+    } catch (error) {
+      console.error('Failed to cancel UPI order:', error);
+      res.status(500).json({ error: 'The order could not be cancelled.' });
     }
   });
 
@@ -1639,7 +1708,7 @@ async function startServer() {
         db.storeConfig.stock1MonthGuaranteeAvailable,
         vaultStock.guarantee_1month
       ),
-      upiId: String(process.env.UPI_ID || '').trim().toLowerCase(),
+      upiId: getMerchantUpiId(),
       payeeName: String(process.env.PAYEE_NAME || '').trim(),
     };
     res.json({ storeConfig, vaultStock });
@@ -1648,12 +1717,8 @@ async function startServer() {
   // Update Store Config
   app.put('/api/store', requireAdminAuth, async (req, res) => {
     const body = req.body || {};
-    const upiId = String(body.upiId ?? db.storeConfig.upiId).trim();
-    if (
-      upiId.length < LIMITS.UPI_ID_MIN ||
-      upiId.length > LIMITS.UPI_ID_MAX ||
-      !LIMITS.UPI_ID_REGEX.test(upiId)
-    ) {
+    const upiId = String(body.upiId ?? db.storeConfig.upiId ?? '');
+    if (!LIMITS.UPI_ID_REGEX.test(upiId)) {
       res.status(400).json({ error: 'Please enter a valid UPI ID.' });
       return;
     }
@@ -1921,7 +1986,7 @@ async function startServer() {
 
     const status: OrderRecord['status'] = 'pending_verification';
     const deliveredCredentials = '';
-    const paymentUpiId = db.storeConfig.upiId;
+    const paymentUpiId = getMerchantUpiId();
     const adminNote = `Awaiting manual confirmation of payment received at ${paymentUpiId}.`;
     const rentalExpiresAt: string | undefined = undefined;
     const verifiedAt: string | undefined = undefined;
@@ -2665,7 +2730,7 @@ async function startServer() {
           quantity: paymentOrder.quantity,
           unitPrice: paymentOrder.amount_paise / 100 / paymentOrder.quantity,
           totalAmount: paymentOrder.amount_paise / 100,
-          paymentUpiId: process.env.UPI_ID,
+          paymentUpiId: getMerchantUpiId(),
           utrNumber: paymentOrder.utr || '',
           upiAppUsed: 'UPI QR',
           customerReference: paymentOrder.customer_reference,

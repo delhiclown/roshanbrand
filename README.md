@@ -47,12 +47,12 @@ The SMS webhook stores matching bank SMS notifications as payment evidence only.
 Configure these values in the Render service's **Environment** settings (or in an uncommitted local `.env`):
 
 - `DATABASE_URL`: the same PostgreSQL database already used by the app. The payment tables are created automatically at startup.
-- `UPI_ID`: the merchant UPI ID used to generate checkout links.
+- `UPI_ID`: optional fallback merchant UPI ID used only if no ID is saved in Admin Panel settings.
 - `PAYEE_NAME`: the payee name shown in UPI apps.
 - `SMS_SECRET`: a private, high-entropy secret sent in the webhook's `x-secret` header.
 - `SMS_SENDER_KEYWORDS`: comma-separated sender text accepted from bank/UPI SMS notifications, for example `airtel,airpay`.
 
-Set `UPI_ID` to the exact valid merchant VPA (the server trims whitespace and lowercases it) and `PAYEE_NAME` before deployment. Both QR and payment link parameters are URL-encoded and generated from these environment values. Deploy the existing Render service after setting the environment values. For Vercel-hosted frontend deployments, keep the backend URL configured in `vercel.json`; browser API calls use `/api/...` and are forwarded to that same server. A trusted SMS relay may record bank SMS evidence by sending:
+The Merchant UPI ID saved in Admin Panel settings is the source of truth. The server uses `UPI_ID` only when the database has no saved ID. Save a valid `name@handle` value; it is stored and used exactly as entered, without trimming, lowercasing, or length truncation. Checkout QR links are generated from the current server setting, not an old order or inventory value. Deploy the existing Render service after setting the environment values. For Vercel-hosted frontend deployments, keep the backend URL configured in `vercel.json`; browser API calls use `/api/...` and are forwarded to that same server. A trusted SMS relay may record bank SMS evidence by sending:
 
 ```text
 POST https://YOUR_BACKEND_HOST/api/sms-webhook
@@ -62,7 +62,7 @@ x-secret: YOUR_SMS_SECRET
 {"sender":"AIRTEL","message":"INR 340.00 credited ... UTR 123456789012"}
 ```
 
-The notification must include a configured sender keyword, `credited` or `received`, a rupee amount prefixed by `Rs`, `INR`, or `₹`, and a labeled 12-digit UTR/ref number. The webhook ignores duplicate UTRs and never approves or delivers an order. Keep `SMS_SECRET` only in the backend and SMS relay; never put it in frontend code. Review payment directly in the bank account before using **Update Delivered Vault ID** in the logged-in admin panel. Expired orders can still be manually approved if payment arrived late; expired pending orders release their reserved stock.
+The notification must include a configured sender keyword, `credited` or `received`, a rupee amount prefixed by `Rs`, `INR`, or `₹`, and a labeled 12-digit UTR/ref number. The webhook ignores duplicate UTRs and never approves or delivers an order. Keep `SMS_SECRET` only in the backend and SMS relay; never put it in frontend code. Review payment directly in the bank account before using **Update Delivered Vault ID** in the logged-in admin panel. Opening checkout does not reserve credentials; closing/cancelling checkout expires that unpaid order and immediately releases any legacy reservation. Expired orders can still be manually approved if payment arrived late.
 
 ### Verify the unpaid-order safeguard
 

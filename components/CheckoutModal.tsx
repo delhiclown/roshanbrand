@@ -50,6 +50,21 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   const [error, setError] = useState('');
   const [copied, setCopied] = useState(false);
   const verificationRun = useRef(0);
+  const paymentOrderRef = useRef<CreatedPaymentOrder | null>(null);
+
+  const cancelPaymentOrder = (order: CreatedPaymentOrder) => {
+    void fetch('/api/cancel-order', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        orderId: order.orderId,
+        accessToken: order.accessToken,
+      }),
+      keepalive: true,
+    }).catch((cancelError: unknown) => {
+      console.error('Could not cancel checkout order:', cancelError);
+    });
+  };
 
   useEffect(() => {
     let active = true;
@@ -76,6 +91,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
           if (createdOrder.status !== 'pending' || !createdOrder.orderId) {
             throw new Error('Server did not confirm the new order as pending.');
           }
+          paymentOrderRef.current = createdOrder;
           setPaymentOrder(createdOrder);
           onOrderCreated(
             {
@@ -101,6 +117,11 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
             },
             createdOrder.accessToken
           );
+        } else {
+          const createdOrder = data as CreatedPaymentOrder;
+          if (createdOrder.orderId && createdOrder.accessToken) {
+            cancelPaymentOrder(createdOrder);
+          }
         }
       } catch (requestError) {
         if (active) {
@@ -119,6 +140,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
     return () => {
       active = false;
       verificationRun.current += 1;
+      if (paymentOrderRef.current) cancelPaymentOrder(paymentOrderRef.current);
     };
   }, [draft]);
 

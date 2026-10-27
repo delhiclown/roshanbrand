@@ -24,7 +24,7 @@ interface CheckoutModalProps {
 interface CreatedPaymentOrder {
   orderId: string;
   amount: number;
-  status: 'pending';
+  status: 'draft';
   createdAt: string;
   upiLink: string;
   upiId: string;
@@ -53,18 +53,33 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   const paymentOrderRef = useRef<CreatedPaymentOrder | null>(null);
 
   const cancelPaymentOrder = (order: CreatedPaymentOrder) => {
-    void fetch('/api/cancel-order', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        orderId: order.orderId,
-        accessToken: order.accessToken,
-      }),
-      keepalive: true,
-    }).catch((cancelError: unknown) => {
-      console.error('Could not cancel checkout order:', cancelError);
+    const body = JSON.stringify({
+      orderId: order.orderId,
+      accessToken: order.accessToken,
     });
+    const beaconSent = navigator.sendBeacon(
+      '/api/cancel-order',
+      new Blob([body], { type: 'application/json' })
+    );
+    if (!beaconSent) {
+      void fetch('/api/cancel-order', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+        keepalive: true,
+      }).catch((cancelError: unknown) => {
+        console.error('Could not cancel checkout draft:', cancelError);
+      });
+    }
   };
+
+  useEffect(() => {
+    const cancelDraftOnPageHide = () => {
+      if (paymentOrderRef.current) cancelPaymentOrder(paymentOrderRef.current);
+    };
+    window.addEventListener('pagehide', cancelDraftOnPageHide);
+    return () => window.removeEventListener('pagehide', cancelDraftOnPageHide);
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -88,35 +103,11 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         }
         if (active) {
           const createdOrder = data as CreatedPaymentOrder;
-          if (createdOrder.status !== 'pending' || !createdOrder.orderId) {
-            throw new Error('Server did not confirm the new order as pending.');
+          if (createdOrder.status !== 'draft' || !createdOrder.orderId) {
+            throw new Error('Server did not confirm the checkout draft.');
           }
           paymentOrderRef.current = createdOrder;
           setPaymentOrder(createdOrder);
-          onOrderCreated(
-            {
-              orderId: createdOrder.orderId,
-              packLabel: draft.packLabel,
-              packType: draft.packType,
-              isRental24h: draft.isRental24h,
-              rentalDurationHours: draft.isRental24h ? 24 : undefined,
-              quantity: draft.quantity,
-              unitPrice: createdOrder.amount / draft.quantity,
-              totalAmount: createdOrder.amount,
-              paymentUpiId: createdOrder.upiId,
-              utrNumber: '',
-              upiAppUsed: 'UPI QR',
-              customerReference: 'Direct UPI Buyer',
-              customSpec: draft.initialCustomSpec,
-              status: 'pending_verification',
-              paymentStatus: createdOrder.status,
-              deliveredCredentials: '',
-              adminNote: 'Awaiting payment verification.',
-              createdAt: createdOrder.createdAt,
-              updatedAt: createdOrder.createdAt,
-            },
-            createdOrder.accessToken
-          );
         } else {
           const createdOrder = data as CreatedPaymentOrder;
           if (createdOrder.orderId && createdOrder.accessToken) {
@@ -177,6 +168,34 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
     setCompletedOrder(verifiedOrder);
     setMessage('');
     onOrderCreated(verifiedOrder, accessToken);
+  };
+
+  const trackSubmittedOrder = (order: CreatedPaymentOrder) => {
+    if (!draft) return;
+    onOrderCreated(
+      {
+        orderId: order.orderId,
+        packLabel: draft.packLabel,
+        packType: draft.packType,
+        isRental24h: draft.isRental24h,
+        rentalDurationHours: draft.isRental24h ? 24 : undefined,
+        quantity: draft.quantity,
+        unitPrice: order.amount / draft.quantity,
+        totalAmount: order.amount,
+        paymentUpiId: order.upiId,
+        utrNumber: utr.trim(),
+        upiAppUsed: 'UPI QR',
+        customerReference: 'Direct UPI Buyer',
+        customSpec: draft.initialCustomSpec,
+        status: 'pending_verification',
+        paymentStatus: 'utr_submitted',
+        deliveredCredentials: '',
+        adminNote: 'Awaiting payment verification.',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+      order.accessToken
+    );
   };
 
   const pasteUtr = async () => {
@@ -250,7 +269,11 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         setMessage('Order expire ho gaya. Naya order banane ke liye support se contact karein.');
         return;
       }
+      if (firstCheck.status !== 'utr_submitted') {
+        throw new Error('Server did not confirm the submitted UTR.');
+      }
 
+      trackSubmittedOrder(paymentOrder);
       setMessage('UTR submitted. Payment confirmation is in progress.');
       const deadline = Date.now() + 3 * 60 * 1000;
       while (Date.now() < deadline && isCurrentRun()) {
@@ -330,7 +353,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
           {creatingOrder ? (
             <div className="flex items-center justify-center gap-2 py-12 text-sky-200">
               <Loader2 className="w-5 h-5 animate-spin" />
-              <span>Order ban raha hai...</span>
+              <span>Payment QR taiyar ho raha hai...</span>
             </div>
           ) : error && !paymentOrder ? (
             <div className="rounded-xl border border-red-400/40 bg-red-950/40 p-4 text-red-200">
@@ -396,7 +419,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
               <form onSubmit={handleVerify} className="space-y-3">
                 <div className="flex items-center justify-between gap-2">
                   <label htmlFor="payment-utr" className="text-sm font-bold text-white">
-                    Payment receipt ka 12-digit UTR number
+                    Payment karne ke baad receipt ka 12-digit UTR number
                   </label>
                   <button
                     type="button"
@@ -426,7 +449,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                   disabled={verifying || creatingOrder}
                   className="w-full rounded-xl bg-sky-500 px-4 py-3 font-extrabold text-slate-950 hover:bg-sky-400 disabled:cursor-not-allowed disabled:opacity-60"
                 >
-                  {verifying ? 'Verification ho rahi hai...' : 'Verify'}
+                  {verifying ? 'Verification ho rahi hai...' : 'I have paid — submit UTR'}
                 </button>
               </form>
 
@@ -442,7 +465,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                 </p>
               )}
               <p className="text-center text-xs text-slate-400">
-                Payment sirf server par SMS se verify hone ke baad confirm hoga. Order 30 minute valid hai.
+                QR kholne se order ya stock reserve nahi hota. UTR submit karne par hi order shuru hoga; payment server SMS se verify hone tak credentials release nahi honge.
                 {' '}
                 <a
                   href={storeConfig.supportUrl}

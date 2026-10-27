@@ -48,6 +48,15 @@ type AdminTab =
   | 'inventory'
   | 'security';
 
+interface SmsPaymentLog {
+  utr: string;
+  amountPaise: number;
+  receivedAt: string;
+  orderId: string | null;
+  result: string;
+  rawMessage: string;
+}
+
 function getOrderVaultPool(order: OrderRecord): VaultPoolType {
   if (order.packType === 'rental_24h') return 'rental_24h';
   if (order.packType === 'guarantee_7days') return 'guarantee_7days';
@@ -82,6 +91,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
 }) => {
   const [activeTab, setActiveTab] = useState<AdminTab>('orders');
   const [orders, setOrders] = useState<OrderRecord[]>([]);
+  const [smsPaymentLogs, setSmsPaymentLogs] = useState<SmsPaymentLog[]>([]);
   const [vault, setVault] = useState<VaultItem[]>([]);
   const [guaranteeClaims, setGuaranteeClaims] = useState<GuaranteeClaim[]>([]);
   const [ordersOffset, setOrdersOffset] = useState(0);
@@ -264,6 +274,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
         mergePage(previous, data.orders || [], 'orderId', requestOrdersOffset)
       );
       setVault(data.vault || []);
+      setSmsPaymentLogs(data.smsPaymentLogs || []);
       setGuaranteeClaims((previous) =>
         mergePage(previous, data.guaranteeClaims || [], 'claimId', requestClaimsOffset)
       );
@@ -1242,6 +1253,36 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
           {/* TAB 1: ORDERS & UTR VERIFY */}
           {activeTab === 'orders' && (
             <div className="space-y-4">
+              {smsPaymentLogs.length > 0 && (
+                <section className="neon-card-3d p-4">
+                  <h3 className="mb-3 text-sm font-extrabold text-white">
+                    Recent SMS payment events
+                  </h3>
+                  <div className="max-h-64 space-y-2 overflow-y-auto">
+                    {smsPaymentLogs.map((log, index) => (
+                      <div
+                        key={`${log.utr}-${log.receivedAt}-${index}`}
+                        className="rounded-lg border border-cyan-500/20 bg-slate-950/70 p-3 text-xs"
+                      >
+                        <div className="flex flex-wrap justify-between gap-2">
+                          <span className="font-mono font-bold text-cyan-200">
+                            UTR {log.utr} · ₹{(log.amountPaise / 100).toFixed(2)}
+                          </span>
+                          <span className={log.result === 'ignored_already_paid' ? 'text-amber-300' : 'text-slate-300'}>
+                            {log.result}
+                          </span>
+                        </div>
+                        <p className="mt-1 break-words text-slate-300">
+                          {log.orderId ? `Order ${log.orderId} · ` : ''}{log.rawMessage}
+                        </p>
+                        <time className="mt-1 block text-slate-500">
+                          {new Date(log.receivedAt).toLocaleString()}
+                        </time>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              )}
               <div className="neon-card-3d p-4 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
                 <div className="flex items-center gap-1.5 overflow-x-auto pb-1 sm:pb-0">
                   {(

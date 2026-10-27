@@ -36,13 +36,17 @@ If the frontend is deployed on Vercel, keep the backend on Render. `vercel.json`
 
 For a Render-only deployment, point the custom domain directly to the Render service; the Vercel rewrite is not used.
 
-Stock shown in the storefront is capped by both the configured display limit and the number of unassigned credentials in that product's vault pool. Add real credentials to the Admin Vault before making a product available; a fresh database starts with an empty vault.
+Stock shown in the storefront is the number of unassigned credentials in the matching vault pool minus reservations held by submitted, unpaid orders. Add real credentials to the Admin Vault before making a product available; a fresh database starts with an empty vault.
 
 ## UPI Payment Verification
 
-Checkout creates a 30-minute `pending` order on the existing PostgreSQL database. The server calculates the whole-rupee price from the selected product and quantity; the browser never supplies the amount. It returns an order-specific UPI link and QR. Scanning the QR or submitting a UTR never marks an order paid and never delivers credentials. A valid, unused 12-digit UTR changes the status to `utr_submitted`; the existing admin panel must then approve payment after checking the bank account. Only that authenticated manual approval can mark the order paid and run the existing vault delivery, once.
+Opening checkout creates only a 15-minute `draft` row. Drafts are not included in the admin order list and never reserve stock. Closing the checkout or leaving the page sends a best-effort cancellation; a server cleanup job silently deletes drafts that remain for 15 minutes. The server calculates the whole-rupee price from the selected product and quantity; the browser never supplies the amount. It returns an order-specific UPI link and QR.
 
-The SMS webhook stores matching bank SMS notifications as payment evidence only. SMS content and customer-submitted UTRs are not trusted as payment approval. No payment-gateway webhook is configured in this project; do not enable automatic fulfillment without integrating a gateway with verified webhook signatures. Credential access rechecks the persisted `paid` status and one-time `delivered` flag on the server.
+Only the customer pressing **I have paid — submit UTR** with a valid, unused 12-digit UTR promotes the draft to `utr_submitted` and reserves its requested vault IDs for 30 minutes. A matching SMS webhook UTR and exact amount automatically delivers credentials once. If no matching SMS arrives, the authenticated admin can use **Update Delivered Vault ID** for a submitted pending order. SMS and manual delivery both require the database row to remain `utr_submitted` and atomically set `paid`/`delivered`; a second delivery attempt cannot assign another ID. SMS events, including notifications arriving after manual delivery, are visible in the Admin orders tab. Rejection releases the reserved IDs immediately.
+
+The legacy cleanup endpoint is protected by the existing admin session: `POST /api/admin/orders/cleanup-fake-utrs` with a JSON body such as `{"orderIds":["RB_..."]}` rejects only the explicitly supplied pending orders that have a valid UTR, and releases their reservations. Review the IDs in Admin first; the endpoint intentionally does not guess which historic UTRs were submitted by a customer.
+
+Credential access rechecks the persisted `paid` status and one-time `delivered` flag on the server and returns `409` for every unpaid order.
 
 Configure these values in the Render service's **Environment** settings (or in an uncommitted local `.env`):
 
@@ -62,16 +66,17 @@ x-secret: YOUR_SMS_SECRET
 {"sender":"AIRTEL","message":"INR 340.00 credited ... UTR 123456789012"}
 ```
 
-The notification must include a configured sender keyword, `credited` or `received`, a rupee amount prefixed by `Rs`, `INR`, or `₹`, and a labeled 12-digit UTR/ref number. The webhook ignores duplicate UTRs and never approves or delivers an order. Keep `SMS_SECRET` only in the backend and SMS relay; never put it in frontend code. Review payment directly in the bank account before using **Update Delivered Vault ID** in the logged-in admin panel. Opening checkout does not reserve credentials; closing/cancelling checkout expires that unpaid order and immediately releases any legacy reservation. Expired orders can still be manually approved if payment arrived late.
+The notification must include a configured sender keyword, `credited` or `received`, a rupee amount prefixed by `Rs`, `INR`, or `₹`, and a labeled 12-digit UTR/ref number. The webhook records every accepted SMS and automatically delivers only when the UTR, amount, order creation time, and pending order status match. Keep `SMS_SECRET` only in the backend and SMS relay; never put it in frontend code. Review the payment directly in the bank account before using **Update Delivered Vault ID** in the logged-in admin panel.
 
 ### Verify the unpaid-order safeguard
 
 1. Deploy the server with `DATABASE_URL`, `UPI_ID`, and `PAYEE_NAME` set, and add at least one test credential to the vault.
-2. Create an order and note its ID. Confirm `/api/order-status/<id>` reports `pending`.
-3. Scan or open the QR without paying. Confirm the status remains `pending`; no credentials appear.
-4. Submit any syntactically valid 12-digit UTR. Confirm the response/status is `utr_submitted`, and try the private access endpoint with the order access token; it must not return credentials.
-5. Wait for a matching SMS notification if testing the relay. Confirm it is stored as evidence only and the order still is not paid.
-6. Only after an authorized admin approves the payment from the bank, confirm the status becomes `paid` and the credentials appear. Repeat the approval and confirm the same order does not receive another vault ID.
+2. Open checkout and note the site stock count. Scan/open the QR, then press Back/close without submitting a UTR. Confirm there is no order in Admin, no order-expired card, and stock is unchanged.
+3. Open checkout again and press **I have paid — submit UTR** with a valid 12-digit UTR. Confirm the order now appears as pending in Admin and stock decreases by the requested quantity. Before approval, the private access endpoint must not return credentials.
+4. Test SMS auto-delivery with an accepted sender and matching credited amount/UTR after UTR submission. Confirm the order becomes paid and credentials appear once. Send the same notification again and verify no second ID is assigned.
+5. For manual delivery, submit a different UTR and use the authenticated Admin **Update Delivered Vault ID** action. Then send a matching SMS and confirm it is logged as ignored/already paid with no second ID.
+6. Reject another pending order and confirm the reserved stock is immediately restored. For draft cleanup, leave checkout open for more than 15 minutes; confirm the draft disappears silently and no stock or expired-order card appears.
+7. For old fake-UTR orders, review their IDs in Admin and call the protected cleanup endpoint with only those IDs. Confirm they become rejected and their reservations are restored.
 
 ## Guarantee Claims
 

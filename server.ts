@@ -19,7 +19,14 @@ import {
   VaultItem,
   VaultPoolType,
 } from './src/types.ts';
-import { deliverOnce, submitUtr } from './src/paymentDelivery.ts';
+import {
+  deliverOnce,
+  isDraftExpired,
+  matchesSmsPayment,
+  releaseStock,
+  reserveStock,
+  submitUtr,
+} from './src/paymentDelivery.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -253,7 +260,7 @@ async function initializePersistence(db: PersistedDatabase): Promise<void> {
       product TEXT NOT NULL,
       quantity INTEGER NOT NULL CHECK (quantity > 0),
       amount_paise INTEGER NOT NULL CHECK (amount_paise > 0),
-      status TEXT NOT NULL CHECK (status IN ('pending', 'utr_submitted', 'paid', 'expired', 'rejected')),
+      status TEXT NOT NULL CHECK (status IN ('draft', 'pending', 'utr_submitted', 'paid', 'expired', 'rejected')),
       utr TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       expires_at TIMESTAMPTZ NOT NULL,
@@ -267,7 +274,7 @@ async function initializePersistence(db: PersistedDatabase): Promise<void> {
   await postgresPool.query(`
     ALTER TABLE orders
     ADD CONSTRAINT orders_status_check
-    CHECK (status IN ('pending', 'utr_submitted', 'paid', 'expired', 'rejected'))
+    CHECK (status IN ('draft', 'pending', 'utr_submitted', 'paid', 'expired', 'rejected'))
   `);
   await postgresPool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS orders_utr_unique
@@ -299,6 +306,17 @@ async function initializePersistence(db: PersistedDatabase): Promise<void> {
       order_id TEXT NOT NULL,
       action_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       source TEXT NOT NULL CHECK (source = 'manual')
+    )
+  `);
+  await postgresPool.query(`
+    CREATE TABLE IF NOT EXISTS sms_payment_logs (
+      id BIGSERIAL PRIMARY KEY,
+      utr TEXT NOT NULL,
+      amount_paise INTEGER NOT NULL,
+      received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      order_id TEXT,
+      result TEXT NOT NULL,
+      raw_message TEXT NOT NULL
     )
   `);
 
@@ -859,13 +877,24 @@ async function startServer() {
   const setOrderAccessCookie = (
     res: express.Response,
     orderId: string,
-    accessToken: string
+    accessToken: string,
+    maxAgeSeconds = 45 * 24 * 60 * 60
   ) => {
     const cookieName = orderAccessCookieName(orderId);
     if (!cookieName) return;
     res.append(
       'Set-Cookie',
-      `${cookieName}=${encodeURIComponent(accessToken)}; Path=/api/orders; HttpOnly; SameSite=Strict; Max-Age=${45 * 24 * 60 * 60}${
+      `${cookieName}=${encodeURIComponent(accessToken)}; Path=/api/orders; HttpOnly; SameSite=Strict; Max-Age=${maxAgeSeconds}${
+        process.env.NODE_ENV === 'production' ? '; Secure' : ''
+      }`
+    );
+  };
+  const clearOrderAccessCookie = (res: express.Response, orderId: string) => {
+    const cookieName = orderAccessCookieName(orderId);
+    if (!cookieName) return;
+    res.append(
+      'Set-Cookie',
+      `${cookieName}=; Path=/api/orders; HttpOnly; SameSite=Strict; Max-Age=0${
         process.env.NODE_ENV === 'production' ? '; Secure' : ''
       }`
     );
@@ -1002,6 +1031,113 @@ async function startServer() {
       transaction.committed = true;
     }
   };
+  const reconcileVaultReservations = async (client: import('pg').PoolClient) => {
+    const activeOrders = await client.query<{ id: string }>(
+      `SELECT id FROM orders WHERE status = 'utr_submitted' AND delivered = 0`
+    );
+    const activeOrderIds = new Set(activeOrders.rows.map((row) => row.id));
+    const staleReservationIds = new Set(
+      db.vault
+        .map((item) => item.reservedOrderId)
+        .filter(
+          (orderId): orderId is string =>
+            typeof orderId === 'string' && !activeOrderIds.has(orderId)
+        )
+    );
+    const affectedPools = new Set<VaultPoolType>();
+    for (const orderId of staleReservationIds) {
+      for (const item of db.vault) {
+        if (item.reservedOrderId === orderId) affectedPools.add(item.poolType);
+      }
+      releaseStock(db.vault, orderId, new Date().toISOString());
+    }
+    for (const pool of affectedPools) syncVaultDisplayCounter(pool);
+    return activeOrderIds;
+  };
+  const deliverSubmittedPayment = async (
+    client: import('pg').PoolClient,
+    orderId: string,
+    source: 'manual' | 'sms',
+    requestedCredentials = ''
+  ) => {
+    const result = await client.query<{
+      id: string;
+      product: PackType;
+      quantity: number;
+      amount_paise: number;
+      status: PaymentStatus;
+      utr: string | null;
+      created_at: Date;
+      expires_at: Date;
+      delivered: number;
+      pack_label: string;
+      customer_reference: string;
+      custom_spec: string;
+    }>('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
+    const paymentOrder = result.rows[0];
+    if (!paymentOrder) return { result: 'not-found' as const };
+    if (paymentOrder.status === 'paid' || paymentOrder.delivered !== 0) {
+      return { result: 'already-delivered' as const };
+    }
+    if (paymentOrder.status !== 'utr_submitted') {
+      return { result: 'not-pending' as const };
+    }
+
+    let order = db.orders.find((existing) => existing.orderId === orderId);
+    if (!order) {
+      order = {
+        orderId,
+        packLabel: paymentOrder.pack_label,
+        packType: paymentOrder.product,
+        isRental24h: paymentOrder.product === 'rental_24h',
+        rentalDurationHours: paymentOrder.product === 'rental_24h' ? 24 : undefined,
+        quantity: paymentOrder.quantity,
+        unitPrice: paymentOrder.amount_paise / 100 / paymentOrder.quantity,
+        totalAmount: paymentOrder.amount_paise / 100,
+        paymentUpiId: getMerchantUpiId(),
+        utrNumber: paymentOrder.utr || '',
+        upiAppUsed: 'UPI QR',
+        customerReference: paymentOrder.customer_reference,
+        customSpec: paymentOrder.custom_spec,
+        status: 'pending_verification',
+        paymentStatus: 'utr_submitted',
+        deliveredCredentials: '',
+        adminNote: 'Awaiting payment verification.',
+        createdAt: paymentOrder.created_at.toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      db.orders.unshift(order);
+    }
+
+    const deliveryResult = deliverOnce(
+      { delivered: false, status: paymentOrder.status },
+      source,
+      () => deliverOrder(order!, requestedCredentials)
+    );
+    if (deliveryResult !== 'delivered') return { result: deliveryResult, order };
+
+    const updated = await client.query(
+      `UPDATE orders SET status = 'paid', delivered = 1
+       WHERE id = $1 AND status = 'utr_submitted' AND delivered = 0
+       RETURNING id`,
+      [orderId]
+    );
+    if (updated.rowCount !== 1) {
+      throw new Error(`Payment order ${orderId} changed during delivery.`);
+    }
+    order.adminNote = source === 'sms'
+      ? 'Payment verified from SMS notification; Ready Vault ID delivered.'
+      : 'Payment manually confirmed by admin; Ready Vault ID delivered.';
+    if (order.utrNumber) {
+      await client.query(
+        'UPDATE payments SET used_order_id = $2 WHERE utr = $1 AND used_order_id IS NULL',
+        [order.utrNumber, orderId]
+      );
+      await client.query('DELETE FROM verify_attempts WHERE order_id = $1', [orderId]);
+    }
+    syncVaultDisplayCounter(getVaultPoolForPackType(order.packType));
+    return { result: 'delivered' as const, order };
+  };
 
   app.post('/api/create-order', createOrderLimiter, async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
@@ -1010,6 +1146,7 @@ async function startServer() {
       res.status(503).json({ error: 'Payment database is not configured.' });
       return;
     }
+    await reconcileVaultReservations(client);
 
     const upiId = getMerchantUpiId();
     const payeeName = String(process.env.PAYEE_NAME || '').trim();
@@ -1088,15 +1225,6 @@ async function startServer() {
       return;
     }
 
-    const isRental24h = product === 'rental_24h';
-    const availableStock =
-      isRental24h
-        ? db.storeConfig.rentalStockDisplayAvailable
-        : product === 'guarantee_7days'
-          ? db.storeConfig.stock7DayGuaranteeAvailable
-          : product === 'guarantee_1month'
-            ? db.storeConfig.stock1MonthGuaranteeAvailable
-            : db.storeConfig.stockDisplayAvailable;
     const targetPool = getVaultPoolForPackType(product);
     const availableVaultItems = db.vault.filter(
       (item) =>
@@ -1104,7 +1232,7 @@ async function startServer() {
         item.poolType === targetPool &&
         !item.reservedOrderId
     );
-    if (quantity > availableVaultItems.length || quantity > availableStock) {
+    if (quantity > availableVaultItems.length) {
       res.status(409).json({ error: 'Not enough stock is available for this package.' });
       return;
     }
@@ -1112,7 +1240,7 @@ async function startServer() {
     const orderId = `RB_${Date.now()}_${randomBytes(6).toString('hex').toUpperCase()}`;
     const accessToken = randomBytes(32).toString('hex');
     const createdAt = new Date();
-    const expiresAt = new Date(createdAt.getTime() + 30 * 60 * 1000);
+    const expiresAt = new Date(createdAt.getTime() + 15 * 60 * 1000);
     const packLabel = String(body.packLabel || `${quantity} ${product} ID Pack`).trim().slice(0, 80);
     const customerReference = String(body.customerReference || 'Direct UPI Buyer')
       .trim()
@@ -1132,38 +1260,17 @@ async function startServer() {
         `INSERT INTO orders
           (id, product, quantity, amount_paise, status, created_at, expires_at,
            pack_label, customer_reference, custom_spec)
-         VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9)`,
+         VALUES ($1, $2, $3, $4, 'draft', $5, $6, $7, $8, $9)`,
         [orderId, product, quantity, amountPaise, createdAt, expiresAt, packLabel, customerReference, customSpec]
       );
       db.orderAccessTokens[orderId] = createHash('sha256').update(accessToken).digest('hex');
-      db.orders.unshift({
-        orderId,
-        packLabel,
-        packType: product,
-        isRental24h,
-        rentalDurationHours: isRental24h ? 24 : undefined,
-        quantity,
-        unitPrice: amountRupees / quantity,
-        totalAmount: amountRupees,
-        paymentUpiId: upiId,
-        utrNumber: '',
-        upiAppUsed: 'UPI QR',
-        customerReference,
-        customSpec,
-        status: 'pending_verification',
-        paymentStatus: 'pending',
-        deliveredCredentials: '',
-        adminNote: 'Awaiting payment verification.',
-        createdAt: createdAt.toISOString(),
-        updatedAt: createdAt.toISOString(),
-      });
       await saveDb(db);
-      setOrderAccessCookie(res, orderId, accessToken);
+      setOrderAccessCookie(res, orderId, accessToken, 15 * 60);
       res.status(201).json({
         orderId,
         amount: amountRupees,
         amountPaise,
-        status: 'pending',
+        status: 'draft',
         createdAt: createdAt.toISOString(),
         upiLink,
         upiId,
@@ -1214,6 +1321,14 @@ async function startServer() {
         return;
       }
 
+      if (paymentOrder.status === 'draft') {
+        await client.query('DELETE FROM orders WHERE id = $1 AND status = $2', [orderId, 'draft']);
+        delete db.orderAccessTokens[orderId];
+        await saveDb(db);
+        clearOrderAccessCookie(res, orderId);
+        res.json({ status: 'draft', cancelled: true });
+        return;
+      }
       if (paymentOrder.status === 'paid') {
         await commitCheckoutTransaction();
         res.json({ status: 'paid', cancelled: false });
@@ -1225,24 +1340,8 @@ async function startServer() {
         return;
       }
 
-      await client.query(
-        `UPDATE orders SET status = 'expired'
-         WHERE id = $1 AND status IN ('pending', 'utr_submitted') AND delivered = 0`,
-        [orderId]
-      );
-      for (const item of db.vault) {
-        if (item.reservedOrderId === orderId) {
-          item.reservedOrderId = undefined;
-          item.updatedAt = new Date().toISOString();
-        }
-      }
-      syncVaultDisplayCounter(getVaultPoolForPackType(paymentOrder.product));
-      const order = db.orders.find((item) => item.orderId === orderId);
-      if (order) order.paymentStatus = 'expired';
-      await saveDb(db);
-      broadcastStateUpdate('order_cancelled', { orderId });
-      broadcastStateUpdate('vault_updated', {});
-      res.json({ status: 'expired', cancelled: true });
+      await commitCheckoutTransaction();
+      res.json({ status: paymentOrder.status, cancelled: false });
     } catch (error) {
       console.error('Failed to cancel UPI order:', error);
       res.status(500).json({ error: 'The order could not be cancelled.' });
@@ -1301,14 +1400,79 @@ async function startServer() {
       return;
     }
     try {
+      const receivedAt = new Date();
       await client.query(
         `INSERT INTO payments (utr, amount_paise, received_at, raw_message)
          VALUES ($1, $2, clock_timestamp(), $3)
          ON CONFLICT (utr) DO NOTHING`,
         [utrMatch[1], amountPaise, message]
       );
-      await commitCheckoutTransaction();
-      res.status(200).json({ ok: true });
+      const savedPayment = await client.query<{ amount_paise: number }>(
+        'SELECT amount_paise FROM payments WHERE utr = $1',
+        [utrMatch[1]]
+      );
+      const orderResult = await client.query<{
+        id: string;
+        status: PaymentStatus;
+        utr: string;
+        amount_paise: number;
+        created_at: Date;
+        delivered: number;
+      }>('SELECT id, status, utr, amount_paise, created_at, delivered FROM orders WHERE utr = $1 FOR UPDATE', [
+        utrMatch[1],
+      ]);
+      const matchedOrder = orderResult.rows[0];
+      let result = 'unmatched';
+      let orderId: string | null = null;
+      let delivered = false;
+
+      if (matchedOrder) {
+        orderId = matchedOrder.id;
+        const paymentMatches = matchesSmsPayment(
+          {
+            utr: matchedOrder.utr,
+            amountPaise: matchedOrder.amount_paise,
+            createdAt: matchedOrder.created_at,
+          },
+          { utr: utrMatch[1], amountPaise, receivedAt }
+        );
+        if (
+          savedPayment.rows[0]?.amount_paise !== amountPaise ||
+          matchedOrder.amount_paise !== amountPaise
+        ) {
+          result = 'amount_mismatch';
+        } else if (!paymentMatches) {
+          result = 'received_before_order';
+        } else if (matchedOrder.status === 'paid' || matchedOrder.delivered !== 0) {
+          result = 'ignored_already_paid';
+          await client.query(
+            'UPDATE payments SET used_order_id = $2 WHERE utr = $1 AND used_order_id IS NULL',
+            [utrMatch[1], matchedOrder.id]
+          );
+        } else if (matchedOrder.status === 'utr_submitted') {
+          const delivery = await deliverSubmittedPayment(client, matchedOrder.id, 'sms');
+          result = delivery.result;
+          if (delivery.result === 'delivered') {
+            delivered = true;
+          }
+        } else {
+          result = `ignored_${matchedOrder.status}`;
+        }
+      }
+
+      await client.query(
+        `INSERT INTO sms_payment_logs (utr, amount_paise, received_at, order_id, result, raw_message)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [utrMatch[1], amountPaise, receivedAt, orderId, result, message]
+      );
+      if (delivered) {
+        await saveDb(db);
+        broadcastStateUpdate('order_verified', { orderId, source: 'sms' });
+        broadcastStateUpdate('vault_updated', {});
+      } else {
+        await commitCheckoutTransaction();
+      }
+      res.status(200).json({ ok: true, result });
     } catch (error) {
       console.error('Failed to save SMS payment notification:', error);
       res.status(200).json({ ok: false });
@@ -1335,7 +1499,7 @@ async function startServer() {
         product: PackType;
         quantity: number;
         amount_paise: number;
-        status: 'pending' | 'utr_submitted' | 'paid' | 'expired' | 'rejected';
+        status: PaymentStatus;
         utr: string | null;
         created_at: Date;
         expires_at: Date;
@@ -1368,15 +1532,27 @@ async function startServer() {
         res.status(409).json({ error: 'This order was rejected.' });
         return;
       }
-      if (paymentOrder.status === 'expired' || paymentOrder.expires_at.getTime() <= Date.now()) {
+      await reconcileVaultReservations(client);
+      if (paymentOrder.status === 'draft' && isDraftExpired(paymentOrder.expires_at)) {
+        await client.query("DELETE FROM orders WHERE id = $1 AND status = 'draft'", [orderId]);
+        delete db.orderAccessTokens[orderId];
+        await saveDb(db);
+        clearOrderAccessCookie(res, orderId);
+        res.json({ status: 'expired' });
+        return;
+      }
+      if (
+        paymentOrder.status === 'expired' ||
+        (paymentOrder.status === 'utr_submitted' && paymentOrder.expires_at.getTime() <= Date.now())
+      ) {
         if (paymentOrder.status !== 'expired') {
-          await client.query("UPDATE orders SET status = 'expired' WHERE id = $1", [orderId]);
-          for (const item of db.vault) {
-            if (item.reservedOrderId === orderId) {
-              item.reservedOrderId = undefined;
-              item.updatedAt = new Date().toISOString();
-            }
-          }
+          await client.query(
+            "UPDATE orders SET status = 'expired' WHERE id = $1 AND status = 'utr_submitted'",
+            [orderId]
+          );
+          releaseStock(db.vault, orderId, new Date().toISOString());
+          const order = db.orders.find((existing) => existing.orderId === orderId);
+          if (order) order.paymentStatus = 'expired';
           syncVaultDisplayCounter(getVaultPoolForPackType(paymentOrder.product));
           await saveDb(db);
           broadcastStateUpdate('vault_updated', {});
@@ -1389,6 +1565,10 @@ async function startServer() {
       if (paymentOrder.utr === utr && paymentOrder.status === 'utr_submitted') {
         await commitCheckoutTransaction();
         res.json({ status: 'utr_submitted' });
+        return;
+      }
+      if (paymentOrder.status !== 'draft' && paymentOrder.status !== 'pending') {
+        res.status(409).json({ error: 'This order has already received a UTR submission.' });
         return;
       }
       const clientKey = createHash('sha256').update(req.ip || 'unknown').digest('hex');
@@ -1431,24 +1611,94 @@ async function startServer() {
         res.status(409).json({ error: 'This order cannot accept a UTR in its current state.' });
         return;
       }
+      const poolType = getVaultPoolForPackType(paymentOrder.product);
+      if (!reserveStock(db.vault, poolType, orderId, paymentOrder.quantity)) {
+        await commitCheckoutTransaction();
+        res.status(409).json({ error: 'Not enough available IDs to reserve this order.' });
+        return;
+      }
+      const submittedAt = new Date();
       const submitted = await client.query(
-        `UPDATE orders SET status = 'utr_submitted', utr = $2
-         WHERE id = $1 AND status IN ('pending', 'utr_submitted') AND delivered = 0`,
-        [orderId, utr]
+        `UPDATE orders SET status = 'utr_submitted', utr = $2,
+             expires_at = $3 + INTERVAL '30 minutes'
+         WHERE id = $1 AND status IN ('draft', 'pending') AND delivered = 0
+         RETURNING id`,
+        [orderId, utr, submittedAt]
       );
       if (submitted.rowCount !== 1) {
-        throw new Error(`Could not submit UTR for payment order ${orderId}.`);
+        res.status(409).json({ error: 'This order is no longer available for UTR submission.' });
+        return;
       }
-      const order = db.orders.find((existing) => existing.orderId === orderId);
-      if (order) {
+      const now = submittedAt.toISOString();
+      for (const item of db.vault) {
+        if (item.reservedOrderId === orderId) item.updatedAt = now;
+      }
+      let order = db.orders.find((existing) => existing.orderId === orderId);
+      if (!order) {
+        order = {
+          orderId,
+          packLabel: paymentOrder.pack_label,
+          packType: paymentOrder.product,
+          isRental24h: paymentOrder.product === 'rental_24h',
+          rentalDurationHours: paymentOrder.product === 'rental_24h' ? 24 : undefined,
+          quantity: paymentOrder.quantity,
+          unitPrice: paymentOrder.amount_paise / 100 / paymentOrder.quantity,
+          totalAmount: paymentOrder.amount_paise / 100,
+          paymentUpiId: getMerchantUpiId(),
+          utrNumber: utr,
+          upiAppUsed: 'UPI QR',
+          customerReference: paymentOrder.customer_reference,
+          customSpec: paymentOrder.custom_spec,
+          status: 'pending_verification',
+          paymentStatus: 'utr_submitted',
+          deliveredCredentials: '',
+          adminNote: 'Awaiting payment verification.',
+          createdAt: now,
+          updatedAt: now,
+        };
+        db.orders.unshift(order);
+      } else {
         order.utrNumber = utr;
         order.paymentStatus = 'utr_submitted';
-        order.updatedAt = new Date().toISOString();
+        order.updatedAt = now;
+      }
+      syncVaultDisplayCounter(poolType);
+      setOrderAccessCookie(res, orderId, authorizedToken);
+      const priorPayment = await client.query<{ utr: string; amount_paise: number; received_at: Date }>(
+        `SELECT utr, amount_paise, received_at FROM payments
+         WHERE utr = $1 AND amount_paise = $2 AND received_at > $3
+           AND used_order_id IS NULL`,
+        [utr, paymentOrder.amount_paise, paymentOrder.created_at]
+      );
+      let paidImmediately = false;
+      if (
+        priorPayment.rows[0] &&
+        matchesSmsPayment(
+          { utr, amountPaise: paymentOrder.amount_paise, createdAt: paymentOrder.created_at },
+          {
+            utr: priorPayment.rows[0].utr,
+            amountPaise: priorPayment.rows[0].amount_paise,
+            receivedAt: priorPayment.rows[0].received_at,
+          }
+        )
+      ) {
+        const delivery = await deliverSubmittedPayment(client, orderId, 'sms');
+        paidImmediately = delivery.result === 'delivered';
+        if (paidImmediately) {
+          await client.query(
+            `UPDATE sms_payment_logs SET order_id = $2, result = 'delivered_on_utr_submit'
+             WHERE utr = $1 AND result = 'unmatched'`,
+            [utr, orderId]
+          );
+        }
       }
       await saveDb(db);
-      await commitCheckoutTransaction();
-      broadcastStateUpdate('order_utr_submitted', { orderId });
-      res.json({ status: 'utr_submitted' });
+      broadcastStateUpdate('order_utr_submitted', { orderId, order });
+      broadcastStateUpdate('vault_updated', {});
+      if (paidImmediately) {
+        broadcastStateUpdate('order_verified', { order, source: 'sms' });
+      }
+      res.json({ status: paidImmediately ? 'paid' : 'utr_submitted', order });
       return;
     } catch (error) {
       console.error('Failed to submit UPI UTR:', error);
@@ -1469,7 +1719,7 @@ async function startServer() {
         'SELECT status FROM orders WHERE id = $1',
         [req.params.id]
       );
-      if (!result.rows[0]) {
+      if (!result.rows[0] || result.rows[0].status === 'draft') {
         res.status(404).json({ status: 'not_found' });
         return;
       }
@@ -1669,20 +1919,30 @@ async function startServer() {
   // Public Store Config
   app.get('/api/store', (_req, res) => {
     res.setHeader('Cache-Control', 'no-store');
+    const activeReservationIds = new Set(
+      db.orders
+        .filter(
+          (order) =>
+            order.status === 'pending_verification' &&
+            order.paymentStatus === 'utr_submitted'
+        )
+        .map((order) => order.orderId)
+    );
+    const isAvailableVaultItem = (item: VaultItem) =>
+      !item.isAssigned &&
+      (!item.reservedOrderId || activeReservationIds.has(item.reservedOrderId));
     const vaultStock = {
       permanent: db.vault.filter(
-        (item) => item.poolType === 'permanent' && !item.isAssigned && !item.reservedOrderId
+        (item) => item.poolType === 'permanent' && isAvailableVaultItem(item)
       ).length,
       rental_24h: db.vault.filter(
-        (item) => item.poolType === 'rental_24h' && !item.isAssigned && !item.reservedOrderId
+        (item) => item.poolType === 'rental_24h' && isAvailableVaultItem(item)
       ).length,
       guarantee_7days: db.vault.filter(
-        (item) =>
-          item.poolType === 'guarantee_7days' && !item.isAssigned && !item.reservedOrderId
+        (item) => item.poolType === 'guarantee_7days' && isAvailableVaultItem(item)
       ).length,
       guarantee_1month: db.vault.filter(
-        (item) =>
-          item.poolType === 'guarantee_1month' && !item.isAssigned && !item.reservedOrderId
+        (item) => item.poolType === 'guarantee_1month' && isAvailableVaultItem(item)
       ).length,
     };
     const storeConfig = {
@@ -1692,22 +1952,10 @@ async function startServer() {
             key !== 'presetRentalCredentials' && key !== 'presetPermanentCredentials'
         )
       ),
-      stockDisplayAvailable: Math.min(
-        db.storeConfig.stockDisplayAvailable,
-        vaultStock.permanent
-      ),
-      rentalStockDisplayAvailable: Math.min(
-        db.storeConfig.rentalStockDisplayAvailable,
-        vaultStock.rental_24h
-      ),
-      stock7DayGuaranteeAvailable: Math.min(
-        db.storeConfig.stock7DayGuaranteeAvailable,
-        vaultStock.guarantee_7days
-      ),
-      stock1MonthGuaranteeAvailable: Math.min(
-        db.storeConfig.stock1MonthGuaranteeAvailable,
-        vaultStock.guarantee_1month
-      ),
+      stockDisplayAvailable: vaultStock.permanent,
+      rentalStockDisplayAvailable: vaultStock.rental_24h,
+      stock7DayGuaranteeAvailable: vaultStock.guarantee_7days,
+      stock1MonthGuaranteeAvailable: vaultStock.guarantee_1month,
       upiId: getMerchantUpiId(),
       payeeName: String(process.env.PAYEE_NAME || '').trim(),
     };
@@ -2294,6 +2542,7 @@ async function startServer() {
         guaranteeClaims: claims,
         guaranteeClaimsTotal: normalizedClaims.length,
         vault: db.vault,
+        smsPaymentLogs: [],
         summary,
         replacementCounts,
         ordersOffset: orderOffset,
@@ -2394,8 +2643,14 @@ async function startServer() {
           claimQuery,
         ]
       );
+      const smsPaymentLogs = await query(
+        `SELECT utr, amount_paise AS "amountPaise", received_at AS "receivedAt",
+                order_id AS "orderId", result, raw_message AS "rawMessage"
+         FROM sms_payment_logs ORDER BY id DESC LIMIT 50`
+      );
       res.json({
         ...result.rows[0],
+        smsPaymentLogs: smsPaymentLogs.rows,
         ordersOffset: orderOffset,
         claimsOffset: claimOffset,
         ordersPageSize,
@@ -2623,169 +2878,55 @@ async function startServer() {
     }
 
     try {
-      let paymentOrderResult = await client.query<{
-        id: string;
-        product: PackType;
-        quantity: number;
-        amount_paise: number;
-        status: 'pending' | 'utr_submitted' | 'paid' | 'expired' | 'rejected';
-        utr: string | null;
-        created_at: Date;
-        expires_at: Date;
+      const paymentOrderResult = await client.query<{
+        status: PaymentStatus;
         delivered: number;
-        pack_label: string;
-        customer_reference: string;
-        custom_spec: string;
-      }>('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
-      let paymentOrder = paymentOrderResult.rows[0];
-      let order = db.orders.find((existing) => existing.orderId === orderId);
-
+        utr: string | null;
+      }>('SELECT status, delivered, utr FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
+      const paymentOrder = paymentOrderResult.rows[0];
       if (!paymentOrder) {
-        if (!order) {
-          res.status(404).json({ error: 'Order not found.' });
-          return;
-        }
-        if (order.status === 'rejected') {
-          res.status(409).json({ error: 'Rejected orders cannot be manually marked as paid.' });
-          return;
-        }
-        if (!isPackType(order.packType)) {
-          res.status(409).json({ error: 'Order has an invalid product type.' });
-          return;
-        }
-        const amountPaise = Math.round(order.totalAmount * 100);
-        const createdAt = new Date(order.createdAt);
-        if (!Number.isSafeInteger(amountPaise) || amountPaise <= 0 || !Number.isFinite(createdAt.getTime())) {
-          res.status(409).json({ error: 'Order payment details are invalid.' });
-          return;
-        }
-        const expiresAt = new Date(createdAt.getTime() + 30 * 60 * 1000);
-        const status =
-          order.status === 'verified_delivered'
-            ? 'paid'
-            : expiresAt.getTime() <= Date.now()
-              ? 'expired'
-              : 'pending';
-        await client.query(
-          `INSERT INTO orders
-            (id, product, quantity, amount_paise, status, utr, created_at, expires_at,
-             delivered, pack_label, customer_reference, custom_spec)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-           ON CONFLICT (id) DO NOTHING`,
-          [
-            orderId,
-            order.packType,
-            order.quantity,
-            amountPaise,
-            status,
-            order.utrNumber || null,
-            createdAt,
-            expiresAt,
-            order.status === 'verified_delivered' ? 1 : 0,
-            order.packLabel,
-            order.customerReference,
-            order.customSpec,
-          ]
-        );
-        paymentOrderResult = await client.query(
-          'SELECT * FROM orders WHERE id = $1 FOR UPDATE',
-          [orderId]
-        );
-        paymentOrder = paymentOrderResult.rows[0];
-      }
-
-      if (!paymentOrder) {
-        throw new Error(`Could not load payment order ${orderId} after creating its record.`);
-      }
-
-      if (paymentOrder.status === 'rejected') {
-        res.status(409).json({ error: 'Rejected orders cannot be manually marked as paid.' });
+        res.status(404).json({ error: 'Order not found.' });
         return;
       }
-
       await client.query(
         "INSERT INTO manual_payment_logs (order_id, source) VALUES ($1, 'manual')",
         [orderId]
       );
-
-      if (paymentOrder.delivered !== 0) {
+      if (paymentOrder.status === 'paid' || paymentOrder.delivered !== 0) {
         await commitCheckoutTransaction();
         res.json({ status: 'paid', alreadyDelivered: true });
         return;
       }
-
-      if (order?.status === 'rejected') {
-        res.status(409).json({ error: 'Rejected orders cannot be manually marked as paid.' });
+      if (paymentOrder.status !== 'utr_submitted') {
+        res.status(409).json({ error: 'Only orders with a submitted UTR can be delivered.' });
         return;
       }
-
-      if (!order) {
-        const now = new Date().toISOString();
-        order = {
-          orderId,
-          packLabel: paymentOrder.pack_label,
-          packType: paymentOrder.product,
-          isRental24h: paymentOrder.product === 'rental_24h',
-          rentalDurationHours: paymentOrder.product === 'rental_24h' ? 24 : undefined,
-          quantity: paymentOrder.quantity,
-          unitPrice: paymentOrder.amount_paise / 100 / paymentOrder.quantity,
-          totalAmount: paymentOrder.amount_paise / 100,
-          paymentUpiId: getMerchantUpiId(),
-          utrNumber: paymentOrder.utr || '',
-          upiAppUsed: 'UPI QR',
-          customerReference: paymentOrder.customer_reference,
-          customSpec: paymentOrder.custom_spec,
-          status: 'pending_verification',
-          deliveredCredentials: '',
-          adminNote: 'Awaiting payment verification.',
-          createdAt: paymentOrder.created_at.toISOString(),
-          updatedAt: now,
-        };
+      if (!paymentOrder.utr || !LIMITS.UTR_REGEX.test(paymentOrder.utr)) {
+        res.status(409).json({ error: 'This order does not have a valid submitted UTR.' });
+        return;
       }
-
-      const verifiedOrderId = order.utrNumber ? db.utrIndex[order.utrNumber] : undefined;
+      const order = db.orders.find((existing) => existing.orderId === orderId);
+      if (!order || order.status !== 'pending_verification') {
+        res.status(409).json({ error: 'The order is not awaiting payment review.' });
+        return;
+      }
+      const verifiedOrderId = db.utrIndex[paymentOrder.utr];
       if (verifiedOrderId && verifiedOrderId !== orderId) {
         res.status(409).json({ error: 'This UTR has already been used for another order.' });
         return;
       }
-
-      const deliveryState = { delivered: paymentOrder.delivered !== 0, status: paymentOrder.status };
       const requestedCredentials = String(req.body?.deliveredCredentials || '').trim();
-      const deliveryResult = deliverOnce(deliveryState, 'manual', () =>
-        deliverOrder(order!, requestedCredentials)
-      );
-      if (deliveryResult === 'already-delivered') {
-        await commitCheckoutTransaction();
-        res.json({ status: deliveryState.status, alreadyDelivered: true });
-        return;
-      }
-      if (deliveryResult === 'unavailable') {
-        await commitCheckoutTransaction();
+      const delivery = await deliverSubmittedPayment(client, orderId, 'manual', requestedCredentials);
+      if (delivery.result !== 'delivered') {
         res.status(409).json({
           error: 'Not enough available IDs in the matching vault pool to deliver this order.',
         });
         return;
       }
-
-      const updated = await client.query(
-        "UPDATE orders SET status = 'paid', delivered = 1, utr = COALESCE(utr, $2) WHERE id = $1 AND delivered = 0",
-        [orderId, order.utrNumber || null]
-      );
-      if (updated.rowCount !== 1) {
-        throw new Error(`Payment order ${orderId} was delivered by another transaction.`);
-      }
-      if (order.utrNumber) {
-        await client.query(
-          'UPDATE payments SET used_order_id = $2 WHERE utr = $1 AND used_order_id IS NULL',
-          [order.utrNumber, orderId]
-        );
-        await client.query('DELETE FROM verify_attempts WHERE order_id = $1', [orderId]);
-      }
-      syncVaultDisplayCounter(getVaultPoolForPackType(order.packType));
       await saveDb(db);
-      broadcastStateUpdate('order_verified', { order, source: 'manual' });
+      broadcastStateUpdate('order_verified', { order: delivery.order, source: 'manual' });
       broadcastStateUpdate('vault_updated', {});
-      res.json({ status: 'paid', alreadyDelivered: false, order });
+      res.json({ status: 'paid', alreadyDelivered: false, order: delivery.order });
     } catch (error) {
       console.error('Failed to manually mark UPI order as paid:', error);
       res.status(500).json({ error: 'The order could not be marked paid.' });
@@ -2912,26 +3053,82 @@ async function startServer() {
     }
 
     if (postgresPool) {
-      await postgresPool.query(
-        "UPDATE orders SET status = 'rejected' WHERE id = $1 AND delivered = 0 AND status <> 'paid'",
+      const client = getCheckoutClient();
+      if (!client) {
+        res.status(503).json({ error: 'Payment database is not configured.' });
+        return;
+      }
+      const updated = await client.query(
+        `UPDATE orders SET status = 'rejected'
+         WHERE id = $1 AND delivered = 0 AND status = 'utr_submitted'
+         RETURNING id`,
         [order.orderId]
       );
+      if (updated.rowCount !== 1) {
+        res.status(409).json({ error: 'Only unpaid submitted orders can be rejected.' });
+        return;
+      }
     }
+    const now = new Date().toISOString();
     order.status = 'rejected';
     order.paymentStatus = 'rejected';
     order.adminNote =
       'Payment UTR could not be verified. Please contact support with payment screenshot.';
-    order.updatedAt = new Date().toISOString();
-    for (const item of db.vault) {
-      if (item.reservedOrderId === order.orderId) {
-        item.reservedOrderId = undefined;
-        item.updatedAt = order.updatedAt;
-      }
-    }
+    order.updatedAt = now;
+    releaseStock(db.vault, order.orderId, now);
+    syncVaultDisplayCounter(getVaultPoolForPackType(order.packType));
     if (!(await persistDbOrRespond(res))) return;
     broadcastStateUpdate('order_rejected', { order });
+    broadcastStateUpdate('vault_updated', {});
 
     res.json({ order });
+  });
+
+  app.post('/api/admin/orders/cleanup-fake-utrs', async (req, res) => {
+    const rawOrderIds: unknown[] = Array.isArray(req.body?.orderIds) ? req.body.orderIds : [];
+    const orderIds = [
+      ...new Set(rawOrderIds.map((id) => String(id).trim()).filter((id) => id.length > 0)),
+    ];
+    if (orderIds.length === 0 || orderIds.length > 100) {
+      res.status(400).json({ error: 'Provide 1 to 100 legacy order IDs to clean up.' });
+      return;
+    }
+
+    const client = getCheckoutClient();
+    if (postgresPool && !client) {
+      res.status(503).json({ error: 'Payment database is not configured.' });
+      return;
+    }
+    const rejected: string[] = [];
+    const now = new Date().toISOString();
+    for (const orderId of orderIds) {
+      const order = db.orders.find((item) => item.orderId === orderId);
+      if (!order || order.status !== 'pending_verification' || !LIMITS.UTR_REGEX.test(order.utrNumber)) {
+        continue;
+      }
+      if (client) {
+        const updated = await client.query(
+          `UPDATE orders SET status = 'rejected'
+           WHERE id = $1 AND status = 'utr_submitted' AND delivered = 0 AND utr IS NOT NULL
+           RETURNING id`,
+          [orderId]
+        );
+        if (updated.rowCount !== 1) continue;
+      }
+      order.status = 'rejected';
+      order.paymentStatus = 'rejected';
+      order.adminNote = 'Legacy UTR order rejected during one-time fake-order cleanup.';
+      order.updatedAt = now;
+      releaseStock(db.vault, orderId, now);
+      syncVaultDisplayCounter(getVaultPoolForPackType(order.packType));
+      rejected.push(orderId);
+    }
+    if (!(await persistDbOrRespond(res))) return;
+    if (rejected.length) {
+      broadcastStateUpdate('orders_rejected', { orderIds: rejected });
+      broadcastStateUpdate('vault_updated', {});
+    }
+    res.json({ rejectedOrderIds: rejected });
   });
 
   // Admin Delete Order
@@ -3108,22 +3305,43 @@ async function startServer() {
 
       const expiredResult = await client.query<{ id: string; product: PackType }>(
         `UPDATE orders SET status = 'expired'
-         WHERE status IN ('pending', 'utr_submitted') AND expires_at <= NOW()
+         WHERE status = 'utr_submitted' AND expires_at <= NOW()
          RETURNING id, product`
       );
-      if (expiredResult.rowCount) {
-        const expiredIds = new Set(expiredResult.rows.map((row) => row.id));
-        const expiredPools = new Set(
-          expiredResult.rows.map((row) => getVaultPoolForPackType(row.product))
-        );
-        const now = new Date().toISOString();
+      const draftsResult = await client.query<{ id: string }>(
+        `DELETE FROM orders WHERE status = 'draft' AND expires_at <= NOW() RETURNING id`
+      );
+      const activeOrders = await client.query<{ id: string }>(
+        `SELECT id FROM orders WHERE status = 'utr_submitted' AND delivered = 0`
+      );
+      const activeOrderIds = new Set(activeOrders.rows.map((row) => row.id));
+      const now = new Date().toISOString();
+      const expiredIds = new Set(expiredResult.rows.map((row) => row.id));
+      const affectedPools = new Set<VaultPoolType>(
+        expiredResult.rows.map((row) => getVaultPoolForPackType(row.product))
+      );
+      for (const id of expiredIds) {
+        releaseStock(db.vault, id, now);
+        const order = db.orders.find((item) => item.orderId === id);
+        if (order) order.paymentStatus = 'expired';
+      }
+      const staleReservationIds = new Set(
+        db.vault
+          .map((item) => item.reservedOrderId)
+          .filter(
+            (orderId): orderId is string =>
+              typeof orderId === 'string' && !activeOrderIds.has(orderId)
+          )
+      );
+      for (const id of staleReservationIds) {
         for (const item of db.vault) {
-          if (item.reservedOrderId && expiredIds.has(item.reservedOrderId)) {
-            item.reservedOrderId = undefined;
-            item.updatedAt = now;
-          }
+          if (item.reservedOrderId === id) affectedPools.add(item.poolType);
         }
-        for (const pool of expiredPools) syncVaultDisplayCounter(pool);
+        releaseStock(db.vault, id, now);
+      }
+      for (const draft of draftsResult.rows) delete db.orderAccessTokens[draft.id];
+      for (const pool of affectedPools) syncVaultDisplayCounter(pool);
+      if (expiredResult.rowCount || draftsResult.rowCount || staleReservationIds.size) {
         const state = JSON.stringify(db);
         await client.query(
           'UPDATE roshanbrand_state SET state = $1::jsonb, updated_at = NOW() WHERE id = 1',
@@ -3131,8 +3349,10 @@ async function startServer() {
         );
         await client.query('COMMIT');
         lastPersistedState = state;
-        broadcastStateUpdate('orders_expired', { count: expiredResult.rowCount });
-        broadcastStateUpdate('vault_updated', {});
+        if (expiredResult.rowCount) {
+          broadcastStateUpdate('orders_expired', { count: expiredResult.rowCount });
+          broadcastStateUpdate('vault_updated', {});
+        }
       } else {
         await client.query('COMMIT');
       }
@@ -3151,6 +3371,9 @@ async function startServer() {
     });
   }, 60_000);
   expiryTimer.unref();
+  void expirePendingPaymentOrders().catch((error: unknown) => {
+    console.error('Failed to run startup order cleanup:', error);
+  });
 
   // Vite Middleware (Development) or Static Dist (Production)
   if (process.env.NODE_ENV !== 'production') {

@@ -68,6 +68,13 @@ function getVaultPoolLabel(poolType: VaultPoolType): string {
   }
 }
 
+const VAULT_POOLS: { poolType: VaultPoolType; label: string }[] = [
+  { poolType: 'rental_24h', label: '24H Rental' },
+  { poolType: 'permanent', label: 'Permanent' },
+  { poolType: 'guarantee_7days', label: '7 Days Guarantee' },
+  { poolType: 'guarantee_1month', label: '1 Month Guarantee' },
+];
+
 export const AdminPortal: React.FC<AdminPortalProps> = ({
   storeConfig,
   onConfigUpdated,
@@ -76,10 +83,6 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   const [activeTab, setActiveTab] = useState<AdminTab>('orders');
   const [orders, setOrders] = useState<OrderRecord[]>([]);
   const [vault, setVault] = useState<VaultItem[]>([]);
-  const availableRentalVaultStock = vault.filter(
-    (item) =>
-      item.poolType === 'rental_24h' && !item.isAssigned && !item.reservedOrderId
-  ).length;
   const [guaranteeClaims, setGuaranteeClaims] = useState<GuaranteeClaim[]>([]);
   const [ordersOffset, setOrdersOffset] = useState(0);
   const [claimsOffset, setClaimsOffset] = useState(0);
@@ -378,7 +381,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
         setSupportUrlDirty(false);
         onConfigUpdated(data.storeConfig);
         setSaveSuccess(
-          `Settings saved. 7 Days: ${data.storeConfig.stock7DayGuaranteeAvailable} IDs · 1 Month: ${data.storeConfig.stock1MonthGuaranteeAvailable} IDs.`
+          `Budgets saved. Permanent: ${data.storeConfig.stockDisplayAvailable} · 24H Rental: ${data.storeConfig.rentalStockDisplayAvailable} · 7 Days: ${data.storeConfig.stock7DayGuaranteeAvailable} · 1 Month: ${data.storeConfig.stock1MonthGuaranteeAvailable} IDs.`
         );
         setTimeout(() => setSaveSuccess(''), 3500);
       }
@@ -2099,16 +2102,34 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
 
                 <div className="space-y-1.5">
                   <label className="block text-xs font-extrabold text-emerald-300">
-                    24H Rental IDs Available
+                    24H Rental IDs Budget
                   </label>
                   <input
                     type="text"
-                    value={availableRentalVaultStock}
-                    readOnly
+                    inputMode="numeric"
+                    min={0}
+                    value={stockInputs.rentalStockDisplayAvailable}
+                    onChange={(e) => {
+                      const value = e.target.value;
+                      setStockInputs((current) => ({
+                        ...current,
+                        rentalStockDisplayAvailable: value,
+                      }));
+                      setDirtyStockInputs((current) => ({
+                        ...current,
+                        rentalStockDisplayAvailable: true,
+                      }));
+                      if (/^\d+$/.test(value) && Number(value) <= 100000) {
+                        setFormConfig((current) => ({
+                          ...current,
+                          rentalStockDisplayAvailable: Number(value),
+                        }));
+                      }
+                    }}
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-emerald-500/40 text-sm text-emerald-400 font-mono font-black"
                   />
                   <p className="text-[11px] text-slate-400">
-                    Automatically calculated from unassigned IDs in the rental vault.
+                    Customer availability is capped by unassigned IDs in the rental vault.
                   </p>
                 </div>
 
@@ -2325,14 +2346,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     Select Vault Pool
                   </label>
                   <div className="grid grid-cols-2 gap-2">
-                    {(
-                      [
-                        ['rental_24h', '24H Rental ID Pool'],
-                        ['permanent', 'Permanent ID Pool'],
-                        ['guarantee_7days', '7 Days Guarantee Pool'],
-                        ['guarantee_1month', '1 Month Guarantee Pool'],
-                      ] as const
-                    ).map(([poolType, label]) => (
+                    {VAULT_POOLS.map(({ poolType, label }) => (
                       <button
                         key={poolType}
                         type="button"
@@ -2343,7 +2357,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                             : 'bg-slate-950 text-slate-300 border-cyan-500/30'
                         }`}
                       >
-                        {label}
+                        {label} ID Pool
                       </button>
                     ))}
                   </div>
@@ -2387,74 +2401,90 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
 
               <div className="lg:col-span-7 neon-card-3d p-6 space-y-4">
                 <div className="flex items-center justify-between border-b border-cyan-500/25 pb-3">
-                  <h3 className="font-display text-sm font-black text-white">
-                    Vault Stock ({readyVaultCount} Ready / {vault.length} Total)
-                  </h3>
+                  <h3 className="font-display text-sm font-black text-white">Vault Stock by ID Type</h3>
                 </div>
 
-                {vault.length === 0 ? (
-                  <div className="p-8 text-center text-xs text-slate-400">
-                    No IDs are available in this pool yet. Add accounts on the left; they will be
-                    assigned after payment is manually verified.
-                  </div>
-                ) : (
-                  <div className="space-y-2.5 max-h-[500px] overflow-y-auto pr-1">
-                    {vault.map((item) => (
-                      <div
-                        key={item.vaultId}
-                        className={`p-3.5 rounded-xl border flex items-center justify-between gap-3 ${
-                          item.isAssigned
-                            ? 'bg-slate-950/50 border-slate-800 opacity-60'
-                            : item.reservedOrderId
-                              ? 'bg-amber-950/30 border-amber-500/40'
-                            : 'bg-slate-950/90 border-cyan-500/35'
-                        }`}
-                      >
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-2 flex-wrap">
-                            <span
-                              className={`w-2 h-2 rounded-full ${
-                                item.isAssigned
-                                  ? 'bg-slate-600'
-                                  : item.reservedOrderId
-                                    ? 'bg-amber-400'
-                                  : 'bg-emerald-400 shadow-[0_0_8px_#34d399]'
-                              }`}
-                            />
-                            <p className="font-mono text-xs text-white font-bold truncate">
-                              {item.irctcUsername} | {item.irctcPassword}
-                            </p>
-                            <span className="text-[10px] font-bold text-cyan-300">
-                              · {getVaultPoolLabel(item.poolType)}
-                            </span>
-                          </div>
-                          <div className="flex items-center gap-2 mt-1 text-[11px] text-slate-400">
-                            {item.accountNote && <span>{item.accountNote}</span>}
-                            {item.isAssigned && (
-                              <span className="text-cyan-400 font-mono font-semibold">
-                                Delivered in Order: {item.assignedOrderId}
-                              </span>
-                            )}
-                            {!item.isAssigned && item.reservedOrderId && (
-                              <span className="text-amber-300 font-mono font-semibold">
-                                Reserved for Order: {item.reservedOrderId}
-                              </span>
-                            )}
-                          </div>
-                        </div>
+                <div className="space-y-4 max-h-[650px] overflow-y-auto pr-1">
+                  {VAULT_POOLS.map(({ poolType, label }) => {
+                    const poolItems = vault.filter((item) => item.poolType === poolType);
+                    const poolReadyCount = poolItems.filter(
+                      (item) => !item.isAssigned && !item.reservedOrderId
+                    ).length;
 
-                        <button
-                          type="button"
-                          onClick={() => handleDeleteVaultItem(item.vaultId)}
-                          className="p-2 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-rose-950/50 transition-colors cursor-pointer"
-                          title="Remove from Vault"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
+                    return (
+                      <section
+                        key={poolType}
+                        className="rounded-xl border border-cyan-500/20 bg-slate-950/40 p-3"
+                      >
+                        <div className="mb-2 flex items-center justify-between border-b border-cyan-500/15 pb-2">
+                          <h4 className="text-xs font-black text-cyan-200">{label}</h4>
+                          <span className="text-[11px] font-mono font-bold text-slate-300">
+                            {poolReadyCount} Ready / {poolItems.length} Total
+                          </span>
+                        </div>
+                        {poolItems.length === 0 ? (
+                          <p className="py-3 text-center text-[11px] text-slate-500">
+                            No IDs in this pool yet.
+                          </p>
+                        ) : (
+                          <div className="space-y-2">
+                            {poolItems.map((item) => (
+                              <div
+                                key={item.vaultId}
+                                className={`p-3.5 rounded-xl border flex items-center justify-between gap-3 ${
+                                  item.isAssigned
+                                    ? 'bg-slate-950/50 border-slate-800 opacity-60'
+                                    : item.reservedOrderId
+                                      ? 'bg-amber-950/30 border-amber-500/40'
+                                      : 'bg-slate-950/90 border-cyan-500/35'
+                                }`}
+                              >
+                                <div className="min-w-0 flex-1">
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <span
+                                      className={`w-2 h-2 rounded-full ${
+                                        item.isAssigned
+                                          ? 'bg-slate-600'
+                                          : item.reservedOrderId
+                                            ? 'bg-amber-400'
+                                            : 'bg-emerald-400 shadow-[0_0_8px_#34d399]'
+                                      }`}
+                                    />
+                                    <p className="font-mono text-xs text-white font-bold truncate">
+                                      {item.irctcUsername} | {item.irctcPassword}
+                                    </p>
+                                  </div>
+                                  <div className="flex items-center gap-2 mt-1 text-[11px] text-slate-400">
+                                    {item.accountNote && <span>{item.accountNote}</span>}
+                                    {item.isAssigned && (
+                                      <span className="text-cyan-400 font-mono font-semibold">
+                                        Delivered in Order: {item.assignedOrderId}
+                                      </span>
+                                    )}
+                                    {!item.isAssigned && item.reservedOrderId && (
+                                      <span className="text-amber-300 font-mono font-semibold">
+                                        Reserved for Order: {item.reservedOrderId}
+                                      </span>
+                                    )}
+                                  </div>
+                                </div>
+
+                                <button
+                                  type="button"
+                                  onClick={() => handleDeleteVaultItem(item.vaultId)}
+                                  className="p-2 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-rose-950/50 transition-colors cursor-pointer"
+                                  title="Remove from Vault"
+                                >
+                                  <Trash2 className="w-4 h-4" />
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </section>
+                    );
+                  })}
+                </div>
               </div>
               </div>
             </div>

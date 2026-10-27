@@ -1004,7 +1004,10 @@ async function startServer() {
         db.storeConfig.stockDisplayAvailable,
         vaultStock.permanent
       ),
-      rentalStockDisplayAvailable: vaultStock.rental_24h,
+      rentalStockDisplayAvailable: Math.min(
+        db.storeConfig.rentalStockDisplayAvailable,
+        vaultStock.rental_24h
+      ),
       stock7DayGuaranteeAvailable: Math.min(
         db.storeConfig.stock7DayGuaranteeAvailable,
         vaultStock.guarantee_7days
@@ -1124,10 +1127,7 @@ async function startServer() {
         db.storeConfig.stockDisplayAvailable
       ),
       rentalStockDisplayAvailable: normalizeStock(
-        db.vault.filter(
-          (item) =>
-            item.poolType === 'rental_24h' && !item.isAssigned && !item.reservedOrderId
-        ).length,
+        body.rentalStockDisplayAvailable,
         db.storeConfig.rentalStockDisplayAvailable
       ),
       stock7DayGuaranteeAvailable: normalizeStock(
@@ -1227,7 +1227,7 @@ async function startServer() {
     );
     if (
       quantity > availableVaultItems.length ||
-      (packType !== 'rental_24h' && quantity > availableStock)
+      quantity > availableStock
     ) {
       res.status(409).json({ error: 'Not enough stock is available for this package.' });
       return;

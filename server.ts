@@ -1166,6 +1166,8 @@ async function startServer() {
         orderId,
         amount: amountRupees,
         amountPaise,
+        status: 'pending',
+        createdAt: createdAt.toISOString(),
         upiLink,
         upiId,
         payeeName,
@@ -3094,8 +3096,20 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(__dirname, 'dist');
-    app.use(express.static(distPath));
+    const setNoCacheHeaders = (res: express.Response) => {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
+    };
+    app.use(
+      express.static(distPath, {
+        setHeaders: (res, filePath) => {
+          if (/\.(?:html?|js|mjs)$/i.test(filePath)) setNoCacheHeaders(res);
+        },
+      })
+    );
     app.get('*', (_req, res) => {
+      setNoCacheHeaders(res);
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }

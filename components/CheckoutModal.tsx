@@ -24,6 +24,8 @@ interface CheckoutModalProps {
 interface CreatedPaymentOrder {
   orderId: string;
   amount: number;
+  status: 'pending';
+  createdAt: string;
   upiLink: string;
   upiId: string;
   payeeName: string;
@@ -71,24 +73,34 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         }
         if (active) {
           const createdOrder = data as CreatedPaymentOrder;
-          setPaymentOrder(createdOrder);
-          try {
-            const recent = JSON.parse(localStorage.getItem('roshanbrand_recent_orders') || '[]');
-            const recentIds = Array.isArray(recent)
-              ? recent.filter((id) => typeof id === 'string')
-              : [];
-            localStorage.setItem(
-              'roshanbrand_recent_orders',
-              JSON.stringify(
-                [
-                  createdOrder.orderId,
-                  ...recentIds.filter((id) => id !== createdOrder.orderId),
-                ].slice(0, 10)
-              )
-            );
-          } catch (storageError) {
-            console.error('Could not save recent payment order ID:', storageError);
+          if (createdOrder.status !== 'pending' || !createdOrder.orderId) {
+            throw new Error('Server did not confirm the new order as pending.');
           }
+          setPaymentOrder(createdOrder);
+          onOrderCreated(
+            {
+              orderId: createdOrder.orderId,
+              packLabel: draft.packLabel,
+              packType: draft.packType,
+              isRental24h: draft.isRental24h,
+              rentalDurationHours: draft.isRental24h ? 24 : undefined,
+              quantity: draft.quantity,
+              unitPrice: createdOrder.amount / draft.quantity,
+              totalAmount: createdOrder.amount,
+              paymentUpiId: createdOrder.upiId,
+              utrNumber: '',
+              upiAppUsed: 'UPI QR',
+              customerReference: 'Direct UPI Buyer',
+              customSpec: draft.initialCustomSpec,
+              status: 'pending_verification',
+              paymentStatus: createdOrder.status,
+              deliveredCredentials: '',
+              adminNote: 'Awaiting payment verification.',
+              createdAt: createdOrder.createdAt,
+              updatedAt: createdOrder.createdAt,
+            },
+            createdOrder.accessToken
+          );
         }
       } catch (requestError) {
         if (active) {

@@ -33,19 +33,14 @@ import {
   VaultPoolType,
 } from './types';
 
-const orderAccessStorageKey = (orderId: string) => `roshanbrand_order_access_${orderId}`;
 const cookieAuthenticatedOrder = 'http-only-cookie';
 
-const removeRecentOrder = (orderId: string) => {
+const clearStoredOrderData = () => {
   try {
-    const recentOrders: unknown = JSON.parse(
-      localStorage.getItem('roshanbrand_recent_orders') || '[]'
-    );
-    if (!Array.isArray(recentOrders)) return;
-    localStorage.setItem(
-      'roshanbrand_recent_orders',
-      JSON.stringify(recentOrders.filter((id) => id !== orderId))
-    );
+    localStorage.removeItem('roshanbrand_recent_orders');
+    for (const key of Object.keys(localStorage)) {
+      if (key.startsWith('roshanbrand_order_')) localStorage.removeItem(key);
+    }
   } catch {
     // Browser storage may be unavailable.
   }
@@ -86,15 +81,7 @@ export default function App() {
   const [checkoutDraft, setCheckoutDraft] = useState<CheckoutDraft | null>(null);
   const [rentalStockNoticeOpen, setRentalStockNoticeOpen] = useState(false);
 
-  const [trackedOrderId, setTrackedOrderId] = useState<string>(() => {
-    try {
-      return (
-        JSON.parse(localStorage.getItem('roshanbrand_recent_orders') || '[]')[0] || ''
-      );
-    } catch {
-      return '';
-    }
-  });
+  const [trackedOrderId, setTrackedOrderId] = useState('');
   const [searchInput, setSearchInput] = useState<string>('');
   const [orderAccessInput, setOrderAccessInput] = useState<string>('');
   const [trackedOrder, setTrackedOrder] = useState<OrderRecord | null>(null);
@@ -113,6 +100,10 @@ export default function App() {
     Math.min(storeConfig.stock1MonthGuaranteeAvailable, vaultStock.guarantee_1month);
 
   useEffect(() => {
+    clearStoredOrderData();
+  }, []);
+
+  useEffect(() => {
     if (
       trackedOrder?.status !== 'verified_delivered' ||
       !trackedOrder.deliveredCredentials
@@ -125,15 +116,6 @@ export default function App() {
       document.title = previousTitle;
     };
   }, [trackedOrder?.status]);
-
-  useEffect(() => {
-    if (
-      trackedOrder?.status === 'verified_delivered' ||
-      trackedOrder?.status === 'rejected'
-    ) {
-      removeRecentOrder(trackedOrder.orderId);
-    }
-  }, [trackedOrder?.orderId, trackedOrder?.status]);
 
   // Keep storefront stock and settings in sync with admin changes.
   useEffect(() => {
@@ -227,29 +209,17 @@ export default function App() {
         if (res.ok) {
           const lookupData = await res.json();
           let order: OrderRecord = lookupData.order;
-          let accessToken = '';
-          try {
-            accessToken = localStorage.getItem(orderAccessStorageKey(order.orderId)) || '';
-          } catch {
-            accessToken = '';
-          }
           const accessResponse = await fetch('/api/orders/access', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               orderId: order.orderId,
-              ...(accessToken ? { accessToken } : {}),
             }),
           });
-          try {
-            localStorage.removeItem(orderAccessStorageKey(order.orderId));
-          } catch {
-            // The access key is no longer written to browser storage.
-          }
           if (accessResponse.ok) {
             const accessData = await accessResponse.json();
             order = accessData.order;
-            setTrackedOrderAccessToken(accessToken || cookieAuthenticatedOrder);
+            setTrackedOrderAccessToken(cookieAuthenticatedOrder);
             setGuaranteeClaims(accessData.guaranteeClaims || []);
           } else {
             setTrackedOrderAccessToken('');
@@ -535,11 +505,6 @@ export default function App() {
           setTrackError(data.error || 'Order ID or access key is incorrect.');
           return;
         }
-        try {
-          localStorage.removeItem(orderAccessStorageKey(data.order.orderId));
-        } catch {
-          // The access key remains available in the field for this visit.
-        }
         setTrackedOrder(data.order);
         setTrackedOrderAccessToken(accessToken);
         setGuaranteeClaims(data.guaranteeClaims || []);
@@ -632,7 +597,6 @@ export default function App() {
             onDownload={downloadOrderCsv}
             onGuaranteeClaimsUpdated={setGuaranteeClaims}
             onBack={() => {
-              removeRecentOrder(trackedOrder.orderId);
               setTrackedOrder(null);
               setTrackedOrderId('');
               setTrackedOrderAccessToken('');
@@ -844,7 +808,7 @@ export default function App() {
                               ? 'Order expired'
                               : trackedOrder.paymentStatus === 'utr_submitted'
                                 ? 'UTR submitted — waiting for payment confirmation'
-                                : 'Order created — payment not confirmed'}
+                                : 'Waiting for payment / enter UTR'}
                           </h3>
                           <span className="text-[11px] font-mono font-bold text-amber-300">
                             {trackedOrder.orderId}

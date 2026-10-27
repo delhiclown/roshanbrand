@@ -130,7 +130,10 @@ export default function App() {
   }, [trackedOrder?.status]);
 
   useEffect(() => {
-    if (trackedOrder?.status === 'verified_delivered') {
+    if (
+      trackedOrder?.status === 'verified_delivered' ||
+      trackedOrder?.status === 'rejected'
+    ) {
       removeRecentOrder(trackedOrder.orderId);
     }
   }, [trackedOrder?.orderId, trackedOrder?.status]);
@@ -658,6 +661,10 @@ export default function App() {
     link.click();
     document.body.removeChild(link);
   };
+
+  const firstAvailableProduct = productOptions.find(
+    (option) => getAvailableStock(option) > 0
+  );
 
   if (viewMode === 'admin') {
     return (
@@ -1559,7 +1566,7 @@ export default function App() {
         </div>
       </main>
 
-      {/* Rental stock notice */}
+      {/* Total available stock notice */}
       {rentalStockNoticeOpen && (
         <div
           className="stock-notice-backdrop fixed inset-0 z-50 flex items-center justify-center bg-slate-950/45 p-4"
@@ -1585,17 +1592,17 @@ export default function App() {
 
             <div className="relative p-6 sm:p-7">
               <div className="mb-5 text-center text-[11px] font-bold uppercase tracking-[0.2em] text-cyan-300/80">
-                24-hour rental IDs
+                Total available IDs
               </div>
               <div
                 className={`mx-auto flex h-12 w-12 items-center justify-center rounded-2xl border ${
-                  availableRentalStock > 0
+                  totalAvailableStock > 0
                     ? 'border-cyan-300/30 bg-cyan-400/10 text-cyan-300'
                     : 'border-rose-300/25 bg-rose-400/10 text-rose-300'
                 }`}
               >
-                {availableRentalStock > 0 ? (
-                  <Clock className="h-5 w-5" />
+                {totalAvailableStock > 0 ? (
+                  <Layers className="h-5 w-5" />
                 ) : (
                   <XCircle className="h-5 w-5" />
                 )}
@@ -1603,23 +1610,26 @@ export default function App() {
               <h2
                 id="rental-stock-notice-title"
                 className={`mt-6 text-center text-3xl font-black tracking-tight ${
-                  availableRentalStock > 0 ? 'text-white' : 'text-rose-200'
+                  totalAvailableStock > 0 ? 'text-white' : 'text-rose-200'
                 }`}
               >
-                {availableRentalStock > 0
-                  ? `${availableRentalStock} ID${availableRentalStock === 1 ? '' : 's'} available`
+                {totalAvailableStock > 0
+                  ? `${totalAvailableStock} ID${totalAvailableStock === 1 ? '' : 's'} available`
                   : 'Out of Stock'}
               </h2>
               <div className="mx-auto mt-3 h-1 w-14 rounded-full bg-gradient-to-r from-blue-500 via-cyan-400 to-emerald-400" />
 
-              {availableRentalStock > 0 ? (
+              {totalAvailableStock > 0 && firstAvailableProduct ? (
                 <button
                   type="button"
                   onClick={() => {
                     setRentalStockNoticeOpen(false);
-                    setOpenCardId('irctc-rental-24h');
+                    setOpenCardId(firstAvailableProduct.id);
+                    setSelectedTier('1');
+                    setQuantity(1);
+                    setOutOfStockQuantity(null);
                     document
-                      .getElementById('product-irctc-rental-24h')
+                      .getElementById(`product-${firstAvailableProduct.id}`)
                       ?.scrollIntoView({ behavior: 'smooth', block: 'center' });
                   }}
                   className="mt-7 flex w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-blue-600 to-cyan-500 px-5 py-3.5 text-sm font-extrabold text-white shadow-[0_10px_28px_rgba(8,145,178,0.24)] transition hover:brightness-110"

@@ -1359,6 +1359,12 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                                   <span className="font-mono font-black text-sm text-white tracking-wider">
                                     {order.utrNumber}
                                   </span>
+                                  <span className="mt-1 block text-[11px] font-semibold text-slate-400">
+                                    UTR submitted: {formatClaimDate(order.createdAt)}
+                                  </span>
+                                  <span className="mt-0.5 block text-[11px] font-semibold text-cyan-200">
+                                    ID type: {getVaultPoolLabel(getOrderVaultPool(order))} ID
+                                  </span>
                                 </div>
                                 <button
                                   type="button"

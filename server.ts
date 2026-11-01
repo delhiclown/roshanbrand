@@ -1021,14 +1021,12 @@ async function startServer() {
          failed_attempts = CASE
            WHEN verify_attempts.blocked_until IS NOT NULL
              AND verify_attempts.blocked_until <= NOW() THEN 1
-           WHEN verify_attempts.last_utr = $3 THEN verify_attempts.failed_attempts
            ELSE verify_attempts.failed_attempts + 1
          END,
          blocked_until = CASE
            WHEN verify_attempts.blocked_until IS NOT NULL
              AND verify_attempts.blocked_until <= NOW() THEN NULL
-           WHEN verify_attempts.last_utr = $3 THEN verify_attempts.blocked_until
-           WHEN verify_attempts.failed_attempts + 1 >= 5 THEN NOW() + INTERVAL '10 minutes'
+           WHEN verify_attempts.failed_attempts + 1 >= 3 THEN NOW() + INTERVAL '10 minutes'
            ELSE verify_attempts.blocked_until
          END,
          last_utr = $3
@@ -1568,24 +1566,47 @@ async function startServer() {
       }
 
       const state = { status: paymentOrder.status, delivered: paymentOrder.delivered !== 0 };
-      if (paymentOrder.utr === utr && paymentOrder.status === 'utr_submitted') {
-        await commitCheckoutTransaction();
-        res.json({ status: 'utr_submitted' });
-        return;
-      }
-      if (paymentOrder.status !== 'draft' && paymentOrder.status !== 'pending') {
-        res.status(409).json({ error: 'This order has already received a UTR submission.' });
-        return;
-      }
       const clientKey = createHash('sha256').update(req.ip || 'unknown').digest('hex');
-      const attemptResult = await client.query<{ blocked_until: Date | null }>(
-        'SELECT blocked_until FROM verify_attempts WHERE order_id = $1 AND client_key = $2',
+      const attemptResult = await client.query<{
+        failed_attempts: number;
+        blocked_until: Date | null;
+      }>(
+        'SELECT failed_attempts, blocked_until FROM verify_attempts WHERE order_id = $1 AND client_key = $2',
         [orderId, clientKey]
       );
-      const blockedUntil = attemptResult.rows[0]?.blocked_until;
-      if (blockedUntil && blockedUntil.getTime() > Date.now()) {
-        res.setHeader('Retry-After', String(Math.ceil((blockedUntil.getTime() - Date.now()) / 1000)));
+      const attemptCount = attemptResult.rows[0]?.failed_attempts ?? 0;
+      if (attemptCount >= 3) {
+        res.status(429).json({
+          error: 'Bahut zyada galat UTR. Support se contact karein.',
+          wrongUtr: true,
+          attempts: attemptCount,
+          locked: true,
+        });
+        return;
+      }
+      if (paymentOrder.utr === utr && paymentOrder.status === 'utr_submitted') {
+        const failed = await recordUtrAttempt(client, orderId, clientKey, utr);
+        await commitCheckoutTransaction();
+        res.json({ status: 'utr_submitted', attempts: failed?.failed_attempts ?? attemptCount });
+        return;
+      }
+      if (
+        attemptResult.rows[0]?.blocked_until &&
+        attemptResult.rows[0].blocked_until.getTime() > Date.now()
+      ) {
+        res.setHeader(
+          'Retry-After',
+          String(Math.ceil((attemptResult.rows[0].blocked_until.getTime() - Date.now()) / 1000))
+        );
         res.status(429).json({ error: 'Too many UTR attempts. Try again in 10 minutes.' });
+        return;
+      }
+      if (
+        paymentOrder.status !== 'draft' &&
+        paymentOrder.status !== 'pending' &&
+        paymentOrder.status !== 'utr_submitted'
+      ) {
+        res.status(409).json({ error: 'This order has already received a UTR submission.' });
         return;
       }
       const duplicateUtr = await client.query<{ id: string }>(
@@ -1598,27 +1619,61 @@ async function startServer() {
       ) {
         const failed = await recordUtrAttempt(client, orderId, clientKey, utr);
         await commitCheckoutTransaction();
-        if (failed?.blocked_until && failed.blocked_until.getTime() > Date.now()) {
-          res.setHeader('Retry-After', String(Math.ceil((failed.blocked_until.getTime() - Date.now()) / 1000)));
-          res.status(429).json({ error: 'Too many UTR attempts. Try again in 10 minutes.' });
-          return;
-        }
-        res.status(409).json({ error: 'This UTR has already been submitted for another order.' });
+        const attempts = failed?.failed_attempts ?? attemptCount;
+        res.status(attempts >= 3 ? 429 : 409).json({
+          error: attempts >= 3
+            ? 'Bahut zyada galat UTR. Support se contact karein.'
+            : 'Galat UTR. Receipt se 12-digit UTR dobara check karein.',
+          wrongUtr: true,
+          attempts,
+          locked: attempts >= 3,
+        });
         return;
       }
       const failed = await recordUtrAttempt(client, orderId, clientKey, utr);
-      if (failed?.blocked_until && failed.blocked_until.getTime() > Date.now()) {
+      const attempts = failed?.failed_attempts ?? attemptCount;
+      const savedPayment = await client.query<{
+        utr: string;
+        amount_paise: number;
+        received_at: Date;
+        used_order_id: string | null;
+      }>(
+        'SELECT utr, amount_paise, received_at, used_order_id FROM payments WHERE utr = $1',
+        [utr]
+      );
+      const recordedPayment = savedPayment.rows[0];
+      if (
+        recordedPayment &&
+        (recordedPayment.used_order_id !== null ||
+          !matchesSmsPayment(
+            { utr, amountPaise: paymentOrder.amount_paise, createdAt: paymentOrder.created_at },
+            {
+              utr: recordedPayment.utr,
+              amountPaise: recordedPayment.amount_paise,
+              receivedAt: recordedPayment.received_at,
+            }
+          ))
+      ) {
         await commitCheckoutTransaction();
-        res.setHeader('Retry-After', String(Math.ceil((failed.blocked_until.getTime() - Date.now()) / 1000)));
-        res.status(429).json({ error: 'Too many UTR attempts. Try again in 10 minutes.' });
+        res.status(409).json({
+          error: attempts >= 3
+            ? 'Bahut zyada galat UTR. Support se contact karein.'
+            : 'Galat UTR. Receipt se 12-digit UTR dobara check karein.',
+          wrongUtr: true,
+          attempts,
+          locked: attempts >= 3,
+        });
         return;
       }
-      if (!submitUtr(state)) {
+      if (paymentOrder.status !== 'utr_submitted' && !submitUtr(state)) {
         res.status(409).json({ error: 'This order cannot accept a UTR in its current state.' });
         return;
       }
       const poolType = getVaultPoolForPackType(paymentOrder.product);
-      if (!reserveStock(db.vault, poolType, orderId, paymentOrder.quantity)) {
+      if (
+        paymentOrder.status !== 'utr_submitted' &&
+        !reserveStock(db.vault, poolType, orderId, paymentOrder.quantity)
+      ) {
         await commitCheckoutTransaction();
         res.status(409).json({ error: 'Not enough available IDs to reserve this order.' });
         return;
@@ -1699,7 +1754,7 @@ async function startServer() {
       if (paidImmediately) {
         broadcastStateUpdate('order_verified', { order, source: 'sms' });
       }
-      res.json({ status: paidImmediately ? 'paid' : 'utr_submitted', order });
+      res.json({ status: paidImmediately ? 'paid' : 'utr_submitted', order, attempts });
       return;
     } catch (error) {
       console.error(

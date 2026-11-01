@@ -71,7 +71,7 @@ export function isOrderExpired(
 export function createSubmittedOrderUpdate(orderId: string, utr: string, submittedAt: Date) {
   return {
     text: `UPDATE orders SET status = 'utr_submitted', utr = $2, expires_at = $3
-           WHERE id = $1 AND status IN ('draft', 'pending') AND delivered = 0
+           WHERE id = $1 AND status IN ('draft', 'pending', 'utr_submitted') AND delivered = 0
            RETURNING id`,
     values: [
       orderId,

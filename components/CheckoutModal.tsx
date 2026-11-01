@@ -8,6 +8,7 @@ import {
   Download,
   Loader2,
   X,
+  XCircle,
 } from 'lucide-react';
 import { LIMITS } from '../src/constants';
 import { CheckoutDraft, OrderRecord, StoreConfig } from '../src/types';
@@ -35,6 +36,9 @@ interface CreatedPaymentOrder {
 const wait = (milliseconds: number) =>
   new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
 
+const WRONG_UTR_ERROR = 'Galat UTR. Receipt se 12-digit UTR dobara check karein.';
+const TOO_MANY_WRONG_UTR_ERROR = 'Bahut zyada galat UTR. Support se contact karein.';
+
 export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   draft,
   storeConfig,
@@ -45,6 +49,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   const [utr, setUtr] = useState('');
   const [creatingOrder, setCreatingOrder] = useState(true);
   const [verifying, setVerifying] = useState(false);
+  const [wrongAttempts, setWrongAttempts] = useState(0);
   const [completedOrder, setCompletedOrder] = useState<OrderRecord | null>(null);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -145,9 +150,17 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         accessToken: order.accessToken,
       }),
     });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || 'UTR verify nahi ho saka.');
-    return data as { status: string };
+    const data = await response.json() as {
+      status: string;
+      error?: string;
+      wrongUtr?: boolean;
+      attempts?: number;
+      locked?: boolean;
+    };
+    if (!response.ok && !data.wrongUtr) {
+      throw new Error(data.error || 'UTR verify nahi ho saka.');
+    }
+    return data;
   };
 
   const fetchPaidOrder = async (order: CreatedPaymentOrder) => {
@@ -249,7 +262,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
     if (!paymentOrder || verifying || completedOrder) return;
     const submittedUtr = utr.trim();
     if (!LIMITS.UTR_REGEX.test(submittedUtr)) {
-      setError('Kripya apna valid 12-digit numeric UTR dalein.');
+      setError(WRONG_UTR_ERROR);
       return;
     }
 
@@ -261,6 +274,18 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
 
     try {
       const firstCheck = await checkUtr(paymentOrder, submittedUtr);
+      if (firstCheck.wrongUtr) {
+        const attempts = firstCheck.attempts ?? 0;
+        setWrongAttempts(attempts);
+        setError(
+          firstCheck.locked || attempts >= 3
+            ? TOO_MANY_WRONG_UTR_ERROR
+            : WRONG_UTR_ERROR
+        );
+        setMessage('');
+        return;
+      }
+      if (firstCheck.attempts !== undefined) setWrongAttempts(firstCheck.attempts);
       if (firstCheck.status === 'paid') {
         finishAsPaid(await fetchPaidOrder(paymentOrder), paymentOrder.accessToken);
         return;
@@ -275,7 +300,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
 
       trackSubmittedOrder(paymentOrder);
       setMessage('UTR submitted. Payment confirmation is in progress.');
-      const deadline = Date.now() + 3 * 60 * 1000;
+      const deadline = Date.now() + 2 * 60 * 1000;
       while (Date.now() < deadline && isCurrentRun()) {
         await wait(Math.min(5000, deadline - Date.now()));
         if (!isCurrentRun()) return;
@@ -303,7 +328,10 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
       }
 
       if (isCurrentRun()) {
-        setMessage('Payment abhi confirm nahi hua. Support se contact karein.');
+        const attempts = firstCheck.attempts ?? wrongAttempts + 1;
+        setWrongAttempts(attempts);
+        setError(attempts >= 3 ? TOO_MANY_WRONG_UTR_ERROR : WRONG_UTR_ERROR);
+        setMessage('');
       }
     } catch (requestError) {
       if (isCurrentRun()) {
@@ -446,10 +474,10 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                 />
                 <button
                   type="submit"
-                  disabled={verifying || creatingOrder}
+                  disabled={verifying || creatingOrder || wrongAttempts >= 3}
                   className="w-full rounded-xl bg-sky-500 px-4 py-3 font-extrabold text-slate-950 hover:bg-sky-400 disabled:cursor-not-allowed disabled:opacity-60"
                 >
-                  {verifying ? 'Verification ho rahi hai...' : 'I have paid — submit UTR'}
+                  {verifying ? 'Verification ho rahi hai...' : 'Submit UTR'}
                 </button>
               </form>
 
@@ -461,6 +489,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
               )}
               {error && (
                 <p className="rounded-lg border border-red-400/30 bg-red-950/30 p-3 text-sm text-red-200">
+                  <XCircle className="inline w-4 h-4 mr-2 text-red-400" />
                   {error}
                 </p>
               )}

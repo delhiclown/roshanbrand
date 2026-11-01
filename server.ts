@@ -1093,6 +1093,32 @@ async function startServer() {
     if (paymentOrder.status !== 'utr_submitted') {
       return { result: 'not-pending' as const };
     }
+    const savedPayment = await client.query<{
+      utr: string;
+      amount_paise: number;
+      received_at: Date;
+      used_order_id: string | null;
+    }>(
+      'SELECT utr, amount_paise, received_at, used_order_id FROM payments WHERE utr = $1 FOR UPDATE',
+      [paymentOrder.utr]
+    );
+    const payment = savedPayment.rows[0];
+    if (
+      !payment ||
+      payment.used_order_id !== null ||
+      !paymentOrder.expires_at ||
+      payment.received_at.getTime() > paymentOrder.expires_at.getTime() ||
+      !matchesSmsPayment(
+        { utr: paymentOrder.utr, amountPaise: paymentOrder.amount_paise, createdAt: paymentOrder.created_at },
+        {
+          utr: payment.utr,
+          amountPaise: payment.amount_paise,
+          receivedAt: payment.received_at,
+        }
+      )
+    ) {
+      return { result: 'payment-not-verified' as const };
+    }
 
     let order = db.orders.find((existing) => existing.orderId === orderId);
     if (!order) {
@@ -1148,6 +1174,44 @@ async function startServer() {
     }
     syncVaultDisplayCounter(getVaultPoolForPackType(order.packType));
     return { result: 'delivered' as const, order };
+  };
+  const rejectExpiredUtrOrder = async (client: import('pg').PoolClient, orderId: string) => {
+    const result = await client.query<{ product: PackType }>(
+      `UPDATE orders SET status = 'rejected'
+       WHERE id = $1 AND status = 'utr_submitted' AND delivered = 0 AND expires_at <= NOW()
+         AND NOT EXISTS (
+           SELECT 1 FROM payments
+           WHERE payments.utr = orders.utr
+             AND payments.amount_paise = orders.amount_paise
+             AND payments.received_at > orders.created_at
+             AND payments.received_at <= orders.expires_at
+             AND payments.used_order_id IS NULL
+         )
+       RETURNING product`,
+      [orderId]
+    );
+    const expiredOrder = result.rows[0];
+    if (!expiredOrder) return false;
+
+    const now = new Date().toISOString();
+    const existingOrder = db.orders.find((order) => order.orderId === orderId);
+    const orderToReject = existingOrder ?? {
+      status: 'utr_submitted',
+      paymentStatus: 'utr_submitted',
+      adminNote: '',
+      updatedAt: '',
+    };
+    if (!rejectOrderAndReleaseStock(
+      orderToReject,
+      db.vault,
+      orderId,
+      now,
+      'No matching bank SMS payment was received within 3 minutes.'
+    )) {
+      throw new Error(`Could not reject expired UTR order ${orderId}.`);
+    }
+    syncVaultDisplayCounter(getVaultPoolForPackType(expiredOrder.product));
+    return true;
   };
 
   app.post('/api/create-order', createOrderLimiter, async (req, res) => {
@@ -1416,14 +1480,17 @@ async function startServer() {
         utr: string;
         amount_paise: number;
         created_at: Date;
+        expires_at: Date | null;
         delivered: number;
-      }>('SELECT id, status, utr, amount_paise, created_at, delivered FROM orders WHERE utr = $1 FOR UPDATE', [
+      }>('SELECT id, status, utr, amount_paise, created_at, expires_at, delivered FROM orders WHERE utr = $1 FOR UPDATE', [
         utr,
       ]);
       const matchedOrder = orderResult.rows[0];
       let result = 'unmatched';
       let orderId: string | null = null;
       let delivered = false;
+      let orderNeedsManualReview: OrderRecord | undefined;
+      let orderAutoRejected = false;
 
       if (matchedOrder) {
         orderId = matchedOrder.id;
@@ -1449,11 +1516,20 @@ async function startServer() {
             'UPDATE payments SET used_order_id = $2 WHERE utr = $1 AND used_order_id IS NULL',
             [utr, matchedOrder.id]
           );
+        } else if (
+          matchedOrder.status === 'utr_submitted' &&
+          isOrderExpired(matchedOrder.expires_at) &&
+          (!matchedOrder.expires_at || receivedAt.getTime() > matchedOrder.expires_at.getTime())
+        ) {
+          orderAutoRejected = await rejectExpiredUtrOrder(client, matchedOrder.id);
+          result = orderAutoRejected ? 'rejected_expired_utr' : 'ignored_expired_utr';
         } else if (matchedOrder.status === 'utr_submitted') {
           const delivery = await deliverSubmittedPayment(client, matchedOrder.id, 'sms');
           result = delivery.result;
           if (delivery.result === 'delivered') {
             delivered = true;
+          } else if (delivery.order) {
+            orderNeedsManualReview = delivery.order;
           }
         } else {
           result = `ignored_${matchedOrder.status}`;
@@ -1474,6 +1550,16 @@ async function startServer() {
         broadcastStateUpdate('order_verified', { orderId, source: 'sms' });
         broadcastStateUpdate('vault_updated', {});
       } else {
+        if (orderNeedsManualReview || orderAutoRejected) {
+          await saveDb(db);
+        }
+        if (orderNeedsManualReview) {
+          broadcastStateUpdate('order_created', { order: orderNeedsManualReview });
+        }
+        if (orderAutoRejected) {
+          broadcastStateUpdate('order_rejected', { orderId });
+          broadcastStateUpdate('vault_updated', {});
+        }
         await commitCheckoutTransaction();
       }
       res.status(200).json({ ok: true, result });
@@ -1532,7 +1618,15 @@ async function startServer() {
         res.json({ status: 'paid' });
         return;
       }
-      if (paymentOrder.status === 'rejected') {
+      if (
+        paymentOrder.status === 'rejected' &&
+        db.orders.some(
+          (order) =>
+            order.orderId === orderId &&
+            order.status === 'rejected' &&
+            order.adminNote !== 'No matching bank SMS payment was received within 3 minutes.'
+        )
+      ) {
         res.status(409).json({ error: 'This order was rejected.' });
         return;
       }
@@ -1545,22 +1639,18 @@ async function startServer() {
         res.json({ status: 'expired' });
         return;
       }
-      if (
-        paymentOrder.status === 'expired' ||
-        (paymentOrder.status === 'utr_submitted' && isOrderExpired(paymentOrder.expires_at))
-      ) {
-        if (paymentOrder.status !== 'expired') {
-          await client.query(
-            "UPDATE orders SET status = 'expired' WHERE id = $1 AND status = 'utr_submitted'",
-            [orderId]
-          );
-          releaseStock(db.vault, orderId, new Date().toISOString());
-          const order = db.orders.find((existing) => existing.orderId === orderId);
-          if (order) order.paymentStatus = 'expired';
-          syncVaultDisplayCounter(getVaultPoolForPackType(paymentOrder.product));
+
+      if (paymentOrder.status === 'utr_submitted' && isOrderExpired(paymentOrder.expires_at)) {
+        const rejected = await rejectExpiredUtrOrder(client, orderId);
+        if (rejected) {
           await saveDb(db);
+          broadcastStateUpdate('order_rejected', { orderId });
           broadcastStateUpdate('vault_updated', {});
+          res.json({ status: 'rejected' });
+          return;
         }
+      }
+      if (paymentOrder.status === 'expired') {
         res.json({ status: 'expired' });
         return;
       }
@@ -1604,7 +1694,8 @@ async function startServer() {
       if (
         paymentOrder.status !== 'draft' &&
         paymentOrder.status !== 'pending' &&
-        paymentOrder.status !== 'utr_submitted'
+        paymentOrder.status !== 'utr_submitted' &&
+        paymentOrder.status !== 'rejected'
       ) {
         res.status(409).json({ error: 'This order has already received a UTR submission.' });
         return;
@@ -1689,35 +1780,6 @@ async function startServer() {
       for (const item of db.vault) {
         if (item.reservedOrderId === orderId) item.updatedAt = now;
       }
-      let order = db.orders.find((existing) => existing.orderId === orderId);
-      if (!order) {
-        order = {
-          orderId,
-          packLabel: paymentOrder.pack_label,
-          packType: paymentOrder.product,
-          isRental24h: paymentOrder.product === 'rental_24h',
-          rentalDurationHours: paymentOrder.product === 'rental_24h' ? 24 : undefined,
-          quantity: paymentOrder.quantity,
-          unitPrice: paymentOrder.amount_paise / 100 / paymentOrder.quantity,
-          totalAmount: paymentOrder.amount_paise / 100,
-          paymentUpiId: getMerchantUpiId(),
-          utrNumber: utr,
-          upiAppUsed: 'UPI QR',
-          customerReference: paymentOrder.customer_reference,
-          customSpec: paymentOrder.custom_spec,
-          status: 'pending_verification',
-          paymentStatus: 'utr_submitted',
-          deliveredCredentials: '',
-          adminNote: 'Awaiting payment verification.',
-          createdAt: now,
-          updatedAt: now,
-        };
-        db.orders.unshift(order);
-      } else {
-        order.utrNumber = utr;
-        order.paymentStatus = 'utr_submitted';
-        order.updatedAt = now;
-      }
       syncVaultDisplayCounter(poolType);
       setOrderAccessCookie(res, orderId, authorizedToken);
       const priorPayment = await client.query<{ utr: string; amount_paise: number; received_at: Date }>(
@@ -1727,6 +1789,8 @@ async function startServer() {
         [utr, paymentOrder.amount_paise, paymentOrder.created_at]
       );
       let paidImmediately = false;
+      let paidOrder: OrderRecord | undefined;
+      let orderNeedsManualReview: OrderRecord | undefined;
       if (
         priorPayment.rows[0] &&
         matchesSmsPayment(
@@ -1740,6 +1804,8 @@ async function startServer() {
       ) {
         const delivery = await deliverSubmittedPayment(client, orderId, 'sms');
         paidImmediately = delivery.result === 'delivered';
+        if (paidImmediately) paidOrder = delivery.order;
+        else orderNeedsManualReview = delivery.order;
         if (paidImmediately) {
           await client.query(
             `UPDATE sms_payment_logs SET order_id = $2, result = 'delivered_on_utr_submit'
@@ -1749,12 +1815,13 @@ async function startServer() {
         }
       }
       await saveDb(db);
-      broadcastStateUpdate('order_utr_submitted', { orderId, order });
       broadcastStateUpdate('vault_updated', {});
       if (paidImmediately) {
-        broadcastStateUpdate('order_verified', { order, source: 'sms' });
+        broadcastStateUpdate('order_verified', { order: paidOrder, source: 'sms' });
+      } else if (orderNeedsManualReview) {
+        broadcastStateUpdate('order_created', { order: orderNeedsManualReview });
       }
-      res.json({ status: paidImmediately ? 'paid' : 'utr_submitted', order, attempts });
+      res.json({ status: paidImmediately ? 'paid' : 'utr_submitted', attempts });
       return;
     } catch (error) {
       console.error(
@@ -1774,15 +1841,39 @@ async function startServer() {
       return;
     }
     try {
-      const result = await client.query<{ status: PaymentStatus }>(
-        'SELECT status FROM orders WHERE id = $1',
+      const result = await client.query<{
+        status: PaymentStatus;
+        expires_at: Date | null;
+        matching_payment: boolean;
+      }>(
+        `SELECT status, expires_at, EXISTS (
+           SELECT 1 FROM payments
+           WHERE payments.utr = orders.utr
+             AND payments.amount_paise = orders.amount_paise
+             AND payments.received_at > orders.created_at
+             AND payments.received_at <= orders.expires_at
+             AND payments.used_order_id IS NULL
+         ) AS matching_payment
+         FROM orders WHERE id = $1 FOR UPDATE`,
         [req.params.id]
       );
       if (!result.rows[0] || result.rows[0].status === 'draft') {
         res.status(404).json({ status: 'not_found' });
         return;
       }
-      res.json({ status: result.rows[0].status });
+      let status: PaymentStatus | 'payment_received' = result.rows[0].status;
+      if (status === 'utr_submitted' && isOrderExpired(result.rows[0].expires_at)) {
+        const rejected = await rejectExpiredUtrOrder(client, req.params.id);
+        if (rejected) {
+          await saveDb(db);
+          broadcastStateUpdate('order_rejected', { orderId: req.params.id });
+          broadcastStateUpdate('vault_updated', {});
+          status = 'rejected';
+        } else if (result.rows[0].matching_payment) {
+          status = 'payment_received';
+        }
+      }
+      res.json({ status });
     } catch (error) {
       console.error('Failed to read payment order status:', error);
       res.status(500).json({ error: 'Order status is temporarily unavailable.' });
@@ -2547,6 +2638,7 @@ async function startServer() {
     const claimsPageSize = pageSize('claimsLimit');
     if (!postgresPool) {
       const normalizedOrders = db.orders.filter((order) => {
+        if (order.status === 'pending_verification') return false;
         if (orderStatus !== 'all' && order.status !== orderStatus) return false;
         if (!orderQuery) return true;
         const haystack = [
@@ -2583,7 +2675,7 @@ async function startServer() {
       }));
       const summary = {
         ordersTotal: normalizedOrders.length,
-        pendingOrders: db.orders.filter((order) => order.status === 'pending_verification').length,
+        pendingOrders: 0,
         deliveredOrders: db.orders.filter((order) => order.status === 'verified_delivered').length,
         verifiedRevenue: db.orders
           .filter((order) => order.status === 'verified_delivered' && !order.refundedAt)
@@ -2634,8 +2726,41 @@ async function startServer() {
            LEFT JOIN orders AS payment_order
              ON payment_order.id = order_rows.item->>'orderId'
          ),
+         eligible_order_rows AS (
+           SELECT normalized_order_rows.item, normalized_order_rows.ordinal
+           FROM normalized_order_rows
+           LEFT JOIN orders AS payment_order
+             ON payment_order.id = normalized_order_rows.item->>'orderId'
+           WHERE normalized_order_rows.item->>'status' != 'pending_verification'
+             OR EXISTS (
+               SELECT 1
+               FROM payments AS payment
+               WHERE payment.utr = COALESCE(
+                   NULLIF(payment_order.utr, ''),
+                   NULLIF(normalized_order_rows.item->>'utrNumber', '')
+                 )
+                 AND payment.amount_paise = COALESCE(
+                   payment_order.amount_paise,
+                   CASE
+                     WHEN normalized_order_rows.item->>'totalAmount' ~ '^[0-9]+([.][0-9]{1,2})?$'
+                     THEN ROUND((normalized_order_rows.item->>'totalAmount')::numeric * 100)::integer
+                   END
+                 )
+                 AND payment.received_at > COALESCE(
+                   payment_order.created_at,
+                   NULLIF(normalized_order_rows.item->>'createdAt', '')::timestamptz
+                 )
+                 AND payment.used_order_id IS NULL
+                 AND (
+                   payment_order.id IS NULL OR (
+                     payment_order.status = 'utr_submitted' AND
+                     payment.received_at <= payment_order.expires_at
+                   )
+                 )
+             )
+         ),
          filtered_orders AS (
-           SELECT item, ordinal FROM normalized_order_rows
+           SELECT item, ordinal FROM eligible_order_rows
            WHERE ($3 = 'all' OR item->>'status' = $3)
              AND ($4 = '' OR POSITION(LOWER($4) IN LOWER(CONCAT_WS(' ',
                item->>'orderId', item->>'utrNumber', item->>'customerReference',
@@ -2685,7 +2810,7 @@ async function startServer() {
            (SELECT state->'vault' FROM app_state) AS vault,
            jsonb_build_object(
              'ordersTotal', (SELECT COUNT(*) FROM order_rows),
-             'pendingOrders', (SELECT COUNT(*) FROM order_rows WHERE item->>'status' = 'pending_verification'),
+             'pendingOrders', (SELECT COUNT(*) FROM eligible_order_rows WHERE item->>'status' = 'pending_verification'),
              'deliveredOrders', (SELECT COUNT(*) FROM order_rows WHERE item->>'status' = 'verified_delivered'),
              'verifiedRevenue', COALESCE((
                SELECT SUM(
@@ -2987,6 +3112,12 @@ async function startServer() {
       const requestedCredentials = String(req.body?.deliveredCredentials || '').trim();
       const delivery = await deliverSubmittedPayment(client, orderId, 'manual', requestedCredentials);
       if (delivery.result !== 'delivered') {
+        if (delivery.result === 'payment-not-verified') {
+          res.status(409).json({
+            error: 'No matching bank SMS payment was found. This order cannot be delivered.',
+          });
+          return;
+        }
         res.status(409).json({
           error: 'Not enough available IDs in the matching vault pool to deliver this order.',
         });
@@ -3021,6 +3152,41 @@ async function startServer() {
       });
       return;
     }
+    const client = getCheckoutClient();
+    if (!postgresPool || !client) {
+      res.status(409).json({ error: 'A matching bank SMS payment is required before delivery.' });
+      return;
+    }
+    const paymentResult = await client.query<{
+      utr: string;
+      amount_paise: number;
+      received_at: Date;
+      used_order_id: string | null;
+    }>(
+      'SELECT utr, amount_paise, received_at, used_order_id FROM payments WHERE utr = $1 FOR UPDATE',
+      [order.utrNumber]
+    );
+    const payment = paymentResult.rows[0];
+    if (
+      !payment ||
+      payment.used_order_id !== null ||
+      !matchesSmsPayment(
+        {
+          utr: order.utrNumber,
+          amountPaise: Math.round(order.totalAmount * 100),
+          createdAt: new Date(order.createdAt),
+        },
+        {
+          utr: payment.utr,
+          amountPaise: payment.amount_paise,
+          receivedAt: payment.received_at,
+        }
+      )
+    ) {
+      res.status(409).json({ error: 'A matching bank SMS payment is required before delivery.' });
+      return;
+    }
+
     const verifiedOrderId = db.utrIndex[order.utrNumber];
     if (verifiedOrderId && verifiedOrderId !== order.orderId) {
       res.status(409).json({ error: 'This UTR has already been used for a verified order.' });
@@ -3384,11 +3550,17 @@ async function startServer() {
       db.orderAccessTokens ||= {};
       db.guaranteeClaims ||= [];
 
-      const expiredResult = await client.query<{ id: string; product: PackType }>(
-        `UPDATE orders SET status = 'expired'
-         WHERE status = 'utr_submitted' AND expires_at <= NOW()
-         RETURNING id, product`
+      const expiredResult = await client.query<{ id: string }>(
+        `SELECT id FROM orders
+         WHERE status = 'utr_submitted' AND delivered = 0 AND expires_at <= NOW()
+         FOR UPDATE SKIP LOCKED`
       );
+      const expiredIds = new Set<string>();
+      for (const expiredOrder of expiredResult.rows) {
+        if (await rejectExpiredUtrOrder(client, expiredOrder.id)) {
+          expiredIds.add(expiredOrder.id);
+        }
+      }
       const draftsResult = await client.query<{ id: string }>(
         `DELETE FROM orders WHERE status = 'draft' AND expires_at <= NOW() RETURNING id`
       );
@@ -3397,15 +3569,7 @@ async function startServer() {
       );
       const activeOrderIds = new Set(activeOrders.rows.map((row) => row.id));
       const now = new Date().toISOString();
-      const expiredIds = new Set(expiredResult.rows.map((row) => row.id));
-      const affectedPools = new Set<VaultPoolType>(
-        expiredResult.rows.map((row) => getVaultPoolForPackType(row.product))
-      );
-      for (const id of expiredIds) {
-        releaseStock(db.vault, id, now);
-        const order = db.orders.find((item) => item.orderId === id);
-        if (order) order.paymentStatus = 'expired';
-      }
+      const affectedPools = new Set<VaultPoolType>();
       const staleReservationIds = new Set(
         db.vault
           .map((item) => item.reservedOrderId)
@@ -3422,7 +3586,7 @@ async function startServer() {
       }
       for (const draft of draftsResult.rows) delete db.orderAccessTokens[draft.id];
       for (const pool of affectedPools) syncVaultDisplayCounter(pool);
-      if (expiredResult.rowCount || draftsResult.rowCount || staleReservationIds.size) {
+      if (expiredIds.size || draftsResult.rowCount || staleReservationIds.size) {
         const state = JSON.stringify(db);
         await client.query(
           'UPDATE roshanbrand_state SET state = $1::jsonb, updated_at = NOW() WHERE id = 1',
@@ -3430,8 +3594,8 @@ async function startServer() {
         );
         await client.query('COMMIT');
         lastPersistedState = state;
-        if (expiredResult.rowCount) {
-          broadcastStateUpdate('orders_expired', { count: expiredResult.rowCount });
+        if (expiredIds.size) {
+          broadcastStateUpdate('orders_rejected', { orderIds: [...expiredIds] });
           broadcastStateUpdate('vault_updated', {});
         }
       } else {
@@ -3453,7 +3617,7 @@ async function startServer() {
         error instanceof Error ? error.message : String(error)
       );
     });
-  }, 60_000);
+  }, 15_000);
   expiryTimer.unref();
   void expirePendingPaymentOrders().catch((error: unknown) => {
     console.error(

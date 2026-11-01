@@ -50,6 +50,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   const [creatingOrder, setCreatingOrder] = useState(true);
   const [verifying, setVerifying] = useState(false);
   const [wrongAttempts, setWrongAttempts] = useState(0);
+  const [paymentReceived, setPaymentReceived] = useState(false);
   const [completedOrder, setCompletedOrder] = useState<OrderRecord | null>(null);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -183,34 +184,6 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
     onOrderCreated(verifiedOrder, accessToken);
   };
 
-  const trackSubmittedOrder = (order: CreatedPaymentOrder) => {
-    if (!draft) return;
-    onOrderCreated(
-      {
-        orderId: order.orderId,
-        packLabel: draft.packLabel,
-        packType: draft.packType,
-        isRental24h: draft.isRental24h,
-        rentalDurationHours: draft.isRental24h ? 24 : undefined,
-        quantity: draft.quantity,
-        unitPrice: order.amount / draft.quantity,
-        totalAmount: order.amount,
-        paymentUpiId: order.upiId,
-        utrNumber: utr.trim(),
-        upiAppUsed: 'UPI QR',
-        customerReference: 'Direct UPI Buyer',
-        customSpec: draft.initialCustomSpec,
-        status: 'pending_verification',
-        paymentStatus: 'utr_submitted',
-        deliveredCredentials: '',
-        adminNote: 'Awaiting payment verification.',
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      },
-      order.accessToken
-    );
-  };
-
   const pasteUtr = async () => {
     try {
       const text = await navigator.clipboard.readText();
@@ -294,13 +267,20 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         setMessage('Order expire ho gaya. Naya order banane ke liye support se contact karein.');
         return;
       }
+      if (firstCheck.status === 'rejected') {
+        const attempts = firstCheck.attempts ?? wrongAttempts + 1;
+        setWrongAttempts(attempts);
+        setError(attempts >= 3 ? TOO_MANY_WRONG_UTR_ERROR : WRONG_UTR_ERROR);
+        setMessage('');
+        return;
+      }
       if (firstCheck.status !== 'utr_submitted') {
         throw new Error('Server did not confirm the submitted UTR.');
       }
 
-      trackSubmittedOrder(paymentOrder);
-      setMessage('UTR submitted. Payment confirmation is in progress.');
-      const deadline = Date.now() + 2 * 60 * 1000;
+      setMessage('Verification ho rahi hai...');
+      const deadline = Date.now() + 3 * 60 * 1000;
+      let matchingPaymentSeen = false;
       while (Date.now() < deadline && isCurrentRun()) {
         await wait(Math.min(5000, deadline - Date.now()));
         if (!isCurrentRun()) return;
@@ -318,16 +298,47 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
           return;
         }
         if (statusData.status === 'rejected') {
-          setMessage('Payment review complete nahi hua. Support se contact karein.');
+          const attempts = firstCheck.attempts ?? wrongAttempts + 1;
+          setWrongAttempts(attempts);
+          setError(attempts >= 3 ? TOO_MANY_WRONG_UTR_ERROR : WRONG_UTR_ERROR);
+          setMessage('');
           return;
         }
         if (statusData.status === 'paid') {
           finishAsPaid(await fetchPaidOrder(paymentOrder), paymentOrder.accessToken);
           return;
         }
+        if (statusData.status === 'payment_received') {
+          matchingPaymentSeen = true;
+          setPaymentReceived(true);
+        }
       }
 
       if (isCurrentRun()) {
+        const statusResponse = await fetch(
+          `/api/order-status/${encodeURIComponent(paymentOrder.orderId)}`,
+          { cache: 'no-store' }
+        );
+        const statusData = await statusResponse.json();
+        if (!statusResponse.ok) {
+          throw new Error(statusData.error || 'Order status check nahi ho saka.');
+        }
+        if (statusData.status === 'paid') {
+          finishAsPaid(await fetchPaidOrder(paymentOrder), paymentOrder.accessToken);
+          return;
+        }
+        if (statusData.status === 'rejected') {
+          const attempts = firstCheck.attempts ?? wrongAttempts + 1;
+          setWrongAttempts(attempts);
+          setError(attempts >= 3 ? TOO_MANY_WRONG_UTR_ERROR : WRONG_UTR_ERROR);
+          setMessage('');
+          return;
+        }
+        if (statusData.status === 'payment_received' || matchingPaymentSeen) {
+          setPaymentReceived(true);
+          setMessage('Payment SMS mil gaya hai. Order delivery process mein hai.');
+          return;
+        }
         const attempts = firstCheck.attempts ?? wrongAttempts + 1;
         setWrongAttempts(attempts);
         setError(attempts >= 3 ? TOO_MANY_WRONG_UTR_ERROR : WRONG_UTR_ERROR);
@@ -464,17 +475,19 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                   inputMode="numeric"
                   autoComplete="off"
                   maxLength={12}
+                  disabled={paymentReceived}
                   value={utr}
                   onChange={(event) => {
                     setUtr(event.target.value.replace(/\D/g, '').slice(0, 12));
                     setError('');
+                    setPaymentReceived(false);
                   }}
                   placeholder="12-digit UTR"
                   className="w-full rounded-xl border border-sky-400/40 bg-slate-950 px-4 py-3 font-mono text-lg tracking-widest text-white outline-none focus:border-sky-300"
                 />
                 <button
                   type="submit"
-                  disabled={verifying || creatingOrder || wrongAttempts >= 3}
+                  disabled={verifying || creatingOrder || wrongAttempts >= 3 || paymentReceived}
                   className="w-full rounded-xl bg-sky-500 px-4 py-3 font-extrabold text-slate-950 hover:bg-sky-400 disabled:cursor-not-allowed disabled:opacity-60"
                 >
                   {verifying ? 'Verification ho rahi hai...' : 'Submit UTR'}
@@ -494,7 +507,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                 </p>
               )}
               <p className="text-center text-xs text-slate-400">
-                QR kholne se order ya stock reserve nahi hota. UTR submit karne par hi order shuru hoga; payment server SMS se verify hone tak credentials release nahi honge.
+                QR kholne se order ya stock reserve nahi hota. UTR submit karne par verification shuru hogi; matching bank SMS milne par credentials automatically deliver honge.
                 {' '}
                 <a
                   href={storeConfig.supportUrl}

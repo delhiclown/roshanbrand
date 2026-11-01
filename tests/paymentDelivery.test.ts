@@ -75,12 +75,20 @@ test('Submitting a valid UTR creates the order and reserves the required stock',
   assert.equal(flow.submit('draft-2', ''), false);
 });
 
-test('UTR SQL update passes a Date for the TIMESTAMPTZ expires_at column', async () => {
+test('A rejected UTR order can accept a corrected retry', () => {
+  const state: DeliveryState = { delivered: false, status: 'rejected' };
+
+  assert.equal(submitUtr(state), true);
+  assert.equal(state.status, 'utr_submitted');
+});
+
+test('UTR submission expires after three minutes and passes a Date for TIMESTAMPTZ', async () => {
   const submittedAt = new Date('2026-10-27T12:00:00.000Z');
   const saved = { expiresAt: null as unknown };
   const mockPostgres = {
     async query(text: string, values: readonly unknown[]) {
       assert.match(text, /expires_at = \$3/);
+      assert.match(text, /status IN \([^)]*'rejected'/);
       const expiresAt = values[2];
       if (!(expiresAt instanceof Date)) {
         throw new TypeError('TIMESTAMPTZ value must be a JavaScript Date.');
@@ -94,7 +102,7 @@ test('UTR SQL update passes a Date for the TIMESTAMPTZ expires_at column', async
 
   assert.equal(result.rowCount, 1);
   assert.ok(saved.expiresAt instanceof Date);
-  assert.equal(saved.expiresAt.toISOString(), '2026-10-27T12:30:00.000Z');
+  assert.equal(saved.expiresAt.toISOString(), '2026-10-27T12:03:00.000Z');
 });
 
 test('A matching SMS delivers credentials only once', () => {
@@ -222,6 +230,27 @@ test('Rejecting an order immediately releases its reserved stock', () => {
     rejectOrderAndReleaseStock(order, vault, 'order-1', '2026-10-27T12:01:00.000Z'),
     false
   );
+});
+
+test('Rejecting a waiting UTR order releases its reservation', () => {
+  const vault: { poolType: string; isAssigned: boolean; reservedOrderId?: string }[] = [
+    { poolType: 'permanent', isAssigned: false },
+  ];
+  assert.equal(reserveStock(vault, 'permanent', 'waiting-order', 1), true);
+  const order = {
+    status: 'utr_submitted',
+    paymentStatus: 'utr_submitted',
+    adminNote: '',
+    updatedAt: '',
+  };
+
+  assert.equal(
+    rejectOrderAndReleaseStock(order, vault, 'waiting-order', '2026-10-27T12:03:00.000Z'),
+    true
+  );
+  assert.equal(order.status, 'rejected');
+  assert.equal(order.paymentStatus, 'rejected');
+  assert.equal(vault[0].reservedOrderId, undefined);
 });
 
 test('Draft cleanup expires only drafts past their 15-minute deadline', () => {

@@ -22,7 +22,12 @@ interface ReservableStockItem {
 }
 
 export function submitUtr(state: DeliveryState): boolean {
-  if (state.status !== 'draft' && state.status !== 'pending' && state.status !== 'utr_submitted') {
+  if (
+    state.status !== 'draft' &&
+    state.status !== 'pending' &&
+    state.status !== 'utr_submitted' &&
+    state.status !== 'rejected'
+  ) {
     return false;
   }
   state.status = 'utr_submitted';
@@ -71,12 +76,12 @@ export function isOrderExpired(
 export function createSubmittedOrderUpdate(orderId: string, utr: string, submittedAt: Date) {
   return {
     text: `UPDATE orders SET status = 'utr_submitted', utr = $2, expires_at = $3
-           WHERE id = $1 AND status IN ('draft', 'pending', 'utr_submitted') AND delivered = 0
+           WHERE id = $1 AND status IN ('draft', 'pending', 'utr_submitted', 'rejected') AND delivered = 0
            RETURNING id`,
     values: [
       orderId,
       utr,
-      new Date(submittedAt.getTime() + 30 * 60 * 1000),
+      new Date(submittedAt.getTime() + 3 * 60 * 1000),
     ] as const,
   };
 }
@@ -148,12 +153,13 @@ export function rejectOrderAndReleaseStock(
   order: { status: string; paymentStatus?: string; adminNote: string; updatedAt: string },
   items: ReservableStockItem[],
   orderId: string,
-  updatedAt: string
+  updatedAt: string,
+  adminNote = 'Payment UTR could not be verified. Please contact support with payment screenshot.'
 ): boolean {
-  if (order.status !== 'pending_verification') return false;
+  if (order.status !== 'pending_verification' && order.status !== 'utr_submitted') return false;
   order.status = 'rejected';
   order.paymentStatus = 'rejected';
-  order.adminNote = 'Payment UTR could not be verified. Please contact support with payment screenshot.';
+  order.adminNote = adminNote;
   order.updatedAt = updatedAt;
   releaseStock(items, orderId, updatedAt);
   return true;

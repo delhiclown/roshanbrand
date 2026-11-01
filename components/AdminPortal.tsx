@@ -91,6 +91,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
 }) => {
   const [activeTab, setActiveTab] = useState<AdminTab>('orders');
   const [orders, setOrders] = useState<OrderRecord[]>([]);
+  const [paidStockPendingOrders, setPaidStockPendingOrders] = useState<OrderRecord[]>([]);
   const [smsPaymentLogs, setSmsPaymentLogs] = useState<SmsPaymentLog[]>([]);
   const [vault, setVault] = useState<VaultItem[]>([]);
   const [guaranteeClaims, setGuaranteeClaims] = useState<GuaranteeClaim[]>([]);
@@ -273,6 +274,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
       setOrders((previous) =>
         mergePage(previous, data.orders || [], 'orderId', requestOrdersOffset)
       );
+      setPaidStockPendingOrders(data.paidStockPendingOrders || []);
       setVault(data.vault || []);
       setSmsPaymentLogs(data.smsPaymentLogs || []);
       setGuaranteeClaims((previous) =>
@@ -1339,6 +1341,41 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                   />
                 </div>
               </div>
+
+              <section className="neon-card-3d overflow-hidden border-amber-400/40">
+                <div className="flex items-center justify-between gap-3 border-b border-amber-400/20 px-4 py-3">
+                  <h3 className="text-sm font-extrabold text-amber-200">Paid - Stock Pending</h3>
+                  <span className="rounded-full bg-amber-400/15 px-2.5 py-1 text-xs font-extrabold text-amber-200">
+                    {paidStockPendingOrders.length} waiting
+                  </span>
+                </div>
+                {paidStockPendingOrders.length === 0 ? (
+                  <p className="px-4 py-4 text-xs text-slate-400">No paid customers are waiting for stock.</p>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full min-w-[640px] border-collapse text-left text-xs">
+                      <thead className="bg-slate-950/70 text-[10px] uppercase tracking-wide text-amber-200">
+                        <tr>
+                          <th className="p-3">Order ID</th>
+                          <th className="p-3">Product</th>
+                          <th className="p-3">Amount</th>
+                          <th className="p-3">UTR</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {paidStockPendingOrders.map((order) => (
+                          <tr key={order.orderId} className="border-t border-slate-700/70 text-slate-200">
+                            <td className="p-3 font-mono">{order.orderId}</td>
+                            <td className="p-3">{order.packLabel}</td>
+                            <td className="p-3 font-mono">₹{order.totalAmount.toLocaleString('en-IN')}</td>
+                            <td className="p-3 font-mono">{order.utrNumber}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </section>
 
               {filteredOrders.length === 0 ? (
                 <div className="neon-card-3d p-10 text-center space-y-2">

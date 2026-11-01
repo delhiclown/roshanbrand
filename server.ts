@@ -264,7 +264,7 @@ async function initializePersistence(db: PersistedDatabase): Promise<void> {
       product TEXT NOT NULL,
       quantity INTEGER NOT NULL CHECK (quantity > 0),
       amount_paise INTEGER NOT NULL CHECK (amount_paise > 0),
-      status TEXT NOT NULL CHECK (status IN ('draft', 'pending', 'utr_submitted', 'paid', 'expired', 'rejected')),
+      status TEXT NOT NULL CHECK (status IN ('draft', 'pending', 'utr_submitted', 'paid_stock_pending', 'paid', 'expired', 'rejected')),
       utr TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       expires_at TIMESTAMPTZ NOT NULL,
@@ -278,7 +278,7 @@ async function initializePersistence(db: PersistedDatabase): Promise<void> {
   await postgresPool.query(`
     ALTER TABLE orders
     ADD CONSTRAINT orders_status_check
-    CHECK (status IN ('draft', 'pending', 'utr_submitted', 'paid', 'expired', 'rejected'))
+    CHECK (status IN ('draft', 'pending', 'utr_submitted', 'paid_stock_pending', 'paid', 'expired', 'rejected'))
   `);
   await postgresPool.query(`
     UPDATE orders
@@ -1044,7 +1044,8 @@ async function startServer() {
   };
   const reconcileVaultReservations = async (client: import('pg').PoolClient) => {
     const activeOrders = await client.query<{ id: string }>(
-      `SELECT id FROM orders WHERE status = 'utr_submitted' AND delivered = 0`
+      `SELECT id FROM orders
+       WHERE status IN ('utr_submitted', 'paid_stock_pending') AND delivered = 0`
     );
     const activeOrderIds = new Set(activeOrders.rows.map((row) => row.id));
     const staleReservationIds = new Set(
@@ -1090,7 +1091,7 @@ async function startServer() {
     if (paymentOrder.status === 'paid' || paymentOrder.delivered !== 0) {
       return { result: 'already-delivered' as const };
     }
-    if (paymentOrder.status !== 'utr_submitted') {
+    if (paymentOrder.status !== 'utr_submitted' && paymentOrder.status !== 'paid_stock_pending') {
       return { result: 'not-pending' as const };
     }
     const savedPayment = await client.query<{
@@ -1105,7 +1106,7 @@ async function startServer() {
     const payment = savedPayment.rows[0];
     if (
       !payment ||
-      payment.used_order_id !== null ||
+      (payment.used_order_id !== null && payment.used_order_id !== orderId) ||
       !paymentOrder.expires_at ||
       payment.received_at.getTime() > paymentOrder.expires_at.getTime() ||
       !matchesSmsPayment(
@@ -1147,15 +1148,45 @@ async function startServer() {
     }
 
     const deliveryResult = deliverOnce(
-      { delivered: false, status: paymentOrder.status },
+      { delivered: false, status: 'utr_submitted' },
       source,
       () => deliverOrder(order!, requestedCredentials)
     );
+    if (deliveryResult === 'unavailable' && requestedCredentials.trim()) {
+      return { result: deliveryResult, order };
+    }
+    if (deliveryResult === 'unavailable') {
+      const queued = await client.query(
+        `UPDATE orders SET status = 'paid_stock_pending'
+         WHERE id = $1 AND status IN ('utr_submitted', 'paid_stock_pending') AND delivered = 0
+         RETURNING id`,
+        [orderId]
+      );
+      if (queued.rowCount !== 1) {
+        throw new Error(`Payment order ${orderId} changed while waiting for stock.`);
+      }
+      const paymentBinding = await client.query(
+        `UPDATE payments SET used_order_id = $2
+         WHERE utr = $1 AND (used_order_id IS NULL OR used_order_id = $2)
+         RETURNING utr`,
+        [paymentOrder.utr, orderId]
+      );
+      if (paymentBinding.rowCount !== 1) {
+        throw new Error(`Payment UTR for order ${orderId} is already bound to another order.`);
+      }
+      const now = new Date().toISOString();
+      order!.paymentStatus = 'paid_stock_pending';
+      order!.adminNote = 'Payment verified from SMS; waiting for matching stock.';
+      order!.updatedAt = now;
+      releaseStock(db.vault, orderId, now);
+      syncVaultDisplayCounter(getVaultPoolForPackType(order!.packType));
+      return { result: 'paid_stock_pending' as const, order };
+    }
     if (deliveryResult !== 'delivered') return { result: deliveryResult, order };
 
     const updated = await client.query(
       `UPDATE orders SET status = 'paid', delivered = 1
-       WHERE id = $1 AND status = 'utr_submitted' AND delivered = 0
+       WHERE id = $1 AND status IN ('utr_submitted', 'paid_stock_pending') AND delivered = 0
        RETURNING id`,
       [orderId]
     );
@@ -1166,10 +1197,15 @@ async function startServer() {
       ? 'Payment verified from SMS notification; Ready Vault ID delivered.'
       : 'Payment manually confirmed by admin; Ready Vault ID delivered.';
     if (order.utrNumber) {
-      await client.query(
-        'UPDATE payments SET used_order_id = $2 WHERE utr = $1 AND used_order_id IS NULL',
+      const paymentBinding = await client.query(
+        `UPDATE payments SET used_order_id = $2
+         WHERE utr = $1 AND (used_order_id IS NULL OR used_order_id = $2)
+         RETURNING utr`,
         [order.utrNumber, orderId]
       );
+      if (paymentBinding.rowCount !== 1) {
+        throw new Error(`Payment UTR for order ${orderId} is already bound to another order.`);
+      }
       await client.query('DELETE FROM verify_attempts WHERE order_id = $1', [orderId]);
     }
     syncVaultDisplayCounter(getVaultPoolForPackType(order.packType));
@@ -1212,6 +1248,36 @@ async function startServer() {
     }
     syncVaultDisplayCounter(getVaultPoolForPackType(expiredOrder.product));
     return true;
+  };
+  const deliverPaidStockPending = async (
+    client: import('pg').PoolClient,
+    poolType: VaultPoolType
+  ) => {
+    const queuedOrders = await client.query<{ id: string }>(
+      `SELECT id FROM orders
+       WHERE status = 'paid_stock_pending' AND delivered = 0
+       ORDER BY created_at ASC, id ASC
+       FOR UPDATE`
+    );
+    const deliveredOrderIds: string[] = [];
+    for (const queuedOrder of queuedOrders.rows) {
+      const order = db.orders.find((existing) => existing.orderId === queuedOrder.id);
+      if (!order) {
+        throw new Error(`Paid stock-pending order ${queuedOrder.id} is missing from application state.`);
+      }
+      if (getVaultPoolForPackType(order.packType) !== poolType) continue;
+
+      const delivery = await deliverSubmittedPayment(client, queuedOrder.id, 'sms');
+      if (delivery.result === 'paid_stock_pending') break;
+      if (delivery.result === 'delivered') {
+        deliveredOrderIds.push(queuedOrder.id);
+        continue;
+      }
+      throw new Error(
+        `Could not safely deliver paid stock-pending order ${queuedOrder.id}: ${delivery.result}.`
+      );
+    }
+    return deliveredOrderIds;
   };
 
   app.post('/api/create-order', createOrderLimiter, async (req, res) => {
@@ -1523,7 +1589,10 @@ async function startServer() {
         ) {
           orderAutoRejected = await rejectExpiredUtrOrder(client, matchedOrder.id);
           result = orderAutoRejected ? 'rejected_expired_utr' : 'ignored_expired_utr';
-        } else if (matchedOrder.status === 'utr_submitted') {
+        } else if (
+          matchedOrder.status === 'utr_submitted' ||
+          matchedOrder.status === 'paid_stock_pending'
+        ) {
           const delivery = await deliverSubmittedPayment(client, matchedOrder.id, 'sms');
           result = delivery.result;
           if (delivery.result === 'delivered') {
@@ -1618,6 +1687,14 @@ async function startServer() {
         res.json({ status: 'paid' });
         return;
       }
+      if (paymentOrder.status === 'paid_stock_pending') {
+        if (paymentOrder.utr === utr) {
+          res.json({ status: 'paid_stock_pending' });
+        } else {
+          res.status(409).json({ error: 'This order already has a confirmed payment UTR.' });
+        }
+        return;
+      }
       if (
         paymentOrder.status === 'rejected' &&
         db.orders.some(
@@ -1665,6 +1742,29 @@ async function startServer() {
         [orderId, clientKey]
       );
       const attemptCount = attemptResult.rows[0]?.failed_attempts ?? 0;
+      const priorBinding = await client.query<{ used_order_id: string | null }>(
+        'SELECT used_order_id FROM payments WHERE utr = $1',
+        [utr]
+      );
+      const duplicateUtr = await client.query<{ id: string }>(
+        'SELECT id FROM orders WHERE utr = $1 AND id <> $2',
+        [utr, orderId]
+      );
+      if (
+        (priorBinding.rows[0]?.used_order_id &&
+          priorBinding.rows[0].used_order_id !== orderId) ||
+        duplicateUtr.rows.length > 0 ||
+        db.orders.some((order) => order.utrNumber === utr && order.orderId !== orderId)
+      ) {
+        await commitCheckoutTransaction();
+        res.status(409).json({
+          error: 'Yeh UTR pehle hi use ho chuka hai.',
+          wrongUtr: true,
+          attempts: attemptCount,
+          locked: attemptCount >= 3,
+        });
+        return;
+      }
       if (attemptCount >= 3) {
         res.status(429).json({
           error: 'Bahut zyada galat UTR. Support se contact karein.',
@@ -1700,27 +1800,6 @@ async function startServer() {
         res.status(409).json({ error: 'This order has already received a UTR submission.' });
         return;
       }
-      const duplicateUtr = await client.query<{ id: string }>(
-        'SELECT id FROM orders WHERE utr = $1 AND id <> $2',
-        [utr, orderId]
-      );
-      if (
-        duplicateUtr.rows.length > 0 ||
-        db.orders.some((order) => order.utrNumber === utr && order.orderId !== orderId)
-      ) {
-        const failed = await recordUtrAttempt(client, orderId, clientKey, utr);
-        await commitCheckoutTransaction();
-        const attempts = failed?.failed_attempts ?? attemptCount;
-        res.status(attempts >= 3 ? 429 : 409).json({
-          error: attempts >= 3
-            ? 'Bahut zyada galat UTR. Support se contact karein.'
-            : 'Galat UTR. Receipt se 12-digit UTR dobara check karein.',
-          wrongUtr: true,
-          attempts,
-          locked: attempts >= 3,
-        });
-        return;
-      }
       const failed = await recordUtrAttempt(client, orderId, clientKey, utr);
       const attempts = failed?.failed_attempts ?? attemptCount;
       const savedPayment = await client.query<{
@@ -1733,23 +1812,32 @@ async function startServer() {
         [utr]
       );
       const recordedPayment = savedPayment.rows[0];
+      const recordedPaymentMatches = Boolean(
+        recordedPayment &&
+        matchesSmsPayment(
+          { utr, amountPaise: paymentOrder.amount_paise, createdAt: paymentOrder.created_at },
+          {
+            utr: recordedPayment.utr,
+            amountPaise: recordedPayment.amount_paise,
+            receivedAt: recordedPayment.received_at,
+          }
+        )
+      );
       if (
         recordedPayment &&
-        (recordedPayment.used_order_id !== null ||
-          !matchesSmsPayment(
-            { utr, amountPaise: paymentOrder.amount_paise, createdAt: paymentOrder.created_at },
-            {
-              utr: recordedPayment.utr,
-              amountPaise: recordedPayment.amount_paise,
-              receivedAt: recordedPayment.received_at,
-            }
-          ))
+        ((recordedPayment.used_order_id !== null &&
+          recordedPayment.used_order_id !== orderId) ||
+          !recordedPaymentMatches)
       ) {
         await commitCheckoutTransaction();
+        const alreadyUsed = recordedPayment.used_order_id !== null &&
+          recordedPayment.used_order_id !== orderId;
         res.status(409).json({
-          error: attempts >= 3
-            ? 'Bahut zyada galat UTR. Support se contact karein.'
-            : 'Galat UTR. Receipt se 12-digit UTR dobara check karein.',
+          error: alreadyUsed
+            ? 'Yeh UTR pehle hi use ho chuka hai.'
+            : attempts >= 3
+              ? 'Bahut zyada galat UTR. Support se contact karein.'
+              : 'Galat UTR. Receipt se 12-digit UTR dobara check karein.',
           wrongUtr: true,
           attempts,
           locked: attempts >= 3,
@@ -1761,13 +1849,8 @@ async function startServer() {
         return;
       }
       const poolType = getVaultPoolForPackType(paymentOrder.product);
-      if (
-        paymentOrder.status !== 'utr_submitted' &&
-        !reserveStock(db.vault, poolType, orderId, paymentOrder.quantity)
-      ) {
-        await commitCheckoutTransaction();
-        res.status(409).json({ error: 'Not enough available IDs to reserve this order.' });
-        return;
+      if (paymentOrder.status !== 'utr_submitted') {
+        reserveStock(db.vault, poolType, orderId, paymentOrder.quantity);
       }
       const submittedAt = new Date();
       const update = createSubmittedOrderUpdate(orderId, utr, submittedAt);
@@ -1785,8 +1868,8 @@ async function startServer() {
       const priorPayment = await client.query<{ utr: string; amount_paise: number; received_at: Date }>(
         `SELECT utr, amount_paise, received_at FROM payments
          WHERE utr = $1 AND amount_paise = $2 AND received_at > $3
-           AND used_order_id IS NULL`,
-        [utr, paymentOrder.amount_paise, paymentOrder.created_at]
+           AND (used_order_id IS NULL OR used_order_id = $4)`,
+        [utr, paymentOrder.amount_paise, paymentOrder.created_at, orderId]
       );
       let paidImmediately = false;
       let paidOrder: OrderRecord | undefined;
@@ -1821,7 +1904,14 @@ async function startServer() {
       } else if (orderNeedsManualReview) {
         broadcastStateUpdate('order_created', { order: orderNeedsManualReview });
       }
-      res.json({ status: paidImmediately ? 'paid' : 'utr_submitted', attempts });
+      res.json({
+        status: paidImmediately
+          ? 'paid'
+          : orderNeedsManualReview?.paymentStatus === 'paid_stock_pending'
+            ? 'paid_stock_pending'
+            : 'utr_submitted',
+        attempts,
+      });
       return;
     } catch (error) {
       console.error(
@@ -2653,6 +2743,9 @@ async function startServer() {
           .toLowerCase();
         return haystack.includes(orderQuery.toLowerCase());
       });
+      const paidStockPendingOrders = db.orders
+        .filter((order) => order.paymentStatus === 'paid_stock_pending')
+        .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
       const normalizedClaims = db.guaranteeClaims.filter((claim) => {
         if (claimStatus !== 'all' && claim.status !== claimStatus) return false;
         if (!claimQuery) return true;
@@ -2689,6 +2782,8 @@ async function startServer() {
       res.json({
         storeConfig: db.storeConfig,
         orders,
+        paidStockPendingOrders,
+        paidStockPendingCount: paidStockPendingOrders.length,
         ordersTotal: normalizedOrders.length,
         guaranteeClaims: claims,
         guaranteeClaimsTotal: normalizedClaims.length,
@@ -2725,6 +2820,23 @@ async function startServer() {
            FROM order_rows
            LEFT JOIN orders AS payment_order
              ON payment_order.id = order_rows.item->>'orderId'
+         ),
+         paid_stock_pending_rows AS (
+           SELECT normalized_order_rows.item ||
+             jsonb_build_object('paymentStatus', 'paid_stock_pending') AS item,
+             payment_order.created_at,
+             normalized_order_rows.ordinal
+           FROM normalized_order_rows
+           JOIN orders AS payment_order
+             ON payment_order.id = normalized_order_rows.item->>'orderId'
+           JOIN payments AS payment
+             ON payment.utr = payment_order.utr
+             AND payment.amount_paise = payment_order.amount_paise
+             AND payment.received_at > payment_order.created_at
+             AND payment.received_at <= payment_order.expires_at
+             AND payment.used_order_id = payment_order.id
+           WHERE payment_order.status = 'paid_stock_pending'
+             AND payment_order.delivered = 0
          ),
          eligible_order_rows AS (
            SELECT normalized_order_rows.item, normalized_order_rows.ordinal
@@ -2787,6 +2899,11 @@ async function startServer() {
          )
          SELECT
            (SELECT state->'storeConfig' FROM app_state) AS "storeConfig",
+           COALESCE((
+             SELECT jsonb_agg(item ORDER BY created_at, ordinal)
+             FROM paid_stock_pending_rows
+           ), '[]'::jsonb) AS "paidStockPendingOrders",
+           (SELECT COUNT(*) FROM paid_stock_pending_rows)::int AS "paidStockPendingCount",
            COALESCE((
              SELECT jsonb_agg(page.item ORDER BY page.ordinal)
              FROM (
@@ -3111,6 +3228,13 @@ async function startServer() {
       }
       const requestedCredentials = String(req.body?.deliveredCredentials || '').trim();
       const delivery = await deliverSubmittedPayment(client, orderId, 'manual', requestedCredentials);
+      if (delivery.result === 'paid_stock_pending') {
+        await saveDb(db);
+        broadcastStateUpdate('order_created', { order: delivery.order });
+        broadcastStateUpdate('vault_updated', {});
+        res.json({ status: 'paid_stock_pending', alreadyDelivered: false, order: delivery.order });
+        return;
+      }
       if (delivery.result !== 'delivered') {
         if (delivery.result === 'payment-not-verified') {
           res.status(409).json({
@@ -3517,10 +3641,33 @@ async function startServer() {
     } else if (poolType === 'permanent') {
       db.storeConfig.stockAvailable += parsedLines.length;
     }
+    const client = getCheckoutClient();
+    if (postgresPool && !client) {
+      res.status(503).json({ error: 'Payment database is not configured.' });
+      return;
+    }
+    let deliveredOrderIds: string[] = [];
+    if (client) {
+      try {
+        deliveredOrderIds = await deliverPaidStockPending(client, poolType);
+      } catch (error) {
+        console.error('Failed to deliver paid stock-pending orders:', error);
+        res.status(500).json({ error: 'New stock was added, but queued paid orders could not be delivered safely.' });
+        return;
+      }
+    }
     if (!(await persistDbOrRespond(res))) return;
+    for (const orderId of deliveredOrderIds) {
+      const order = db.orders.find((existing) => existing.orderId === orderId);
+      broadcastStateUpdate('order_verified', { order, source: 'sms' });
+    }
     broadcastStateUpdate('vault_updated', {});
 
-    res.status(201).json({ addedCount: parsedLines.length, storeConfig: db.storeConfig });
+    res.status(201).json({
+      addedCount: parsedLines.length,
+      deliveredOrderIds,
+      storeConfig: db.storeConfig,
+    });
   });
 
   // Admin Delete Vault Item
@@ -3565,7 +3712,8 @@ async function startServer() {
         `DELETE FROM orders WHERE status = 'draft' AND expires_at <= NOW() RETURNING id`
       );
       const activeOrders = await client.query<{ id: string }>(
-        `SELECT id FROM orders WHERE status = 'utr_submitted' AND delivered = 0`
+        `SELECT id FROM orders
+         WHERE status IN ('utr_submitted', 'paid_stock_pending') AND delivered = 0`
       );
       const activeOrderIds = new Set(activeOrders.rows.map((row) => row.id));
       const now = new Date().toISOString();

@@ -10,7 +10,14 @@ export type PackType =
   | 'guarantee_1month';
 
 export type OrderStatus = 'pending_verification' | 'verified_delivered' | 'rejected';
-export type PaymentStatus = 'draft' | 'pending' | 'utr_submitted' | 'paid' | 'expired' | 'rejected';
+export type PaymentStatus =
+  | 'draft'
+  | 'pending'
+  | 'utr_submitted'
+  | 'paid_stock_pending'
+  | 'paid'
+  | 'expired'
+  | 'rejected';
 export type GuaranteeType = 'guarantee_7days' | 'guarantee_1month';
 export type GuaranteeClaimStatus = 'pending' | 'approved' | 'rejected' | 'resolved';
 

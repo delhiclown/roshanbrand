@@ -38,6 +38,9 @@ const wait = (milliseconds: number) =>
 
 const WRONG_UTR_ERROR = 'Galat UTR. Receipt se 12-digit UTR dobara check karein.';
 const TOO_MANY_WRONG_UTR_ERROR = 'Bahut zyada galat UTR. Support se contact karein.';
+const UTR_ALREADY_USED_ERROR = 'Yeh UTR pehle hi use ho chuka hai.';
+const PAID_STOCK_PENDING_MESSAGE =
+  'Payment mil gaya. Stock abhi available nahi hai, stock aate hi ID automatic mil jayegi.';
 
 export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   draft,
@@ -244,6 +247,33 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
     setVerifying(true);
     const run = ++verificationRun.current;
     const isCurrentRun = () => verificationRun.current === run;
+    const waitForStockDelivery = async () => {
+      setPaymentReceived(true);
+      setMessage(PAID_STOCK_PENDING_MESSAGE);
+      setVerifying(false);
+      while (isCurrentRun()) {
+        await wait(5000);
+        if (!isCurrentRun()) return;
+        const statusResponse = await fetch(
+          `/api/order-status/${encodeURIComponent(paymentOrder.orderId)}`,
+          { cache: 'no-store' }
+        );
+        const statusData = await statusResponse.json();
+        if (!statusResponse.ok) {
+          throw new Error(statusData.error || 'Order status check nahi ho saka.');
+        }
+        if (statusData.status === 'paid') {
+          finishAsPaid(await fetchPaidOrder(paymentOrder), paymentOrder.accessToken);
+          return;
+        }
+        if (statusData.status !== 'paid_stock_pending') {
+          if (statusData.status === 'rejected') {
+            setMessage('Payment verify ho gaya, lekin order status check karne ke liye support se contact karein.');
+          }
+          return;
+        }
+      }
+    };
 
     try {
       const firstCheck = await checkUtr(paymentOrder, submittedUtr);
@@ -251,7 +281,9 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         const attempts = firstCheck.attempts ?? 0;
         setWrongAttempts(attempts);
         setError(
-          firstCheck.locked || attempts >= 3
+          firstCheck.error === UTR_ALREADY_USED_ERROR
+            ? UTR_ALREADY_USED_ERROR
+            : firstCheck.locked || attempts >= 3
             ? TOO_MANY_WRONG_UTR_ERROR
             : WRONG_UTR_ERROR
         );
@@ -261,6 +293,10 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
       if (firstCheck.attempts !== undefined) setWrongAttempts(firstCheck.attempts);
       if (firstCheck.status === 'paid') {
         finishAsPaid(await fetchPaidOrder(paymentOrder), paymentOrder.accessToken);
+        return;
+      }
+      if (firstCheck.status === 'paid_stock_pending') {
+        await waitForStockDelivery();
         return;
       }
       if (firstCheck.status === 'expired') {
@@ -308,6 +344,10 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
           finishAsPaid(await fetchPaidOrder(paymentOrder), paymentOrder.accessToken);
           return;
         }
+        if (statusData.status === 'paid_stock_pending') {
+          await waitForStockDelivery();
+          return;
+        }
         if (statusData.status === 'payment_received') {
           matchingPaymentSeen = true;
           setPaymentReceived(true);
@@ -325,6 +365,10 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         }
         if (statusData.status === 'paid') {
           finishAsPaid(await fetchPaidOrder(paymentOrder), paymentOrder.accessToken);
+          return;
+        }
+        if (statusData.status === 'paid_stock_pending') {
+          await waitForStockDelivery();
           return;
         }
         if (statusData.status === 'rejected') {

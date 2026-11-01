@@ -121,7 +121,7 @@ export function parseCreditedSms(
     /(?:₹|INR|Rs\.?)\s*((?:\d{1,3}(?:,\d{3})+|\d{1,2}(?:,\d{2})*,\d{3}|\d+)(?:\.\d{1,2})?)/i
   );
   const utrMatch = message.match(
-    /(?:UTR|REF(?:ERENCE)?|RRN)\s*(?:NO\.?|NUMBER)?\s*[:#-]?\s*(?<!\d)(\d{12})(?!\d)/i
+    /(?:UTR|REF(?:ERENCE)?|RRN|TXN ?ID)\s*(?:NO\.?|NUMBER)?\s*[:#-]?\s*(?<!\d)(\d{12})(?!\d)/i
   );
   if (!amountMatch || !utrMatch) return { ok: false, reason: 'parse_failed' };
 

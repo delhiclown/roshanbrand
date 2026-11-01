@@ -26,6 +26,24 @@ export const LIMITS = {
   QUANTITY_MAX: 500,
 };
 
+export const TRACK_ORDER_MESSAGES: Record<string, string> = {
+  'Paid - Stock Pending':
+    'Payment received. Your ID will be delivered as soon as stock is added. No need to check again and again.',
+  'UTR not found':
+    'We could not find this UTR yet. Please check the 12-digit number, or wait a few minutes and try again.',
+  'Waiting for SMS':
+    'We are waiting for your payment confirmation. Please wait a few minutes and check again.',
+  Rejected: 'This payment could not be matched with an order. Please contact support.',
+  'Order expired': 'This payment could not be matched with an order. Please contact support.',
+  'Waiting for payment':
+    'We are waiting for your payment confirmation. Please wait a few minutes and check again.',
+  Delivered: 'Delivered',
+};
+
+export function getTrackOrderMessage(status: string): string {
+  return TRACK_ORDER_MESSAGES[status] || status;
+}
+
 export const DEFAULT_STORE_CONFIG: StoreConfig = {
   siteTitle: 'Roshanbrand',
   announcementText: '',

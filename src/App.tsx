@@ -23,7 +23,7 @@ import {
 import { AdminPortal } from '../components/AdminPortal';
 import { CheckoutModal } from '../components/CheckoutModal';
 import { DeliveredOrderDetails } from '../components/DeliveredOrderDetails';
-import { DEFAULT_STORE_CONFIG, LIMITS } from './constants';
+import { DEFAULT_STORE_CONFIG, getTrackOrderMessage, LIMITS } from './constants';
 import {
   CheckoutDraft,
   CustomerGuaranteeClaim,
@@ -237,7 +237,7 @@ export default function App() {
           }
           if (!active) return;
           setTrackedOrder(order);
-          setTrackStatusMessage(
+          const currentStatus =
             order.paymentStatus === 'paid' || order.status === 'verified_delivered'
               ? 'Delivered'
               : order.paymentStatus === 'paid_stock_pending'
@@ -248,8 +248,8 @@ export default function App() {
                     ? 'Rejected'
                     : order.paymentStatus === 'expired'
                       ? 'Order expired'
-                      : 'Waiting for payment'
-          );
+                      : 'Waiting for payment';
+          setTrackStatusMessage(getTrackOrderMessage(currentStatus));
           setTrackError('');
         } else {
           setTrackedOrder(null);
@@ -519,13 +519,16 @@ export default function App() {
       const data = await response.json() as {
         error?: string;
         status?: string;
+        message?: string;
         order?: OrderRecord | null;
       };
       if (!response.ok) {
         setTrackError(data.error || 'No order found with this UTR or Order ID.');
         return;
       }
-      setTrackStatusMessage(data.status || '');
+      setTrackStatusMessage(
+        data.message || getTrackOrderMessage(data.status || '')
+      );
       if (data.order) {
         setTrackedOrderId(data.order.orderId);
         setTrackedOrder(data.order);
@@ -542,6 +545,20 @@ export default function App() {
     navigator.clipboard.writeText(text);
     setCopiedKey(key);
     setTimeout(() => setCopiedKey(null), 2000);
+  };
+
+  const normalizeTrackSearchInput = (value: string) =>
+    /^[\d\s]*$/.test(value) ? value.replace(/\s/g, '').slice(0, 12) : value;
+
+  const copyTrackUtr = async () => {
+    if (!LIMITS.UTR_REGEX.test(searchInput)) return;
+    try {
+      await navigator.clipboard.writeText(searchInput);
+      setCopiedKey('track-utr');
+      setTimeout(() => setCopiedKey(null), 1800);
+    } catch {
+      setTrackError('Could not copy the UTR. Please copy it manually.');
+    }
   };
 
   const splitLines = (creds: string) =>
@@ -722,19 +739,38 @@ export default function App() {
                     check its status. Credentials are only returned when this browser has the private
                     order key.
                   </p>
-                  <form onSubmit={handleTrackSearch} className="space-y-2.5">
-                    <input
-                      type="text"
-                      autoComplete="off"
-                      value={searchInput}
-                      onChange={(e) => setSearchInput(e.target.value)}
-                      placeholder="Enter 12-digit UTR or Order ID"
-                      className="w-full px-3 py-2 text-xs rounded-xl border border-cyan-500/40 bg-slate-950/90 text-white font-mono focus:outline-none focus:ring-2 focus:ring-cyan-400/30 focus:border-cyan-400"
-                    />
+                  <form onSubmit={handleTrackSearch} autoComplete="off" className="space-y-2.5">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        name="track-order-reference"
+                        autoComplete="off"
+                        autoCorrect="off"
+                        spellCheck={false}
+                        value={searchInput}
+                        onChange={(e) => setSearchInput(normalizeTrackSearchInput(e.target.value))}
+                        placeholder="Enter 12-digit UTR or Order ID"
+                        className="min-w-0 flex-1 px-3 py-2 text-xs rounded-xl border border-cyan-500/40 bg-slate-950/90 text-white font-mono focus:outline-none focus:ring-2 focus:ring-cyan-400/30 focus:border-cyan-400"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => void copyTrackUtr()}
+                        disabled={!LIMITS.UTR_REGEX.test(searchInput)}
+                        aria-label={copiedKey === 'track-utr' ? 'UTR copied' : 'Copy UTR'}
+                        title={copiedKey === 'track-utr' ? 'Copied' : 'Copy UTR'}
+                        className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-cyan-400/40 bg-slate-900 text-cyan-200 disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        {copiedKey === 'track-utr' ? (
+                          <Check className="h-4 w-4 text-emerald-300" />
+                        ) : (
+                          <Copy className="h-4 w-4" />
+                        )}
+                      </button>
+                    </div>
                     {trackError && (
                       <p className="text-[11px] text-rose-400 font-semibold">{trackError}</p>
                     )}
-                    {trackStatusMessage && (
+                    {trackStatusMessage && !trackedOrder && (
                       <p className="text-[11px] font-semibold text-cyan-200" role="status">
                         {trackStatusMessage}
                       </p>
@@ -811,91 +847,17 @@ export default function App() {
 
           {/* Active / Tracked Order Status Box */}
           {trackedOrder && (
-            <div className="mb-6">
-              {trackedOrder.status === 'pending_verification' ? (
-                <div className="neon-card-3d border-amber-400/50 p-4 sm:p-5">
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <div className="flex items-center gap-3">
-                      <div className="w-10 h-10 rounded-xl bg-amber-500/20 border border-amber-400/50 text-amber-300 flex items-center justify-center shrink-0">
-                        <Clock className="w-5 h-5 animate-pulse" />
-                      </div>
-                      <div>
-                        <div className="flex items-center gap-2">
-                          <h3 className="text-sm font-extrabold text-white">
-                            {trackedOrder.paymentStatus === 'expired'
-                              ? 'Order expired'
-                              : trackedOrder.paymentStatus === 'paid_stock_pending'
-                                ? 'Paid — waiting for stock'
-                                : trackedOrder.paymentStatus === 'utr_submitted'
-                                  ? 'UTR submitted — waiting for SMS'
-                                  : 'Waiting for payment / enter UTR'}
-                          </h3>
-                          <span className="text-[11px] font-mono font-bold text-amber-300">
-                            {trackedOrder.orderId}
-                          </span>
-                        </div>
-                        <p className="text-xs text-slate-300 mt-0.5">
-                          {trackedOrder.paymentStatus === 'expired'
-                            ? 'This order expired before payment was approved. Contact support if you already paid.'
-                            : trackedOrder.paymentStatus === 'paid_stock_pending'
-                              ? 'Payment was verified from the matching bank SMS. Credentials will be delivered automatically when matching stock is added.'
-                              : trackedOrder.paymentStatus === 'utr_submitted'
-                                ? 'Payment reference received. Credentials are released automatically only after a matching bank SMS confirms the exact amount.'
-                                : 'No UTR has been submitted. Submit your UTR; a matching bank SMS is required before automatic delivery.'}
-                          {' '}(₹{trackedOrder.totalAmount} for {trackedOrder.quantity} ID
-                          {trackedOrder.quantity > 1 ? 's' : ''}).
-                        </p>
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => copyToClipboard(trackedOrder.orderId, 'order-id')}
-                      className="px-3 py-1.5 rounded-xl text-xs font-bold bg-slate-900 hover:bg-slate-800 text-cyan-300 border border-cyan-500/35 flex items-center gap-1.5 shadow-[0_3px_0_#040714] cursor-pointer"
-                    >
-                      {copiedKey === 'order-id' ? (
-                        <>
-                          <Check className="w-3.5 h-3.5 text-emerald-400" />
-                          <span>Copied ID</span>
-                        </>
-                      ) : (
-                        <>
-                          <Copy className="w-3.5 h-3.5" />
-                          <span>Copy Order ID</span>
-                        </>
-                      )}
-                    </button>
-                  </div>
-                </div>
-              ) : trackedOrder.paymentStatus === 'expired' ? (
-                <div className="neon-card-3d border-rose-500/50 p-4 text-sm text-rose-200">
-                  Order {trackedOrder.orderId} has expired. Contact support if you already paid.
-                </div>
-              ) : trackedOrder.status === 'rejected' ? (
-                <div className="neon-card-3d border-rose-500/50 p-4 flex items-center justify-between gap-3">
-                  <div className="flex items-center gap-3">
-                    <XCircle className="w-5 h-5 text-rose-400 shrink-0" />
-                    <div>
-                      <p className="text-xs font-bold text-white">
-                        Order {trackedOrder.orderId} — UTR Rejected
-                      </p>
-                      <p className="text-[11px] text-rose-300">
-                        {trackedOrder.adminNote ||
-                          'Invalid or mismatched UTR number. Please contact support.'}
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              ) : (
-                <div className="neon-card-3d border-amber-400/50 p-4 space-y-2">
-                  <h3 className="text-sm font-extrabold text-white">
-                    Order delivered — private access key not available in this browser
-                  </h3>
-                  <p className="text-xs text-slate-300">
-                    UTR lookup shows status only. Delivered credentials are returned only to the
-                    browser holding this order&apos;s private key.
-                  </p>
-                </div>
-              )}
+            <div
+              className={`mb-6 neon-card-3d p-4 ${
+                trackedOrder.status === 'verified_delivered'
+                  ? 'border-emerald-400/50 text-emerald-200'
+                  : 'border-cyan-400/40 text-cyan-100'
+              }`}
+              role="status"
+            >
+              {trackedOrder.status === 'verified_delivered'
+                ? 'Delivered. Credentials are available only in the browser holding this order’s private key.'
+                : trackStatusMessage}
             </div>
           )}
 

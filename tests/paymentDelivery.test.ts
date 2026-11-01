@@ -4,6 +4,7 @@ import {
   createSubmittedOrderUpdate,
   deliverOnce,
   getTrackComplaintStatus,
+  isTrackComplaintStatus,
   isOrderExpired,
   matchesSmsPayment,
   parseCreditedSms,
@@ -14,6 +15,7 @@ import {
   submitUtr,
   type DeliveryState,
 } from '../src/paymentDelivery.ts';
+import { getTrackOrderMessage } from '../src/constants.ts';
 
 interface TestDraft {
   orderId: string;
@@ -179,6 +181,30 @@ test('Track complaints report the current payment state but never for delivered 
   assert.equal(getTrackComplaintStatus('expired'), 'Order expired');
   assert.equal(getTrackComplaintStatus('paid'), null);
   assert.equal(getTrackComplaintStatus('utr_submitted', true), null);
+  assert.equal(isTrackComplaintStatus('UTR not found'), true);
+  assert.equal(isTrackComplaintStatus('Paid - Stock Pending'), true);
+  assert.equal(isTrackComplaintStatus('Waiting for SMS'), true);
+  assert.equal(isTrackComplaintStatus('Rejected'), false);
+  assert.equal(isTrackComplaintStatus(null), false);
+});
+
+test('Track status messages use the customer-facing wording for each payment state', () => {
+  assert.equal(
+    getTrackOrderMessage('Paid - Stock Pending'),
+    'Payment received. Your ID will be delivered as soon as stock is added. No need to check again and again.'
+  );
+  assert.equal(
+    getTrackOrderMessage('UTR not found'),
+    'We could not find this UTR yet. Please check the 12-digit number, or wait a few minutes and try again.'
+  );
+  assert.equal(
+    getTrackOrderMessage('Waiting for SMS'),
+    'We are waiting for your payment confirmation. Please wait a few minutes and check again.'
+  );
+  assert.equal(
+    getTrackOrderMessage('Rejected'),
+    'This payment could not be matched with an order. Please contact support.'
+  );
 });
 
 test('An unmatched SMS can be matched and delivered when its UTR is submitted later', () => {

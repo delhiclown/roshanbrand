@@ -8,7 +8,7 @@ import { fileURLToPath } from 'url';
 import { Pool } from 'pg';
 import { rateLimit } from 'express-rate-limit';
 import { createServer as createViteServer } from 'vite';
-import { DEFAULT_STORE_CONFIG, LIMITS } from './src/constants.ts';
+import { DEFAULT_STORE_CONFIG, getTrackOrderMessage, LIMITS } from './src/constants.ts';
 import {
   CustomerGuaranteeClaim,
   GuaranteeClaim,
@@ -23,6 +23,7 @@ import {
   createSubmittedOrderUpdate,
   deliverOnce,
   getTrackComplaintStatus,
+  isTrackComplaintStatus,
   isOrderExpired,
   matchesSmsPayment,
   parseCreditedSms,
@@ -1521,7 +1522,7 @@ async function startServer() {
              WHERE utr = $1`,
             [complaintUtr, found?.orderId || null]
           );
-        } else {
+        } else if (isTrackComplaintStatus(complaintStatus)) {
           await client.query(
             `INSERT INTO track_order_complaints
                (utr, order_id, current_status, check_count, first_checked_at, last_checked_at)
@@ -1534,12 +1535,24 @@ async function startServer() {
                resolved_at = NULL`,
             [complaintUtr, found?.orderId || null, complaintStatus]
           );
+        } else {
+          await client.query(
+            `UPDATE track_order_complaints
+             SET order_id = COALESCE(order_id, $2),
+                 current_status = $3,
+                 check_count = check_count + 1,
+                 last_checked_at = NOW()
+             WHERE utr = $1 AND resolved_at IS NULL`,
+            [complaintUtr, found?.orderId || null, complaintStatus]
+          );
         }
       }
 
       await commitCheckoutTransaction();
+      const status = complaintStatus || 'Delivered';
       res.json({
-        status: complaintStatus || 'Delivered',
+        status,
+        message: getTrackOrderMessage(status),
         order: found
           ? {
               ...found,
@@ -2974,6 +2987,7 @@ async function startServer() {
         vault: db.vault,
         smsPaymentLogs: [],
         trackOrderComplaints: [],
+        trackOrderComplaintsCount: 0,
         summary,
         replacementCounts,
         ordersOffset: orderOffset,
@@ -3149,19 +3163,33 @@ async function startServer() {
          WHERE log.order_id IS NOT NULL
          ORDER BY log.id DESC LIMIT 50`
       );
-      const trackOrderComplaints = await query(
+      const requestedComplaintUtr = String(req.query.trackComplaintUtr || '');
+      const complaintUtr = LIMITS.UTR_REGEX.test(requestedComplaintUtr)
+        ? requestedComplaintUtr
+        : '';
+      const [trackOrderComplaints, trackOrderComplaintsCount] = await Promise.all([
+        query(
         `SELECT utr, order_id AS "orderId", current_status AS "currentStatus",
                 check_count AS "checkCount", first_checked_at AS "firstCheckedAt",
                 last_checked_at AS "lastCheckedAt"
          FROM track_order_complaints
          WHERE resolved_at IS NULL
-         ORDER BY last_checked_at DESC
-         LIMIT 100`
-      );
+           AND ($1 = '' OR utr = $1)
+         ORDER BY first_checked_at DESC
+         LIMIT 100`,
+        [complaintUtr]
+        ),
+        query(
+          `SELECT COUNT(*)::int AS count
+           FROM track_order_complaints
+           WHERE resolved_at IS NULL`
+        ),
+      ]);
       res.json({
         ...result.rows[0],
         smsPaymentLogs: smsPaymentLogs.rows,
         trackOrderComplaints: trackOrderComplaints.rows,
+        trackOrderComplaintsCount: trackOrderComplaintsCount.rows[0]?.count || 0,
         ordersOffset: orderOffset,
         claimsOffset: claimOffset,
         ordersPageSize,

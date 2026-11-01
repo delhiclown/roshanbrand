@@ -85,6 +85,14 @@ export function getTrackComplaintStatus(
   return 'Waiting for SMS';
 }
 
+export function isTrackComplaintStatus(status: string | null): boolean {
+  return (
+    status === 'UTR not found' ||
+    status === 'Paid - Stock Pending' ||
+    status === 'Waiting for SMS'
+  );
+}
+
 export function createSubmittedOrderUpdate(orderId: string, utr: string, submittedAt: Date) {
   return {
     text: `UPDATE orders SET status = 'utr_submitted', utr = $2, expires_at = $3

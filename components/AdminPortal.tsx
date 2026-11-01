@@ -41,6 +41,7 @@ interface AdminPortalProps {
 
 type AdminTab =
   | 'orders'
+  | 'track_complaints'
   | 'guarantee_claims'
   | 'qr_settings'
   | 'site_settings'
@@ -128,6 +129,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   const [busyOrderId, setBusyOrderId] = useState<string | null>(null);
   const [copiedUtr, setCopiedUtr] = useState<string | null>(null);
   const [trackOrderComplaints, setTrackOrderComplaints] = useState<TrackOrderComplaint[]>([]);
+  const [trackOrderComplaintsCount, setTrackOrderComplaintsCount] = useState(0);
+  const [trackComplaintSearchQuery, setTrackComplaintSearchQuery] = useState('');
   const [resolvingComplaint, setResolvingComplaint] = useState<string | null>(null);
   const [complaintWarning, setComplaintWarning] = useState('');
   const adminFiltersRef = useRef({
@@ -137,6 +140,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     searchQuery: '',
     claimStatusFilter: 'all' as 'all' | GuaranteeClaimStatus,
     claimSearchQuery: '',
+    complaintSearchQuery: '',
   });
   adminFiltersRef.current = {
     ordersOffset,
@@ -145,6 +149,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     searchQuery,
     claimStatusFilter,
     claimSearchQuery,
+    complaintSearchQuery: trackComplaintSearchQuery,
   };
 
   const [newVaultText, setNewVaultText] = useState('');
@@ -262,6 +267,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
         orderSearch: filters.searchQuery,
         claimStatus: filters.claimStatusFilter,
         claimSearch: filters.claimSearchQuery,
+        trackComplaintUtr:
+          filters.complaintSearchQuery.length === 12 ? filters.complaintSearchQuery : '',
       });
       const res = await fetch(`/api/admin/state?${params.toString()}`);
       if (!res.ok) throw new Error(`Admin state returned HTTP ${res.status}.`);
@@ -286,6 +293,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
       setVault(data.vault || []);
       setSmsPaymentLogs(data.smsPaymentLogs || []);
       setTrackOrderComplaints(data.trackOrderComplaints || []);
+      setTrackOrderComplaintsCount(Number(data.trackOrderComplaintsCount) || 0);
       setGuaranteeClaims((previous) =>
         mergePage(previous, data.guaranteeClaims || [], 'claimId', requestClaimsOffset)
       );
@@ -345,18 +353,24 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     searchQuery,
     claimStatusFilter,
     claimSearchQuery,
+    trackComplaintSearchQuery,
   ]);
 
-  const handleCopyUtr = (utr: string) => {
-    navigator.clipboard.writeText(utr);
-    setCopiedUtr(utr);
-    setTimeout(() => setCopiedUtr(null), 1800);
+  const handleCopyUtr = async (utr: string) => {
+    try {
+      await navigator.clipboard.writeText(utr);
+      setCopiedUtr(utr);
+      setTimeout(() => setCopiedUtr(null), 1800);
+    } catch {
+      setComplaintWarning('Could not copy the UTR. Please copy it manually.');
+    }
   };
 
   const handleResolveComplaint = async (utr: string) => {
     setResolvingComplaint(utr);
     setComplaintWarning('');
     setTrackOrderComplaints((current) => current.filter((complaint) => complaint.utr !== utr));
+    setTrackOrderComplaintsCount((current) => Math.max(0, current - 1));
     try {
       const response = await fetch(
         `/api/admin/track-order-complaints/${encodeURIComponent(utr)}/resolve`,
@@ -625,6 +639,9 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   const deliveredCount = adminSummary.deliveredOrders;
   const verifiedRevenue = adminSummary.verifiedRevenue;
   const readyVaultCount = vault.filter((v) => !v.isAssigned && !v.reservedOrderId).length;
+  const filteredTrackOrderComplaints = trackOrderComplaints.filter((complaint) =>
+    complaint.utr.startsWith(trackComplaintSearchQuery)
+  );
 
   const filteredOrders = orders.filter((o) => {
     if (statusFilter !== 'all' && o.status !== statusFilter) return false;
@@ -725,6 +742,20 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
       minute: '2-digit',
     });
 
+  const formatComplaintAge = (value: string) => {
+    const checkedAt = new Date(value).getTime();
+    if (!Number.isFinite(checkedAt)) return 'Unknown';
+    const minutes = Math.max(0, Math.floor((Date.now() - checkedAt) / 60_000));
+    if (minutes < 1) return 'Just now';
+    if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+    const days = Math.floor(hours / 24);
+    if (days < 30) return `${days} day${days === 1 ? '' : 's'} ago`;
+    const months = Math.floor(days / 30);
+    return `${months} month${months === 1 ? '' : 's'} ago`;
+  };
+
   const navItems: {
     id: AdminTab;
     label: string;
@@ -766,6 +797,13 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
       subtitle: 'Pre-load Rental & Permanent IDs',
       icon: <Package className="w-4 h-4" />,
       badge: readyVaultCount,
+    },
+    {
+      id: 'track_complaints',
+      label: 'Track Order Complaints',
+      subtitle: 'View and resolve customer complaints',
+      icon: <Search className="w-4 h-4" />,
+      badge: trackOrderComplaintsCount,
     },
     {
       id: 'security',
@@ -1079,6 +1117,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
         </header>
 
         <main className="max-w-6xl w-full mx-auto px-4 sm:px-6 py-6 space-y-6 flex-1">
+          {activeTab !== 'track_complaints' && (
+            <>
           {/* Top Metrics */}
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-3.5 sm:gap-4">
             <div className="neon-card-3d p-4 sm:p-5 flex items-start justify-between gap-3 border-amber-400/40">
@@ -1150,6 +1190,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
               </div>
             </div>
           </div>
+            </>
+          )}
 
           {activeTab === 'security' && (
             <section className="neon-card-3d max-w-2xl p-5 sm:p-7 border-cyan-400/35">
@@ -1253,79 +1295,6 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                   </div>
                 </section>
               )}
-              <section className="neon-card-3d p-4">
-                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-                  <h3 className="text-sm font-extrabold text-white">Track Order Complaints</h3>
-                  <span className="text-[11px] text-slate-400">
-                    Latest {trackOrderComplaints.length} open records
-                  </span>
-                </div>
-                {complaintWarning && (
-                  <p className="mb-3 text-xs text-rose-300" role="alert">
-                    {complaintWarning}
-                  </p>
-                )}
-                {trackOrderComplaints.length === 0 ? (
-                  <p className="rounded-lg border border-slate-800 bg-slate-950/60 p-3 text-xs text-slate-400">
-                    No open tracking complaints.
-                  </p>
-                ) : (
-                  <div className="max-h-96 space-y-2 overflow-y-auto">
-                    {trackOrderComplaints.map((complaint) => (
-                      <div
-                        key={complaint.utr}
-                        className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-cyan-500/20 bg-slate-950/70 p-3"
-                      >
-                        <div className="min-w-0 flex-1 text-xs">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <span className="font-mono font-bold text-cyan-200">
-                              UTR {complaint.utr}
-                            </span>
-                            <span className="rounded-md bg-amber-950/60 px-2 py-1 font-bold text-amber-200">
-                              {complaint.currentStatus}
-                            </span>
-                          </div>
-                          <p className="mt-1 text-slate-300">
-                            Order: {complaint.orderId || 'Not found'} · Checked {complaint.checkCount} time
-                            {complaint.checkCount === 1 ? '' : 's'}
-                          </p>
-                          <p className="mt-1 text-[11px] text-slate-500">
-                            First: {formatClaimDate(complaint.firstCheckedAt)} · Last:{' '}
-                            {formatClaimDate(complaint.lastCheckedAt)}
-                          </p>
-                        </div>
-                        <div className="flex shrink-0 items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => handleCopyUtr(complaint.utr)}
-                            className="inline-flex items-center gap-1 rounded-lg border border-cyan-400/40 bg-slate-900 px-2.5 py-1.5 text-xs font-bold text-cyan-300"
-                          >
-                            {copiedUtr === complaint.utr ? (
-                              <>
-                                <Check className="h-3.5 w-3.5" />
-                                Copied
-                              </>
-                            ) : (
-                              <>
-                                <Copy className="h-3.5 w-3.5" />
-                                Copy UTR
-                              </>
-                            )}
-                          </button>
-                          <button
-                            type="button"
-                            disabled={resolvingComplaint === complaint.utr}
-                            onClick={() => void handleResolveComplaint(complaint.utr)}
-                            className="rounded-lg border border-emerald-500/40 bg-emerald-950/60 px-2.5 py-1.5 text-xs font-bold text-emerald-200 disabled:opacity-50"
-                          >
-                            {resolvingComplaint === complaint.utr ? 'Resolving…' : 'Resolved'}
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </section>
               <div className="neon-card-3d p-4 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
                 <div className="flex items-center gap-1.5 overflow-x-auto pb-1 sm:pb-0">
                   {(
@@ -1584,6 +1553,101 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                 </>
               )}
             </div>
+          )}
+
+          {activeTab === 'track_complaints' && (
+            <section className="neon-card-3d min-w-0 p-4 sm:p-5">
+              <div className="flex flex-wrap items-start justify-between gap-4">
+                <div>
+                  <h2 className="text-base font-black text-white">Track Order Complaints</h2>
+                  <p className="mt-1 text-xs text-slate-400">
+                    Latest {trackOrderComplaints.length} of {trackOrderComplaintsCount} open complaints
+                  </p>
+                </div>
+                <label className="relative w-full sm:w-72">
+                  <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-cyan-400" />
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    autoComplete="off"
+                    value={trackComplaintSearchQuery}
+                    onChange={(event) => {
+                      setTrackComplaintSearchQuery(
+                        event.target.value.replace(/\D/g, '').slice(0, 12)
+                      );
+                    }}
+                    placeholder="Search 12-digit UTR"
+                    aria-label="Search complaints by UTR"
+                    className="w-full rounded-xl border border-cyan-500/35 bg-slate-950 py-2.5 pl-9 pr-3 text-xs font-mono text-white placeholder:text-slate-500"
+                  />
+                </label>
+              </div>
+
+              {complaintWarning && (
+                <p className="mt-3 text-xs text-rose-300" role="alert">
+                  {complaintWarning}
+                </p>
+              )}
+              {filteredTrackOrderComplaints.length === 0 ? (
+                <p className="mt-4 rounded-lg border border-slate-800 bg-slate-950/60 p-4 text-xs text-slate-400">
+                  {trackComplaintSearchQuery
+                    ? 'No open complaint matches this UTR.'
+                    : 'No open tracking complaints.'}
+                </p>
+              ) : (
+                <div className="mt-4 max-h-[70vh] space-y-2 overflow-y-auto">
+                  {filteredTrackOrderComplaints.map((complaint) => (
+                    <div
+                      key={complaint.utr}
+                      className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-cyan-500/20 bg-slate-950/70 p-3"
+                    >
+                      <div className="min-w-0 flex-1 text-xs">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-mono font-bold text-cyan-200">
+                            UTR {complaint.utr}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => void handleCopyUtr(complaint.utr)}
+                            aria-label={copiedUtr === complaint.utr ? 'UTR copied' : 'Copy UTR'}
+                            title={copiedUtr === complaint.utr ? 'Copied' : 'Copy UTR'}
+                            className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-cyan-400/30 bg-slate-900 text-cyan-200"
+                          >
+                            {copiedUtr === complaint.utr ? (
+                              <Check className="h-3.5 w-3.5 text-emerald-300" />
+                            ) : (
+                              <Copy className="h-3.5 w-3.5" />
+                            )}
+                          </button>
+                          <span className="rounded-md bg-amber-950/60 px-2 py-1 font-bold text-amber-200">
+                            {complaint.currentStatus}
+                          </span>
+                        </div>
+                        <p className="mt-1 text-slate-300">
+                          Order ID: {complaint.orderId || 'Not found'} · Checked {complaint.checkCount}{' '}
+                          time{complaint.checkCount === 1 ? '' : 's'}
+                        </p>
+                        <p className="mt-1 text-[11px] text-slate-400">
+                          First checked: {formatClaimDate(complaint.firstCheckedAt)} · Last checked:{' '}
+                          {formatClaimDate(complaint.lastCheckedAt)}
+                        </p>
+                        <p className="mt-1 text-[11px] text-slate-500">
+                          Complaint age: {formatComplaintAge(complaint.firstCheckedAt)}
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={resolvingComplaint === complaint.utr}
+                        onClick={() => void handleResolveComplaint(complaint.utr)}
+                        className="shrink-0 rounded-lg border border-emerald-500/40 bg-emerald-950/60 px-3 py-2 text-xs font-bold text-emerald-200 disabled:opacity-50"
+                      >
+                        {resolvingComplaint === complaint.utr ? 'Resolving…' : 'Resolved'}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
           )}
 
           {activeTab === 'guarantee_claims' && (

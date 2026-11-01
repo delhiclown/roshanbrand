@@ -22,6 +22,7 @@ import {
 import {
   createSubmittedOrderUpdate,
   deliverOnce,
+  getTrackComplaintStatus,
   isOrderExpired,
   matchesSmsPayment,
   parseCreditedSms,
@@ -312,14 +313,6 @@ async function initializePersistence(db: PersistedDatabase): Promise<void> {
   `);
   await postgresPool.query('ALTER TABLE verify_attempts ADD COLUMN IF NOT EXISTS last_utr TEXT');
   await postgresPool.query(`
-    CREATE TABLE IF NOT EXISTS manual_payment_logs (
-      id BIGSERIAL PRIMARY KEY,
-      order_id TEXT NOT NULL,
-      action_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      source TEXT NOT NULL CHECK (source = 'manual')
-    )
-  `);
-  await postgresPool.query(`
     CREATE TABLE IF NOT EXISTS sms_payment_logs (
       id BIGSERIAL PRIMARY KEY,
       utr TEXT NOT NULL,
@@ -329,6 +322,22 @@ async function initializePersistence(db: PersistedDatabase): Promise<void> {
       result TEXT NOT NULL,
       raw_message TEXT NOT NULL
     )
+  `);
+  await postgresPool.query(`
+    CREATE TABLE IF NOT EXISTS track_order_complaints (
+      utr TEXT PRIMARY KEY,
+      order_id TEXT,
+      current_status TEXT NOT NULL,
+      check_count INTEGER NOT NULL DEFAULT 1 CHECK (check_count > 0),
+      first_checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      resolved_at TIMESTAMPTZ
+    )
+  `);
+  await postgresPool.query(`
+    CREATE INDEX IF NOT EXISTS track_order_complaints_open_last_checked
+    ON track_order_complaints (last_checked_at DESC)
+    WHERE resolved_at IS NULL
   `);
 
   const existing = await postgresPool.query<{ state: PersistedDatabase }>(
@@ -635,51 +644,8 @@ function allocateCredentials(
   return allocatedLines.join('\n');
 }
 
-function deliverOrder(
-  order: OrderRecord,
-  requestedCredentials = ''
-): boolean {
-  let credentials: string | null;
-  if (requestedCredentials.trim()) {
-    const targetPool = getVaultPoolForPackType(order.packType);
-    const credentialLines = requestedCredentials
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean);
-    const matchedItems = credentialLines.map((line) => {
-      const username = (line.split(/[|:,]/)[0] || '').replace(/^Username:\s*/i, '').trim();
-      return db.vault.find(
-        (item) =>
-          item.poolType === targetPool &&
-          item.irctcUsername === username &&
-          ((!item.isAssigned && (!item.reservedOrderId || item.reservedOrderId === order.orderId)) ||
-            item.assignedOrderId === order.orderId)
-      );
-    });
-    if (
-      credentialLines.length !== order.quantity ||
-      matchedItems.some((item) => !item) ||
-      new Set(matchedItems.map((item) => item?.vaultId)).size !== order.quantity
-    ) {
-      return false;
-    }
-
-    const nowIso = new Date().toISOString();
-    credentials = matchedItems
-      .map((item) => {
-        if (!item) return '';
-        item.isAssigned = true;
-        item.assignedOrderId = order.orderId;
-        item.reservedOrderId = undefined;
-        item.updatedAt = nowIso;
-        return `Username: ${item.irctcUsername} | Password: ${item.irctcPassword}${
-          item.accountNote ? ` | ${item.accountNote}` : ''
-        }`;
-      })
-      .join('\n');
-  } else {
-    credentials = allocateCredentials(order.quantity, order.packType, order.orderId);
-  }
+function deliverOrder(order: OrderRecord): boolean {
+  const credentials = allocateCredentials(order.quantity, order.packType, order.orderId);
   if (credentials === null) return false;
 
   const now = new Date();
@@ -694,7 +660,7 @@ function deliverOrder(
   if (order.isRental24h && !order.rentalExpiresAt) {
     order.rentalExpiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString();
   }
-  order.adminNote = 'Payment manually confirmed by admin; Ready Vault ID delivered.';
+  order.adminNote = 'Payment verified from SMS notification; Ready Vault ID delivered.';
 
   if (!db.orders.some((existing) => existing.orderId === order.orderId)) {
     db.orders.unshift(order);
@@ -995,6 +961,17 @@ async function startServer() {
     standardHeaders: true,
     legacyHeaders: false,
   });
+  const trackOrderLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (_req, res) => {
+      res.status(429).json({
+        error: 'Order tracking is limited to 10 checks per minute. Try again shortly.',
+      });
+    },
+  });
   const smsWebhookLimiter = rateLimit({
     windowMs: 60_000,
     limit: 120,
@@ -1008,6 +985,42 @@ async function startServer() {
     },
   });
   const getCheckoutClient = () => requestTransaction.getStore()?.client;
+  const cleanupExpiredRecords = async () => {
+    if (!postgresPool) return;
+    const client = await postgresPool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `DELETE FROM payments
+         WHERE used_order_id IS NULL
+           AND NOT EXISTS (SELECT 1 FROM orders WHERE orders.utr = payments.utr)
+           AND received_at < NOW() - INTERVAL '30 minutes'`
+      );
+      await client.query(
+        `DELETE FROM sms_payment_logs AS log
+         WHERE log.received_at < NOW() - INTERVAL '30 minutes'
+           AND NOT EXISTS (
+             SELECT 1 FROM payments AS payment
+             WHERE payment.utr = log.utr
+               AND payment.used_order_id IS NOT NULL
+               AND payment.used_order_id = log.order_id
+           )`
+      );
+      await client.query(
+        `DELETE FROM track_order_complaints
+         WHERE (resolved_at IS NOT NULL AND resolved_at < NOW() - INTERVAL '7 days')
+            OR (resolved_at IS NULL AND last_checked_at < NOW() - INTERVAL '30 days')`
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch((rollbackError: unknown) => {
+        console.error('Failed to rollback scheduled record cleanup:', rollbackError);
+      });
+      throw error;
+    } finally {
+      client.release();
+    }
+  };
   const recordUtrAttempt = async (
     client: import('pg').PoolClient,
     orderId: string,
@@ -1042,6 +1055,32 @@ async function startServer() {
       transaction.committed = true;
     }
   };
+  const linkSmsPaymentLogs = async (
+    client: import('pg').PoolClient,
+    utr: string,
+    orderId: string
+  ) => {
+    await client.query(
+      `UPDATE sms_payment_logs
+       SET order_id = $2
+       WHERE utr = $1 AND order_id IS NULL`,
+      [utr, orderId]
+    );
+  };
+  const resolveTrackComplaints = async (
+    client: import('pg').PoolClient,
+    orderId: string,
+    utr: string
+  ) => {
+    await client.query(
+      `UPDATE track_order_complaints
+       SET current_status = 'Delivered',
+           order_id = COALESCE(order_id, $1),
+           resolved_at = COALESCE(resolved_at, NOW())
+       WHERE order_id = $1 OR utr = $2`,
+      [orderId, utr]
+    );
+  };
   const reconcileVaultReservations = async (client: import('pg').PoolClient) => {
     const activeOrders = await client.query<{ id: string }>(
       `SELECT id FROM orders
@@ -1068,9 +1107,7 @@ async function startServer() {
   };
   const deliverSubmittedPayment = async (
     client: import('pg').PoolClient,
-    orderId: string,
-    source: 'manual' | 'sms',
-    requestedCredentials = ''
+    orderId: string
   ) => {
     const result = await client.query<{
       id: string;
@@ -1149,12 +1186,9 @@ async function startServer() {
 
     const deliveryResult = deliverOnce(
       { delivered: false, status: 'utr_submitted' },
-      source,
-      () => deliverOrder(order!, requestedCredentials)
+      'sms',
+      () => deliverOrder(order!)
     );
-    if (deliveryResult === 'unavailable' && requestedCredentials.trim()) {
-      return { result: deliveryResult, order };
-    }
     if (deliveryResult === 'unavailable') {
       const queued = await client.query(
         `UPDATE orders SET status = 'paid_stock_pending'
@@ -1174,6 +1208,14 @@ async function startServer() {
       if (paymentBinding.rowCount !== 1) {
         throw new Error(`Payment UTR for order ${orderId} is already bound to another order.`);
       }
+      await linkSmsPaymentLogs(client, paymentOrder.utr || '', orderId);
+      await client.query(
+        `UPDATE track_order_complaints
+         SET order_id = COALESCE(order_id, $2),
+             current_status = 'Paid - Stock Pending'
+         WHERE resolved_at IS NULL AND utr = $1`,
+        [paymentOrder.utr, orderId]
+      );
       const now = new Date().toISOString();
       order!.paymentStatus = 'paid_stock_pending';
       order!.adminNote = 'Payment verified from SMS; waiting for matching stock.';
@@ -1193,9 +1235,7 @@ async function startServer() {
     if (updated.rowCount !== 1) {
       throw new Error(`Payment order ${orderId} changed during delivery.`);
     }
-    order.adminNote = source === 'sms'
-      ? 'Payment verified from SMS notification; Ready Vault ID delivered.'
-      : 'Payment manually confirmed by admin; Ready Vault ID delivered.';
+    order.adminNote = 'Payment verified from SMS notification; Ready Vault ID delivered.';
     if (order.utrNumber) {
       const paymentBinding = await client.query(
         `UPDATE payments SET used_order_id = $2
@@ -1206,8 +1246,10 @@ async function startServer() {
       if (paymentBinding.rowCount !== 1) {
         throw new Error(`Payment UTR for order ${orderId} is already bound to another order.`);
       }
+      await linkSmsPaymentLogs(client, order.utrNumber, orderId);
       await client.query('DELETE FROM verify_attempts WHERE order_id = $1', [orderId]);
     }
+    await resolveTrackComplaints(client, orderId, order.utrNumber);
     syncVaultDisplayCounter(getVaultPoolForPackType(order.packType));
     return { result: 'delivered' as const, order };
   };
@@ -1228,6 +1270,12 @@ async function startServer() {
     );
     const expiredOrder = result.rows[0];
     if (!expiredOrder) return false;
+    await client.query(
+      `UPDATE track_order_complaints
+       SET current_status = 'Rejected'
+       WHERE resolved_at IS NULL AND order_id = $1`,
+      [orderId]
+    );
 
     const now = new Date().toISOString();
     const existingOrder = db.orders.find((order) => order.orderId === orderId);
@@ -1267,7 +1315,7 @@ async function startServer() {
       }
       if (getVaultPoolForPackType(order.packType) !== poolType) continue;
 
-      const delivery = await deliverSubmittedPayment(client, queuedOrder.id, 'sms');
+      const delivery = await deliverSubmittedPayment(client, queuedOrder.id);
       if (delivery.result === 'paid_stock_pending') break;
       if (delivery.result === 'delivered') {
         deliveredOrderIds.push(queuedOrder.id);
@@ -1425,6 +1473,94 @@ async function startServer() {
     }
   });
 
+  app.post('/api/orders/track', trackOrderLimiter, async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const query = String(req.body?.query || '').trim();
+    const isUtr = LIMITS.UTR_REGEX.test(query);
+    if (!query || (!isUtr && query.length > 100)) {
+      res.status(400).json({ error: 'Enter a valid 12-digit UTR or Order ID.' });
+      return;
+    }
+
+    const client = getCheckoutClient();
+    if (!postgresPool || !client) {
+      res.status(503).json({ error: 'Order tracking is temporarily unavailable.' });
+      return;
+    }
+
+    try {
+      const found =
+        db.orders.find((order) => order.orderId.toLowerCase() === query.toLowerCase()) ||
+        db.orders.find((order) => order.utrNumber.toLowerCase() === query.toLowerCase());
+      let paymentStatus: PaymentStatus | null = null;
+      let delivered = false;
+      if (found) {
+        const orderStatus = await client.query<{
+          status: PaymentStatus;
+          delivered: number;
+          utr: string | null;
+        }>('SELECT status, delivered, utr FROM orders WHERE id = $1', [found.orderId]);
+        paymentStatus = orderStatus.rows[0]?.status || found.paymentStatus || 'pending';
+        delivered = orderStatus.rows[0]?.delivered === 1;
+      } else if (!isUtr) {
+        res.status(404).json({ error: 'No order found with this Order ID or UTR.' });
+        return;
+      }
+
+      const complaintUtr = isUtr ? query : found?.utrNumber || '';
+      const complaintStatus = getTrackComplaintStatus(paymentStatus, delivered);
+      if (LIMITS.UTR_REGEX.test(complaintUtr)) {
+        if (complaintStatus === null) {
+          await client.query(
+            `UPDATE track_order_complaints
+             SET current_status = 'Delivered',
+                 order_id = COALESCE(order_id, $2),
+                 check_count = check_count + 1,
+                 last_checked_at = NOW(),
+                 resolved_at = COALESCE(resolved_at, NOW())
+             WHERE utr = $1`,
+            [complaintUtr, found?.orderId || null]
+          );
+        } else {
+          await client.query(
+            `INSERT INTO track_order_complaints
+               (utr, order_id, current_status, check_count, first_checked_at, last_checked_at)
+             VALUES ($1, $2, $3, 1, NOW(), NOW())
+             ON CONFLICT (utr) DO UPDATE SET
+               order_id = COALESCE(EXCLUDED.order_id, track_order_complaints.order_id),
+               current_status = EXCLUDED.current_status,
+               check_count = track_order_complaints.check_count + 1,
+               last_checked_at = NOW(),
+               resolved_at = NULL`,
+            [complaintUtr, found?.orderId || null, complaintStatus]
+          );
+        }
+      }
+
+      await commitCheckoutTransaction();
+      res.json({
+        status: complaintStatus || 'Delivered',
+        order: found
+          ? {
+              ...found,
+              paymentStatus,
+              utrNumber: '',
+              customerReference: '',
+              customSpec: '',
+              deliveredCredentials: '',
+              adminNote:
+                found.status === 'rejected'
+                  ? 'Payment review could not be completed. Please contact support.'
+                  : '',
+            }
+          : null,
+      });
+    } catch (error) {
+      console.error('Failed to track order:', error);
+      res.status(500).json({ error: 'Order tracking could not be completed.' });
+    }
+  });
+
   app.post('/api/cancel-order', cancelOrderLimiter, async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     const client = getCheckoutClient();
@@ -1555,7 +1691,7 @@ async function startServer() {
       let result = 'unmatched';
       let orderId: string | null = null;
       let delivered = false;
-      let orderNeedsManualReview: OrderRecord | undefined;
+      let orderNeedsStockDelivery: OrderRecord | undefined;
       let orderAutoRejected = false;
 
       if (matchedOrder) {
@@ -1582,6 +1718,7 @@ async function startServer() {
             'UPDATE payments SET used_order_id = $2 WHERE utr = $1 AND used_order_id IS NULL',
             [utr, matchedOrder.id]
           );
+          await linkSmsPaymentLogs(client, utr, matchedOrder.id);
         } else if (
           matchedOrder.status === 'utr_submitted' &&
           isOrderExpired(matchedOrder.expires_at) &&
@@ -1593,12 +1730,12 @@ async function startServer() {
           matchedOrder.status === 'utr_submitted' ||
           matchedOrder.status === 'paid_stock_pending'
         ) {
-          const delivery = await deliverSubmittedPayment(client, matchedOrder.id, 'sms');
+          const delivery = await deliverSubmittedPayment(client, matchedOrder.id);
           result = delivery.result;
           if (delivery.result === 'delivered') {
             delivered = true;
           } else if (delivery.order) {
-            orderNeedsManualReview = delivery.order;
+            orderNeedsStockDelivery = delivery.order;
           }
         } else {
           result = `ignored_${matchedOrder.status}`;
@@ -1619,11 +1756,11 @@ async function startServer() {
         broadcastStateUpdate('order_verified', { orderId, source: 'sms' });
         broadcastStateUpdate('vault_updated', {});
       } else {
-        if (orderNeedsManualReview || orderAutoRejected) {
+        if (orderNeedsStockDelivery || orderAutoRejected) {
           await saveDb(db);
         }
-        if (orderNeedsManualReview) {
-          broadcastStateUpdate('order_created', { order: orderNeedsManualReview });
+        if (orderNeedsStockDelivery) {
+          broadcastStateUpdate('order_created', { order: orderNeedsStockDelivery });
         }
         if (orderAutoRejected) {
           broadcastStateUpdate('order_rejected', { orderId });
@@ -1873,7 +2010,7 @@ async function startServer() {
       );
       let paidImmediately = false;
       let paidOrder: OrderRecord | undefined;
-      let orderNeedsManualReview: OrderRecord | undefined;
+      let orderNeedsStockDelivery: OrderRecord | undefined;
       if (
         priorPayment.rows[0] &&
         matchesSmsPayment(
@@ -1885,10 +2022,10 @@ async function startServer() {
           }
         )
       ) {
-        const delivery = await deliverSubmittedPayment(client, orderId, 'sms');
+        const delivery = await deliverSubmittedPayment(client, orderId);
         paidImmediately = delivery.result === 'delivered';
         if (paidImmediately) paidOrder = delivery.order;
-        else orderNeedsManualReview = delivery.order;
+        else orderNeedsStockDelivery = delivery.order;
         if (paidImmediately) {
           await client.query(
             `UPDATE sms_payment_logs SET order_id = $2, result = 'delivered_on_utr_submit'
@@ -1897,17 +2034,32 @@ async function startServer() {
           );
         }
       }
+      if (!paidImmediately) {
+        await client.query(
+          `UPDATE track_order_complaints
+           SET order_id = $2,
+               current_status = $3
+           WHERE utr = $1 AND resolved_at IS NULL`,
+          [
+            utr,
+            orderId,
+            orderNeedsStockDelivery?.paymentStatus === 'paid_stock_pending'
+              ? 'Paid - Stock Pending'
+              : 'Waiting for SMS',
+          ]
+        );
+      }
       await saveDb(db);
       broadcastStateUpdate('vault_updated', {});
       if (paidImmediately) {
         broadcastStateUpdate('order_verified', { order: paidOrder, source: 'sms' });
-      } else if (orderNeedsManualReview) {
-        broadcastStateUpdate('order_created', { order: orderNeedsManualReview });
+      } else if (orderNeedsStockDelivery) {
+        broadcastStateUpdate('order_created', { order: orderNeedsStockDelivery });
       }
       res.json({
         status: paidImmediately
           ? 'paid'
-          : orderNeedsManualReview?.paymentStatus === 'paid_stock_pending'
+          : orderNeedsStockDelivery?.paymentStatus === 'paid_stock_pending'
             ? 'paid_stock_pending'
             : 'utr_submitted',
         attempts,
@@ -2525,7 +2677,7 @@ async function startServer() {
   });
 
   // Lookup Order by Order ID or 12-Digit UTR Number
-  app.get('/api/orders/lookup', async (req, res) => {
+  app.get('/api/orders/lookup', trackOrderLimiter, async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     const q = String(req.query.q || '').trim();
     if (!q) {
@@ -2708,6 +2860,38 @@ async function startServer() {
     });
   });
 
+  app.post('/api/admin/track-order-complaints/:utr/resolve', async (req, res) => {
+    const utr = String(req.params.utr || '').trim();
+    if (!LIMITS.UTR_REGEX.test(utr)) {
+      res.status(400).json({ error: 'A valid UTR is required.' });
+      return;
+    }
+
+    const client = getCheckoutClient();
+    if (!client) {
+      res.status(503).json({ error: 'Complaint records are temporarily unavailable.' });
+      return;
+    }
+    try {
+      const result = await client.query(
+        `UPDATE track_order_complaints
+         SET current_status = 'Resolved', resolved_at = COALESCE(resolved_at, NOW())
+         WHERE utr = $1
+         RETURNING utr`,
+        [utr]
+      );
+      if (result.rowCount !== 1) {
+        res.status(404).json({ error: 'Complaint record not found.' });
+        return;
+      }
+      await commitCheckoutTransaction();
+      res.json({ resolved: true });
+    } catch (error) {
+      console.error('Failed to resolve order tracking complaint:', error);
+      res.status(500).json({ error: 'The complaint could not be resolved.' });
+    }
+  });
+
   // Admin Portal State
   app.get('/api/admin/state', async (req, res) => {
     const pageSize = (key: string) => {
@@ -2789,6 +2973,7 @@ async function startServer() {
         guaranteeClaimsTotal: normalizedClaims.length,
         vault: db.vault,
         smsPaymentLogs: [],
+        trackOrderComplaints: [],
         summary,
         replacementCounts,
         ordersOffset: orderOffset,
@@ -2955,13 +3140,28 @@ async function startServer() {
         ]
       );
       const smsPaymentLogs = await query(
-        `SELECT utr, amount_paise AS "amountPaise", received_at AS "receivedAt",
-                order_id AS "orderId", result, raw_message AS "rawMessage"
-         FROM sms_payment_logs ORDER BY id DESC LIMIT 50`
+        `SELECT log.utr, log.amount_paise AS "amountPaise",
+                log.received_at AS "receivedAt", log.order_id AS "orderId",
+                log.result, log.raw_message AS "rawMessage"
+         FROM sms_payment_logs AS log
+         JOIN payments AS payment
+           ON payment.utr = log.utr AND payment.used_order_id = log.order_id
+         WHERE log.order_id IS NOT NULL
+         ORDER BY log.id DESC LIMIT 50`
+      );
+      const trackOrderComplaints = await query(
+        `SELECT utr, order_id AS "orderId", current_status AS "currentStatus",
+                check_count AS "checkCount", first_checked_at AS "firstCheckedAt",
+                last_checked_at AS "lastCheckedAt"
+         FROM track_order_complaints
+         WHERE resolved_at IS NULL
+         ORDER BY last_checked_at DESC
+         LIMIT 100`
       );
       res.json({
         ...result.rows[0],
         smsPaymentLogs: smsPaymentLogs.rows,
+        trackOrderComplaints: trackOrderComplaints.rows,
         ordersOffset: orderOffset,
         claimsOffset: claimOffset,
         ordersPageSize,
@@ -3175,227 +3375,6 @@ async function startServer() {
     res.json({ claim, order });
   });
 
-  app.post('/api/admin/mark-paid', async (req, res) => {
-    res.setHeader('Cache-Control', 'no-store');
-    const client = getCheckoutClient();
-    const orderId = String(req.body?.orderId || '').trim();
-    if (!postgresPool || !client) {
-      res.status(503).json({ error: 'Payment database is not configured.' });
-      return;
-    }
-    if (!orderId || orderId.length > 100) {
-      res.status(400).json({ error: 'A valid order ID is required.' });
-      return;
-    }
-
-    try {
-      const paymentOrderResult = await client.query<{
-        status: PaymentStatus;
-        delivered: number;
-        utr: string | null;
-      }>('SELECT status, delivered, utr FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
-      const paymentOrder = paymentOrderResult.rows[0];
-      if (!paymentOrder) {
-        res.status(404).json({ error: 'Order not found.' });
-        return;
-      }
-      await client.query(
-        "INSERT INTO manual_payment_logs (order_id, source) VALUES ($1, 'manual')",
-        [orderId]
-      );
-      if (paymentOrder.status === 'paid' || paymentOrder.delivered !== 0) {
-        await commitCheckoutTransaction();
-        res.json({ status: 'paid', alreadyDelivered: true });
-        return;
-      }
-      if (paymentOrder.status !== 'utr_submitted') {
-        res.status(409).json({ error: 'Only orders with a submitted UTR can be delivered.' });
-        return;
-      }
-      if (!paymentOrder.utr || !LIMITS.UTR_REGEX.test(paymentOrder.utr)) {
-        res.status(409).json({ error: 'This order does not have a valid submitted UTR.' });
-        return;
-      }
-      const order = db.orders.find((existing) => existing.orderId === orderId);
-      if (!order || order.status !== 'pending_verification') {
-        res.status(409).json({ error: 'The order is not awaiting payment review.' });
-        return;
-      }
-      const verifiedOrderId = db.utrIndex[paymentOrder.utr];
-      if (verifiedOrderId && verifiedOrderId !== orderId) {
-        res.status(409).json({ error: 'This UTR has already been used for another order.' });
-        return;
-      }
-      const requestedCredentials = String(req.body?.deliveredCredentials || '').trim();
-      const delivery = await deliverSubmittedPayment(client, orderId, 'manual', requestedCredentials);
-      if (delivery.result === 'paid_stock_pending') {
-        await saveDb(db);
-        broadcastStateUpdate('order_created', { order: delivery.order });
-        broadcastStateUpdate('vault_updated', {});
-        res.json({ status: 'paid_stock_pending', alreadyDelivered: false, order: delivery.order });
-        return;
-      }
-      if (delivery.result !== 'delivered') {
-        if (delivery.result === 'payment-not-verified') {
-          res.status(409).json({
-            error: 'No matching bank SMS payment was found. This order cannot be delivered.',
-          });
-          return;
-        }
-        res.status(409).json({
-          error: 'Not enough available IDs in the matching vault pool to deliver this order.',
-        });
-        return;
-      }
-      await saveDb(db);
-      broadcastStateUpdate('order_verified', { order: delivery.order, source: 'manual' });
-      broadcastStateUpdate('vault_updated', {});
-      res.json({ status: 'paid', alreadyDelivered: false, order: delivery.order });
-    } catch (error) {
-      console.error('Failed to manually mark UPI order as paid:', error);
-      res.status(500).json({ error: 'The order could not be marked paid.' });
-    }
-  });
-
-  // Admin 1-Click Verify / Update Order Credentials (Automatically uses Ready ID Vault if not manually overridden)
-  app.post('/api/admin/orders/:orderId/verify', (_req, res) => {
-    res.status(409).json({
-      error: 'Use the authenticated mark-paid action to approve payment and deliver this order.',
-    });
-  });
-  app.post('/api/admin/orders/:orderId/verify', async (req, res) => {
-    const { orderId } = req.params;
-    const order = db.orders.find((o) => o.orderId === orderId);
-    if (!order) {
-      res.status(404).json({ error: 'Order not found' });
-      return;
-    }
-    if (order.status === 'rejected') {
-      res.status(409).json({
-        error: 'Rejected orders cannot be delivered. Create a new order after confirming payment.',
-      });
-      return;
-    }
-    const client = getCheckoutClient();
-    if (!postgresPool || !client) {
-      res.status(409).json({ error: 'A matching bank SMS payment is required before delivery.' });
-      return;
-    }
-    const paymentResult = await client.query<{
-      utr: string;
-      amount_paise: number;
-      received_at: Date;
-      used_order_id: string | null;
-    }>(
-      'SELECT utr, amount_paise, received_at, used_order_id FROM payments WHERE utr = $1 FOR UPDATE',
-      [order.utrNumber]
-    );
-    const payment = paymentResult.rows[0];
-    if (
-      !payment ||
-      payment.used_order_id !== null ||
-      !matchesSmsPayment(
-        {
-          utr: order.utrNumber,
-          amountPaise: Math.round(order.totalAmount * 100),
-          createdAt: new Date(order.createdAt),
-        },
-        {
-          utr: payment.utr,
-          amountPaise: payment.amount_paise,
-          receivedAt: payment.received_at,
-        }
-      )
-    ) {
-      res.status(409).json({ error: 'A matching bank SMS payment is required before delivery.' });
-      return;
-    }
-
-    const verifiedOrderId = db.utrIndex[order.utrNumber];
-    if (verifiedOrderId && verifiedOrderId !== order.orderId) {
-      res.status(409).json({ error: 'This UTR has already been used for a verified order.' });
-      return;
-    }
-
-    let creds = String(req.body?.deliveredCredentials || '').trim();
-    if (order.status === 'verified_delivered' && !creds) {
-      res.status(409).json({
-        error: 'This order was already delivered. Select its existing assigned credentials to update the delivery.',
-      });
-      return;
-    }
-    const targetPool = getVaultPoolForPackType(order.packType);
-    if (creds) {
-      const credentialLines = creds.split('\n').map((line: string) => line.trim()).filter(Boolean);
-      const matchedItems = credentialLines.map((line: string) => {
-        const username = (line.split(/[|:,]/)[0] || '').replace(/^Username:\s*/i, '').trim();
-        return db.vault.find(
-          (item) =>
-            item.poolType === targetPool &&
-            item.irctcUsername === username &&
-            ((!item.isAssigned && (!item.reservedOrderId || item.reservedOrderId === order.orderId)) ||
-              item.assignedOrderId === order.orderId)
-        );
-      });
-      if (
-        credentialLines.length !== order.quantity ||
-        matchedItems.some((item) => !item) ||
-        new Set(matchedItems.map((item) => item?.vaultId)).size !== order.quantity
-      ) {
-        res.status(409).json({
-          error: `This order requires ${order.quantity} available ID(s) from the ${getVaultPoolLabel(targetPool)} pool only.`,
-        });
-        return;
-      }
-      const now = new Date().toISOString();
-      const actualCredentialLines: string[] = [];
-      for (const item of matchedItems) {
-        if (item) {
-          item.isAssigned = true;
-          item.assignedOrderId = order.orderId;
-          item.reservedOrderId = undefined;
-          item.updatedAt = now;
-          actualCredentialLines.push(
-            `Username: ${item.irctcUsername} | Password: ${item.irctcPassword}${
-              item.accountNote ? ` | ${item.accountNote}` : ''
-            }`
-          );
-        }
-      }
-      creds = actualCredentialLines.join('\n');
-    } else {
-      const allocated = allocateCredentials(order.quantity, order.packType, order.orderId);
-      if (allocated === null) {
-        res.status(409).json({
-          error: `Not enough unassigned IDs in the ${getVaultPoolLabel(targetPool)} pool. Add more IDs to that pool before delivery.`,
-        });
-        return;
-      }
-      creds = allocated;
-    }
-
-    const now = new Date();
-    order.status = 'verified_delivered';
-    order.deliveredCredentials = sanitizeDeliveredCredentials(creds).slice(
-      0,
-      LIMITS.CREDENTIALS_MAX
-    );
-    order.updatedAt = now.toISOString();
-    order.verifiedAt = order.verifiedAt || now.toISOString();
-
-    if (order.isRental24h && !order.rentalExpiresAt) {
-      order.rentalExpiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString();
-    }
-    order.adminNote = order.isRental24h
-      ? `Admin Verified UTR #${order.utrNumber} · Ready Vault 24H Rental ID Sent`
-      : `Admin Verified UTR #${order.utrNumber} · Ready Vault ID Sent`;
-
-    db.utrIndex[order.utrNumber] = order.orderId;
-    if (!(await persistDbOrRespond(res))) return;
-    broadcastStateUpdate('order_verified', { order });
-    res.json({ order, storeConfig: db.storeConfig });
-  });
-
   // Admin Reject Order
   app.post('/api/admin/orders/:orderId/reject', async (req, res) => {
     try {
@@ -3432,6 +3411,12 @@ async function startServer() {
           });
           return;
         }
+        await client.query(
+          `UPDATE track_order_complaints
+           SET current_status = 'Rejected'
+           WHERE resolved_at IS NULL AND order_id = $1`,
+          [order.orderId]
+        );
       }
       const now = new Date().toISOString();
       rejectOrderAndReleaseStock(order, db.vault, order.orderId, now);
@@ -3770,6 +3755,21 @@ async function startServer() {
   void expirePendingPaymentOrders().catch((error: unknown) => {
     console.error(
       'Failed to run startup order cleanup:',
+      error instanceof Error ? error.message : String(error)
+    );
+  });
+  const recordCleanupTimer = setInterval(() => {
+    void cleanupExpiredRecords().catch((error: unknown) => {
+      console.error(
+        'Failed to clean up expired payment and complaint records:',
+        error instanceof Error ? error.message : String(error)
+      );
+    });
+  }, 60_000);
+  recordCleanupTimer.unref();
+  void cleanupExpiredRecords().catch((error: unknown) => {
+    console.error(
+      'Failed to run startup payment and complaint cleanup:',
       error instanceof Error ? error.message : String(error)
     );
   });

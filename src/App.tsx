@@ -83,12 +83,12 @@ export default function App() {
 
   const [trackedOrderId, setTrackedOrderId] = useState('');
   const [searchInput, setSearchInput] = useState<string>('');
-  const [orderAccessInput, setOrderAccessInput] = useState<string>('');
   const [trackedOrder, setTrackedOrder] = useState<OrderRecord | null>(null);
   const [trackedOrderAccessToken, setTrackedOrderAccessToken] = useState('');
   const [guaranteeClaims, setGuaranteeClaims] = useState<CustomerGuaranteeClaim[]>([]);
   const [trackDropdownOpen, setTrackDropdownOpen] = useState<boolean>(false);
   const [trackError, setTrackError] = useState<string>('');
+  const [trackStatusMessage, setTrackStatusMessage] = useState('');
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [supportOpen, setSupportOpen] = useState<boolean>(false);
   const displayedPermanentStock = storeConfig.stockDisplayAvailable;
@@ -213,7 +213,13 @@ export default function App() {
             const accessResponse = await fetch('/api/orders/access', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ orderId: order.orderId }),
+              body: JSON.stringify({
+                orderId: order.orderId,
+                accessToken:
+                  trackedOrderAccessToken === cookieAuthenticatedOrder
+                    ? ''
+                    : trackedOrderAccessToken,
+              }),
               cache: 'no-store',
             });
             if (accessResponse.ok) {
@@ -231,6 +237,19 @@ export default function App() {
           }
           if (!active) return;
           setTrackedOrder(order);
+          setTrackStatusMessage(
+            order.paymentStatus === 'paid' || order.status === 'verified_delivered'
+              ? 'Delivered'
+              : order.paymentStatus === 'paid_stock_pending'
+                ? 'Paid - Stock Pending'
+                : order.paymentStatus === 'utr_submitted'
+                  ? 'Waiting for SMS'
+                  : order.paymentStatus === 'rejected' || order.status === 'rejected'
+                    ? 'Rejected'
+                    : order.paymentStatus === 'expired'
+                      ? 'Order expired'
+                      : 'Waiting for payment'
+          );
           setTrackError('');
         } else {
           setTrackedOrder(null);
@@ -252,7 +271,7 @@ export default function App() {
       es.close();
       clearInterval(timer);
     };
-  }, [trackedOrderId]);
+  }, [trackedOrderId, trackedOrderAccessToken]);
 
   const productOptions: ProductOption[] = [
     {
@@ -489,39 +508,34 @@ export default function App() {
     const q = searchInput.trim();
     if (!q) return;
     setTrackError('');
-    const accessToken = orderAccessInput.trim();
-    if (accessToken) {
-      try {
-        const lookupResponse = await fetch(`/api/orders/lookup?q=${encodeURIComponent(q)}`);
-        const lookupData = await lookupResponse.json();
-        if (!lookupResponse.ok) {
-          setTrackError(lookupData.error || 'No order found with this UTR or Order ID.');
-          return;
-        }
-        const orderId = String(lookupData.order.orderId);
-        const response = await fetch('/api/orders/access', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ orderId, accessToken }),
-        });
-        const data = await response.json();
-        if (!response.ok) {
-          setTrackError(data.error || 'Order ID or access key is incorrect.');
-          return;
-        }
-        setTrackedOrder(data.order);
-        setTrackedOrderAccessToken(accessToken);
-        setGuaranteeClaims(data.guaranteeClaims || []);
-        setTrackedOrderId(data.order.orderId);
-        setSearchInput(data.order.orderId);
-        setOrderAccessInput('');
-        return;
-      } catch {
-        setTrackError('Unable to check this access key. Please try again.');
+    setTrackStatusMessage('');
+    try {
+      const response = await fetch('/api/orders/track', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: q }),
+        cache: 'no-store',
+      });
+      const data = await response.json() as {
+        error?: string;
+        status?: string;
+        order?: OrderRecord | null;
+      };
+      if (!response.ok) {
+        setTrackError(data.error || 'No order found with this UTR or Order ID.');
         return;
       }
+      setTrackStatusMessage(data.status || '');
+      if (data.order) {
+        setTrackedOrderId(data.order.orderId);
+        setTrackedOrder(data.order);
+      } else {
+        setTrackedOrderId('');
+        setTrackedOrder(null);
+      }
+    } catch {
+      setTrackError('Unable to check this order. Please try again.');
     }
-    setTrackedOrderId(q);
   };
 
   const copyToClipboard = (text: string, key: string) => {
@@ -705,26 +719,25 @@ export default function App() {
                     Enter your 12-digit{' '}
                     <span className="font-mono font-semibold text-cyan-300">UTR Number</span> or{' '}
                     <span className="font-mono font-semibold text-cyan-300">Order ID</span> to
-                    check its status. Your private access key is required to view credentials.
+                    check its status. Credentials are only returned when this browser has the private
+                    order key.
                   </p>
                   <form onSubmit={handleTrackSearch} className="space-y-2.5">
                     <input
                       type="text"
+                      autoComplete="off"
                       value={searchInput}
                       onChange={(e) => setSearchInput(e.target.value)}
                       placeholder="Enter 12-digit UTR or Order ID"
                       className="w-full px-3 py-2 text-xs rounded-xl border border-cyan-500/40 bg-slate-950/90 text-white font-mono focus:outline-none focus:ring-2 focus:ring-cyan-400/30 focus:border-cyan-400"
                     />
-                    <input
-                      type="password"
-                      value={orderAccessInput}
-                      onChange={(event) => setOrderAccessInput(event.target.value)}
-                      placeholder="Private order access key (optional)"
-                      autoComplete="off"
-                      className="w-full px-3 py-2 text-xs rounded-xl border border-cyan-500/40 bg-slate-950/90 text-white font-mono placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-cyan-400/30 focus:border-cyan-400"
-                    />
                     {trackError && (
                       <p className="text-[11px] text-rose-400 font-semibold">{trackError}</p>
+                    )}
+                    {trackStatusMessage && (
+                      <p className="text-[11px] font-semibold text-cyan-200" role="status">
+                        {trackStatusMessage}
+                      </p>
                     )}
                     <div className="flex items-center gap-2">
                       <button
@@ -733,14 +746,15 @@ export default function App() {
                       >
                         Check Status
                       </button>
-                      {trackedOrderId && (
+                      {(searchInput || trackedOrderId || trackStatusMessage) && (
                         <button
                           type="button"
                           onClick={() => {
                             setTrackedOrderId('');
                             setSearchInput('');
-                            setOrderAccessInput('');
                             setTrackedOrder(null);
+                            setTrackStatusMessage('');
+                            setTrackError('');
                           }}
                           className="px-2.5 py-2 rounded-xl text-xs font-semibold text-slate-300 hover:text-white bg-slate-800/90 border border-slate-700 cursor-pointer"
                         >
@@ -810,9 +824,11 @@ export default function App() {
                           <h3 className="text-sm font-extrabold text-white">
                             {trackedOrder.paymentStatus === 'expired'
                               ? 'Order expired'
-                              : trackedOrder.paymentStatus === 'utr_submitted'
-                                ? 'UTR submitted — waiting for payment confirmation'
-                                : 'Waiting for payment / enter UTR'}
+                              : trackedOrder.paymentStatus === 'paid_stock_pending'
+                                ? 'Paid — waiting for stock'
+                                : trackedOrder.paymentStatus === 'utr_submitted'
+                                  ? 'UTR submitted — waiting for SMS'
+                                  : 'Waiting for payment / enter UTR'}
                           </h3>
                           <span className="text-[11px] font-mono font-bold text-amber-300">
                             {trackedOrder.orderId}
@@ -821,9 +837,11 @@ export default function App() {
                         <p className="text-xs text-slate-300 mt-0.5">
                           {trackedOrder.paymentStatus === 'expired'
                             ? 'This order expired before payment was approved. Contact support if you already paid.'
-                            : trackedOrder.paymentStatus === 'utr_submitted'
-                            ? 'Payment reference received. Credentials will be released only after an administrator confirms the payment.'
-                            : 'No UTR has been submitted. Credentials are released only after an administrator confirms payment.'}
+                            : trackedOrder.paymentStatus === 'paid_stock_pending'
+                              ? 'Payment was verified from the matching bank SMS. Credentials will be delivered automatically when matching stock is added.'
+                              : trackedOrder.paymentStatus === 'utr_submitted'
+                                ? 'Payment reference received. Credentials are released automatically only after a matching bank SMS confirms the exact amount.'
+                                : 'No UTR has been submitted. Submit your UTR; a matching bank SMS is required before automatic delivery.'}
                           {' '}(₹{trackedOrder.totalAmount} for {trackedOrder.quantity} ID
                           {trackedOrder.quantity > 1 ? 's' : ''}).
                         </p>
@@ -870,11 +888,11 @@ export default function App() {
               ) : (
                 <div className="neon-card-3d border-amber-400/50 p-4 space-y-2">
                   <h3 className="text-sm font-extrabold text-white">
-                    Order delivered — private access key required
+                    Order delivered — private access key not available in this browser
                   </h3>
                   <p className="text-xs text-slate-300">
-                    Enter the private key saved when you placed this order to view your credentials.
-                    If you no longer have it, contact support with your order ID and payment receipt.
+                    UTR lookup shows status only. Delivered credentials are returned only to the
+                    browser holding this order&apos;s private key.
                   </p>
                 </div>
               )}
@@ -1022,7 +1040,7 @@ export default function App() {
                               <span className="text-slate-600">·</span>
                               <span className="text-xs font-semibold text-sky-300 flex items-center gap-1">
                                 <Zap className="w-3 h-3 text-emerald-400" />
-                                Manual UPI Check
+                                SMS Auto Verification
                               </span>
                             </>
                           )}
@@ -1665,7 +1683,7 @@ export default function App() {
                         Pay UPI QR &amp; UTR
                       </p>
                       <p className="text-[9px] text-slate-400 truncate hidden sm:block">
-                        Manual payment confirmation
+                        Automatic bank-SMS confirmation
                       </p>
                     </div>
                   </li>
@@ -1675,7 +1693,7 @@ export default function App() {
                     </span>
                     <div className="min-w-0 leading-tight">
                       <p className="text-[10px] font-bold text-white truncate">
-                        Get ID after payment review
+                        Get ID after SMS match
                       </p>
                       <p className="text-[9px] text-slate-400 truncate hidden sm:block">
                         Copy or CSV download
@@ -1688,7 +1706,7 @@ export default function App() {
               <div className="flex items-center justify-between sm:justify-end gap-3 pt-1.5 lg:pt-0 border-t lg:border-t-0 lg:border-l border-cyan-500/25 lg:pl-4 shrink-0">
                 <div className="flex items-center gap-3 sm:gap-4">
                   <span className="text-[10px] font-bold text-cyan-100">UPI payment</span>
-                  <span className="text-[10px] font-bold text-cyan-100">Manual payment review</span>
+                  <span className="text-[10px] font-bold text-cyan-100">Automatic SMS verification</span>
                   <span className="text-[10px] font-bold text-cyan-100">Secure order access</span>
                 </div>
               </div>
@@ -1704,8 +1722,7 @@ export default function App() {
               </li>
               <li>
                 Verify the recipient and amount in your UPI app. Submitting a UTR is not payment
-                confirmation; orders are delivered only after the received payment is manually
-                checked.
+                confirmation; orders are delivered only after a matching SMS confirms the payment.
               </li>
               <li>
                 If an ID cannot be delivered, a full refund is guaranteed in under one minute.
@@ -1715,8 +1732,8 @@ export default function App() {
               </li>
               <li>
                 Your UTR and optional contact details are used to identify and support your order.
-                Keep your private order access key secret; it is required to view delivered
-                credentials on another device.
+                Your private order access key stays in an HttpOnly browser cookie. A UTR alone can
+                show order status but never reveals delivered credentials.
               </li>
             </ul>
           </details>

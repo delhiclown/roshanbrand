@@ -3,7 +3,7 @@ export interface DeliveryState {
   status: string;
 }
 
-export type DeliverySource = 'manual' | 'sms';
+export type DeliverySource = 'sms';
 export type DeliveryResult = 'delivered' | 'already-delivered' | 'unavailable';
 
 export interface ParsedSmsPayment {
@@ -71,6 +71,18 @@ export function isOrderExpired(
 ): boolean {
   if (expiresAt == null) return true;
   return isDraftExpired(expiresAt, now);
+}
+
+export function getTrackComplaintStatus(
+  status: string | null | undefined,
+  delivered = false
+): string | null {
+  if (delivered || status === 'paid' || status === 'verified_delivered') return null;
+  if (!status) return 'UTR not found';
+  if (status === 'paid_stock_pending') return 'Paid - Stock Pending';
+  if (status === 'rejected') return 'Rejected';
+  if (status === 'expired') return 'Order expired';
+  return 'Waiting for SMS';
 }
 
 export function createSubmittedOrderUpdate(orderId: string, utr: string, submittedAt: Date) {

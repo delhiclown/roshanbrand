@@ -18,7 +18,6 @@ import {
   Send,
   Settings,
   ShieldCheck,
-  Sparkles,
   Trash2,
   XCircle,
   Zap,
@@ -55,6 +54,15 @@ interface SmsPaymentLog {
   orderId: string | null;
   result: string;
   rawMessage: string;
+}
+
+interface TrackOrderComplaint {
+  utr: string;
+  orderId: string | null;
+  currentStatus: string;
+  checkCount: number;
+  firstCheckedAt: string;
+  lastCheckedAt: string;
 }
 
 function getOrderVaultPool(order: OrderRecord): VaultPoolType {
@@ -117,9 +125,11 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   );
   const [statusFilter, setStatusFilter] = useState<'all' | OrderRecord['status']>('all');
   const [searchQuery, setSearchQuery] = useState('');
-  const [credDrafts, setCredDrafts] = useState<Record<string, string>>({});
   const [busyOrderId, setBusyOrderId] = useState<string | null>(null);
   const [copiedUtr, setCopiedUtr] = useState<string | null>(null);
+  const [trackOrderComplaints, setTrackOrderComplaints] = useState<TrackOrderComplaint[]>([]);
+  const [resolvingComplaint, setResolvingComplaint] = useState<string | null>(null);
+  const [complaintWarning, setComplaintWarning] = useState('');
   const adminFiltersRef = useRef({
     ordersOffset: 0,
     claimsOffset: 0,
@@ -142,8 +152,6 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   const [newVaultPool, setNewVaultPool] = useState<VaultPoolType>('rental_24h');
   const [addingVault, setAddingVault] = useState(false);
   const [orderErrors, setOrderErrors] = useState<Record<string, string>>({});
-  const [manualPaymentMessages, setManualPaymentMessages] = useState<Record<string, string>>({});
-
   const [formConfig, setFormConfig] = useState<StoreConfig>(storeConfig);
   const [rentalPriceInput, setRentalPriceInput] = useState(
     String(storeConfig.priceRental24h)
@@ -277,6 +285,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
       setPaidStockPendingOrders(data.paidStockPendingOrders || []);
       setVault(data.vault || []);
       setSmsPaymentLogs(data.smsPaymentLogs || []);
+      setTrackOrderComplaints(data.trackOrderComplaints || []);
       setGuaranteeClaims((previous) =>
         mergePage(previous, data.guaranteeClaims || [], 'claimId', requestClaimsOffset)
       );
@@ -344,6 +353,28 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     setTimeout(() => setCopiedUtr(null), 1800);
   };
 
+  const handleResolveComplaint = async (utr: string) => {
+    setResolvingComplaint(utr);
+    setComplaintWarning('');
+    setTrackOrderComplaints((current) => current.filter((complaint) => complaint.utr !== utr));
+    try {
+      const response = await fetch(
+        `/api/admin/track-order-complaints/${encodeURIComponent(utr)}/resolve`,
+        { method: 'POST' }
+      );
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Could not resolve this complaint.');
+      await fetchAdminState();
+    } catch (error) {
+      setComplaintWarning(
+        error instanceof Error ? error.message : 'Could not resolve this complaint.'
+      );
+      await fetchAdminState();
+    } finally {
+      setResolvingComplaint(null);
+    }
+  };
+
   const handleSaveSettings = async (e?: React.FormEvent) => {
     e?.preventDefault();
     const rentalPrice = Number(rentalPriceInput);
@@ -403,81 +434,6 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
       setSaveError(err instanceof Error ? err.message : 'Failed to save settings');
     } finally {
       setSavingSettings(false);
-    }
-  };
-
-  const handleAutoFillFromVault = (order: OrderRecord) => {
-    const targetPool = getOrderVaultPool(order);
-    const available = vault.filter(
-      (v) =>
-        !v.isAssigned &&
-        v.poolType === targetPool &&
-        (!v.reservedOrderId || v.reservedOrderId === order.orderId)
-    );
-    if (available.length < order.quantity) {
-      setOrderErrors((prev) => ({
-        ...prev,
-        [order.orderId]: `This order needs ${order.quantity} ID(s) from the ${getVaultPoolLabel(targetPool)} pool; ${available.length} available.`,
-      }));
-      return;
-    }
-
-    const lines = available
-      .slice(0, order.quantity)
-      .map(
-        (v) =>
-          `Username: ${v.irctcUsername} | Password: ${v.irctcPassword}${
-            v.accountNote ? ` | Note: ${v.accountNote}` : ''
-          }`
-      )
-      .join('\n');
-
-    setOrderErrors((prev) => ({ ...prev, [order.orderId]: '' }));
-    setCredDrafts((prev) => ({ ...prev, [order.orderId]: lines }));
-  };
-
-  const handleVerifyOrder = async (order: OrderRecord) => {
-    const credentials = (
-      credDrafts[order.orderId] ??
-      order.deliveredCredentials ??
-      ''
-    ).trim();
-
-    setBusyOrderId(order.orderId);
-    setManualPaymentMessages((previous) => ({ ...previous, [order.orderId]: '' }));
-    try {
-      const res = await fetch('/api/admin/mark-paid', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ orderId: order.orderId, deliveredCredentials: credentials }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setOrderErrors((previous) => ({
-          ...previous,
-          [order.orderId]: data.error || 'Could not mark this order paid and deliver its ID.',
-        }));
-      } else if (data.alreadyDelivered) {
-        setManualPaymentMessages((previous) => ({
-          ...previous,
-          [order.orderId]: 'Already delivered.',
-        }));
-        await fetchAdminState(false, true);
-      } else {
-        setOrderErrors((prev) => ({ ...prev, [order.orderId]: '' }));
-        setManualPaymentMessages((previous) => ({
-          ...previous,
-          [order.orderId]: 'Payment manually confirmed and ID delivered.',
-        }));
-        await fetchAdminState(false, true);
-      }
-    } catch {
-      setOrderErrors((prev) => ({
-        ...prev,
-        [order.orderId]: 'Could not connect to the server. Please try again.',
-      }));
-    } finally {
-      setBusyOrderId(null);
     }
   };
 
@@ -795,7 +751,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     {
       id: 'qr_settings',
       label: 'QR Code & UPI Setup',
-      subtitle: 'Fixed UPI ID & manual payment review',
+      subtitle: 'UPI setup & automatic SMS payment verification',
       icon: <QrCode className="w-4 h-4" />,
     },
     {
@@ -1186,7 +1142,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                   {readyVaultCount}
                 </p>
                 <span className="text-[11px] text-indigo-300/90 font-semibold mt-1 inline-block">
-                  Manual payment review only
+                  Payment verified by matching bank SMS
                 </span>
               </div>
               <div className="w-10 h-10 rounded-xl bg-indigo-500/20 border border-indigo-400/40 text-indigo-300 flex items-center justify-center shrink-0">
@@ -1270,7 +1226,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
               {smsPaymentLogs.length > 0 && (
                 <section className="neon-card-3d p-4">
                   <h3 className="mb-3 text-sm font-extrabold text-white">
-                    Recent SMS payment events
+                    Recent linked SMS payments
                   </h3>
                   <div className="max-h-64 space-y-2 overflow-y-auto">
                     {smsPaymentLogs.map((log, index) => (
@@ -1297,6 +1253,79 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                   </div>
                 </section>
               )}
+              <section className="neon-card-3d p-4">
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="text-sm font-extrabold text-white">Track Order Complaints</h3>
+                  <span className="text-[11px] text-slate-400">
+                    Latest {trackOrderComplaints.length} open records
+                  </span>
+                </div>
+                {complaintWarning && (
+                  <p className="mb-3 text-xs text-rose-300" role="alert">
+                    {complaintWarning}
+                  </p>
+                )}
+                {trackOrderComplaints.length === 0 ? (
+                  <p className="rounded-lg border border-slate-800 bg-slate-950/60 p-3 text-xs text-slate-400">
+                    No open tracking complaints.
+                  </p>
+                ) : (
+                  <div className="max-h-96 space-y-2 overflow-y-auto">
+                    {trackOrderComplaints.map((complaint) => (
+                      <div
+                        key={complaint.utr}
+                        className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-cyan-500/20 bg-slate-950/70 p-3"
+                      >
+                        <div className="min-w-0 flex-1 text-xs">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="font-mono font-bold text-cyan-200">
+                              UTR {complaint.utr}
+                            </span>
+                            <span className="rounded-md bg-amber-950/60 px-2 py-1 font-bold text-amber-200">
+                              {complaint.currentStatus}
+                            </span>
+                          </div>
+                          <p className="mt-1 text-slate-300">
+                            Order: {complaint.orderId || 'Not found'} · Checked {complaint.checkCount} time
+                            {complaint.checkCount === 1 ? '' : 's'}
+                          </p>
+                          <p className="mt-1 text-[11px] text-slate-500">
+                            First: {formatClaimDate(complaint.firstCheckedAt)} · Last:{' '}
+                            {formatClaimDate(complaint.lastCheckedAt)}
+                          </p>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => handleCopyUtr(complaint.utr)}
+                            className="inline-flex items-center gap-1 rounded-lg border border-cyan-400/40 bg-slate-900 px-2.5 py-1.5 text-xs font-bold text-cyan-300"
+                          >
+                            {copiedUtr === complaint.utr ? (
+                              <>
+                                <Check className="h-3.5 w-3.5" />
+                                Copied
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="h-3.5 w-3.5" />
+                                Copy UTR
+                              </>
+                            )}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={resolvingComplaint === complaint.utr}
+                            onClick={() => void handleResolveComplaint(complaint.utr)}
+                            className="rounded-lg border border-emerald-500/40 bg-emerald-950/60 px-2.5 py-1.5 text-xs font-bold text-emerald-200 disabled:opacity-50"
+                          >
+                            {resolvingComplaint === complaint.utr ? 'Resolving…' : 'Resolved'}
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </section>
               <div className="neon-card-3d p-4 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
                 <div className="flex items-center gap-1.5 overflow-x-auto pb-1 sm:pb-0">
                   {(
@@ -1390,18 +1419,6 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                 <>
                 <div className="space-y-4">
                   {filteredOrders.map((order) => {
-                    const orderPool = getOrderVaultPool(order);
-                    const orderPoolAvailable = vault.filter(
-                      (item) =>
-                        !item.isAssigned &&
-                        item.poolType === orderPool &&
-                        (!item.reservedOrderId || item.reservedOrderId === order.orderId)
-                    ).length;
-                    const draftText =
-                      credDrafts[order.orderId] === undefined
-                        ? order.deliveredCredentials || ''
-                        : credDrafts[order.orderId];
-
                     return (
                       <div
                         key={order.orderId}
@@ -1517,65 +1534,18 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                             )}
                           </div>
 
-                          <div className="w-full lg:w-[26rem] space-y-2.5 bg-slate-950/90 p-4 rounded-2xl border border-cyan-500/35">
-                            <div className="flex items-center justify-between gap-2">
-                              <label className="text-xs font-extrabold text-white flex items-center gap-1.5">
-                                <KeyRound className="w-3.5 h-3.5 text-cyan-400" />
-                                IRCTC ID &amp; Password ({order.quantity} ID
-                                {order.quantity > 1 ? 's' : ''})
-                              </label>
-                              {orderPoolAvailable > 0 && (
-                                <button
-                                  type="button"
-                                  onClick={() => handleAutoFillFromVault(order)}
-                                  className="text-[11px] font-bold text-cyan-300 hover:text-white bg-blue-950/90 px-2.5 py-1 rounded-lg border border-cyan-400/40 flex items-center gap-1 transition-colors cursor-pointer"
-                                >
-                                  <Sparkles className="w-3 h-3 text-cyan-400" />
-                                  <span>Auto-Fill from Vault ({orderPoolAvailable})</span>
-                                </button>
-                              )}
-                            </div>
-
-                            <textarea
-                              rows={3}
-                              value={draftText}
-                              onChange={(e) =>
-                                setCredDrafts((prev) => ({
-                                  ...prev,
-                                  [order.orderId]: e.target.value,
-                                }))
-                              }
-                              placeholder="Enter existing vault username | password (1 per line)&#10;Example: user_irctc01 | your-real-password"
-                              className="w-full px-3 py-2.5 rounded-xl bg-slate-900 border border-cyan-500/35 text-xs text-white font-mono placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-cyan-400/30 focus:border-cyan-400"
-                            />
+                          <div className="w-full lg:w-[26rem] space-y-3 bg-slate-950/90 p-4 rounded-2xl border border-cyan-500/35">
+                            <p className="text-xs leading-relaxed text-slate-300">
+                              Matching SMS payments deliver automatically when the correct stock is
+                              available. This panel cannot approve or deliver an order manually.
+                            </p>
                             {orderErrors[order.orderId] && (
                               <p className="text-xs text-rose-300" role="alert">
                                 {orderErrors[order.orderId]}
                               </p>
                             )}
-                            {manualPaymentMessages[order.orderId] && (
-                              <p className="text-xs text-emerald-300" role="status">
-                                {manualPaymentMessages[order.orderId]}
-                              </p>
-                            )}
 
                             <div className="flex flex-wrap items-center gap-2 pt-1">
-                              <button
-                                type="button"
-                                disabled={
-                                  busyOrderId === order.orderId ||
-                                  order.status === 'rejected' ||
-                                  order.status === 'verified_delivered'
-                                }
-                                onClick={() => handleVerifyOrder(order)}
-                                className="flex-1 py-2.5 px-3 rounded-xl text-white font-extrabold text-xs store-pay-pill disabled:opacity-50 flex items-center justify-center gap-1.5 cursor-pointer"
-                              >
-                                <CheckCircle2 className="w-3.5 h-3.5" />
-                                {order.status === 'verified_delivered'
-                                  ? 'Already delivered'
-                                  : 'Update Delivered Vault ID'}
-                              </button>
-
                               {order.status === 'pending_verification' && (
                                 <button
                                   type="button"
@@ -1917,11 +1887,11 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                 <div className="border-b border-cyan-500/25 pb-4">
                   <h2 className="font-display text-base font-black text-white flex items-center gap-2">
                     <QrCode className="w-5 h-5 text-cyan-400" />
-                    Payment QR Code &amp; Manual UPI Verification
+                    Payment QR Code &amp; Automatic SMS Verification
                   </h2>
                   <p className="text-xs text-slate-300 mt-1">
-                    UPI QR payments are sent to {formConfig.upiId}. Orders stay pending until you
-                    confirm the matching payment in that account.
+                    UPI QR payments are sent to {formConfig.upiId}. Matching bank SMS payments
+                    verify and deliver orders automatically.
                   </p>
                 </div>
 
@@ -1976,11 +1946,11 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                   <div className="space-y-0.5">
                     <div className="flex items-center gap-2 text-xs font-extrabold text-amber-200">
                       <ShieldCheck className="w-4 h-4 text-amber-300" />
-                      <span>Manual payment confirmation only</span>
+                      <span>Automatic payment confirmation only</span>
                     </div>
                     <p className="text-[11px] text-slate-300 leading-relaxed">
-                      Match the exact UTR and amount against a successful credit received at{' '}
-                      {formConfig.upiId} before verifying. A submitted UTR alone is not payment proof.
+                      The server checks the exact UTR and amount against a successful credit SMS
+                      received for {formConfig.upiId}. A submitted UTR alone is never payment proof.
                     </p>
                   </div>
                 </div>
@@ -2450,7 +2420,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                   <p className="text-xs text-slate-300 mt-1">
                     Add one account per line:{' '}
                     <code className="text-cyan-300">username | password</code>. IDs are assigned
-                    from the selected pool after an order&apos;s payment is manually verified.
+                    from the selected pool after the server verifies its matching SMS payment.
                   </p>
                 </div>
 

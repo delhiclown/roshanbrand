@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   createSubmittedOrderUpdate,
   deliverOnce,
+  getTrackComplaintStatus,
   isOrderExpired,
   matchesSmsPayment,
   parseCreditedSms,
@@ -170,6 +171,16 @@ test('Missing or incorrect SMS webhook authorization maps to HTTP 401', () => {
   assert.equal(smsWebhookStatus(true), 200);
 });
 
+test('Track complaints report the current payment state but never for delivered orders', () => {
+  assert.equal(getTrackComplaintStatus(null), 'UTR not found');
+  assert.equal(getTrackComplaintStatus('utr_submitted'), 'Waiting for SMS');
+  assert.equal(getTrackComplaintStatus('paid_stock_pending'), 'Paid - Stock Pending');
+  assert.equal(getTrackComplaintStatus('rejected'), 'Rejected');
+  assert.equal(getTrackComplaintStatus('expired'), 'Order expired');
+  assert.equal(getTrackComplaintStatus('paid'), null);
+  assert.equal(getTrackComplaintStatus('utr_submitted', true), null);
+});
+
 test('An unmatched SMS can be matched and delivered when its UTR is submitted later', () => {
   const storedPayment = {
     utr: '123456789012',
@@ -196,7 +207,7 @@ test('An unmatched SMS can be matched and delivered when its UTR is submitted la
   assert.equal(credentialAssignments, 1);
 });
 
-test('Manual delivery followed by SMS does not assign a second ID', () => {
+test('Repeated SMS delivery attempts do not assign a second ID', () => {
   const state: DeliveryState = { delivered: false, status: 'utr_submitted' };
   let credentialAssignments = 0;
   const deliver = () => {
@@ -204,7 +215,7 @@ test('Manual delivery followed by SMS does not assign a second ID', () => {
     return true;
   };
 
-  assert.equal(deliverOnce(state, 'manual', deliver), 'delivered');
+  assert.equal(deliverOnce(state, 'sms', deliver), 'delivered');
   assert.equal(deliverOnce(state, 'sms', deliver), 'already-delivered');
   assert.equal(credentialAssignments, 1);
 });

@@ -42,7 +42,9 @@ Stock shown in the storefront is the number of unassigned credentials in the mat
 
 Opening checkout creates only a 15-minute `draft` row. Drafts are not included in the admin order list and never reserve stock. Closing the checkout or leaving the page sends a best-effort cancellation; a server cleanup job silently deletes drafts that remain for 15 minutes. The server calculates the whole-rupee price from the selected product and quantity; the browser never supplies the amount. It returns an order-specific UPI link and QR.
 
-Only the customer pressing **I have paid — submit UTR** with a valid, unused 12-digit UTR promotes the draft to `utr_submitted` and reserves its requested vault IDs for 30 minutes. A matching SMS webhook UTR and exact amount automatically delivers credentials once. If no matching SMS arrives, the authenticated admin can use **Update Delivered Vault ID** for a submitted pending order. SMS and manual delivery both require the database row to remain `utr_submitted` and atomically set `paid`/`delivered`; a second delivery attempt cannot assign another ID. SMS events, including notifications arriving after manual delivery, are visible in the Admin orders tab. Rejection releases the reserved IDs immediately.
+Only the customer pressing **I have paid — submit UTR** with a valid, unused 12-digit UTR promotes the draft to `utr_submitted` and reserves its requested vault IDs. A matching SMS webhook UTR and exact amount automatically delivers credentials once. If payment is confirmed but stock is unavailable, the order remains `paid_stock_pending` and is delivered automatically when matching stock is added. Orders without a matching SMS are auto-rejected after three minutes. The admin panel has no manual payment-approval or delivery action; one UTR can be used only once, and delivery requires its matching SMS payment record.
+
+Track Order checks are limited to 10 requests per minute per IP. Each UTR has one complaint record whose check count and last-checked time update on repeat checks. Admins can view the newest 100 open complaints and resolve them; delivery resolves a complaint automatically. Resolved complaints are deleted after seven days, and open complaints with no check for 30 days are deleted. The Recent SMS payments panel shows only SMS records linked to an order. Unlinked incoming credit payments and their SMS logs are deleted after 30 minutes; payment records linked to an order are retained.
 
 The legacy cleanup endpoint is protected by the existing admin session: `POST /api/admin/orders/cleanup-fake-utrs` with a JSON body such as `{"orderIds":["RB_..."]}` rejects only the explicitly supplied pending orders that have a valid UTR, and releases their reservations. Review the IDs in Admin first; the endpoint intentionally does not guess which historic UTRs were submitted by a customer.
 
@@ -66,17 +68,18 @@ x-secret: YOUR_SMS_SECRET
 {"sender":"AIRTEL","message":"INR 340.00 credited ... UTR 123456789012"}
 ```
 
-The notification must include a configured sender keyword, `credited` or `received`, a rupee amount prefixed by `Rs`, `INR`, or `₹`, and a labeled 12-digit UTR/ref number. Debit and OTP messages are ignored, and a missing or incorrect `x-secret` receives HTTP 401. The webhook records every accepted SMS and automatically delivers only when the UTR, amount, order creation time, and pending order status match. Keep `SMS_SECRET` only in the backend and SMS relay; never put it in frontend code. Review the payment directly in the bank account before using **Update Delivered Vault ID** in the logged-in admin panel.
+The notification must include a configured sender keyword, `credited` or `received`, a rupee amount prefixed by `Rs`, `INR`, or `₹`, and a labeled 12-digit UTR/ref number. Debit and OTP messages are ignored, and a missing or incorrect `x-secret` receives HTTP 401. The webhook automatically delivers only when the UTR, amount, order creation time, and pending order status match. Keep `SMS_SECRET` only in the backend and SMS relay; never put it in frontend code. The customer's private order key remains in an HttpOnly cookie; a UTR alone can show status but cannot reveal credentials.
 
 ### Verify the unpaid-order safeguard
 
 1. Deploy the server with `DATABASE_URL`, `UPI_ID`, and `PAYEE_NAME` set, and add at least one test credential to the vault.
 2. Open checkout and note the site stock count. Scan/open the QR, then press Back/close without submitting a UTR. Confirm there is no order in Admin, no order-expired card, and stock is unchanged.
-3. Open checkout again and press **I have paid — submit UTR** with a valid 12-digit UTR. Confirm the order now appears as pending in Admin and stock decreases by the requested quantity. Before approval, the private access endpoint must not return credentials.
+3. Open checkout again and press **I have paid — submit UTR** with a valid 12-digit UTR. Confirm the order now appears as pending in Admin and stock decreases by the requested quantity. Before a matching SMS arrives, the private access endpoint must not return credentials.
 4. Test SMS auto-delivery with an accepted sender and matching credited amount/UTR after UTR submission. Confirm the order becomes paid and credentials appear once. Send the same notification again and verify no second ID is assigned.
-5. For manual delivery, submit a different UTR and use the authenticated Admin **Update Delivered Vault ID** action. Then send a matching SMS and confirm it is logged as ignored/already paid with no second ID.
-6. Reject another pending order and confirm the reserved stock is immediately restored. For draft cleanup, leave checkout open for more than 15 minutes; confirm the draft disappears silently and no stock or expired-order card appears.
-7. For old fake-UTR orders, review their IDs in Admin and call the protected cleanup endpoint with only those IDs. Confirm they become rejected and their reservations are restored.
+5. Test the order-tracking complaint list with an unmatched UTR, repeat the same check, and verify one record's count increases. Resolve it and confirm it disappears immediately; a delivered order should never create a new open complaint.
+6. Confirm the Recent SMS payments panel hides unlinked SMS records and retains any payment linked to a delivered or stock-pending order.
+7. Reject another pending order and confirm the reserved stock is immediately restored. For draft cleanup, leave checkout open for more than 15 minutes; confirm the draft disappears silently and no stock or expired-order card appears.
+8. For old fake-UTR orders, review their IDs in Admin and call the protected cleanup endpoint with only those IDs. Confirm they become rejected and their reservations are restored.
 
 ## Guarantee Claims
 

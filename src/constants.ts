@@ -29,6 +29,8 @@ export const LIMITS = {
 export const TRACK_ORDER_MESSAGES: Record<string, string> = {
   'Paid - Stock Pending':
     'Payment received. Your ID will be delivered as soon as stock is added. No need to check again and again.',
+  'Late Payment - Pending Review':
+    'Aapka payment verify ho raha hai. Agar paisa kat gaya hai to chinta na karein, order approve hote hi mil jayega.',
   'UTR not found':
     'We could not find this UTR yet. Please check the 12-digit number, or wait a few minutes and try again.',
   'Waiting for SMS':

@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   createSubmittedOrderUpdate,
   deliverOnce,
+  getUtrReviewStatus,
   getTrackComplaintStatus,
   isTrackComplaintStatus,
   isOrderExpired,
@@ -13,6 +14,7 @@ import {
   reserveStock,
   smsWebhookStatus,
   submitUtr,
+  shouldExpirePaymentOrder,
   type DeliveryState,
 } from '../src/paymentDelivery.ts';
 import { getTrackOrderMessage } from '../src/constants.ts';
@@ -83,20 +85,25 @@ test('A rejected UTR order can accept a corrected retry', () => {
 
   assert.equal(submitUtr(state), true);
   assert.equal(state.status, 'utr_submitted');
+
+  const expiredDraft: DeliveryState = { delivered: false, status: 'expired' };
+  assert.equal(submitUtr(expiredDraft), true);
+  assert.equal(expiredDraft.status, 'utr_submitted');
 });
 
-test('UTR submission expires after three minutes and passes a Date for TIMESTAMPTZ', async () => {
+test('UTR submission records server time without shortening the payment grace deadline', async () => {
   const submittedAt = new Date('2026-10-27T12:00:00.000Z');
-  const saved = { expiresAt: null as unknown };
+  const saved = { submittedAt: null as unknown };
   const mockPostgres = {
     async query(text: string, values: readonly unknown[]) {
-      assert.match(text, /expires_at = \$3/);
-      assert.match(text, /status IN \([^)]*'rejected'/);
-      const expiresAt = values[2];
-      if (!(expiresAt instanceof Date)) {
+      assert.match(text, /utr_submitted_at = \$3/);
+      assert.match(text, /late_payment_pending_review/);
+      assert.doesNotMatch(text, /expires_at = \$3/);
+      const timestamp = values[2];
+      if (!(timestamp instanceof Date)) {
         throw new TypeError('TIMESTAMPTZ value must be a JavaScript Date.');
       }
-      saved.expiresAt = expiresAt;
+      saved.submittedAt = timestamp;
       return { rowCount: 1 };
     },
   };
@@ -104,8 +111,28 @@ test('UTR submission expires after three minutes and passes a Date for TIMESTAMP
   const result = await mockPostgres.query(update.text, update.values);
 
   assert.equal(result.rowCount, 1);
-  assert.ok(saved.expiresAt instanceof Date);
-  assert.equal(saved.expiresAt.toISOString(), '2026-10-27T12:03:00.000Z');
+  assert.ok(saved.submittedAt instanceof Date);
+  assert.equal(saved.submittedAt.toISOString(), submittedAt.toISOString());
+});
+
+test('UTRs submitted after the payment deadline go to manual late-payment review', () => {
+  const expiresAt = new Date('2026-10-27T12:10:00.000Z');
+  assert.equal(
+    getUtrReviewStatus(expiresAt, new Date('2026-10-27T12:09:58.000Z')),
+    'utr_submitted'
+  );
+  assert.equal(
+    getUtrReviewStatus(expiresAt, new Date('2026-10-27T12:10:01.000Z')),
+    'late_payment_pending_review'
+  );
+  assert.equal(
+    getUtrReviewStatus(expiresAt, new Date('2026-10-27T12:15:00.000Z')),
+    'late_payment_pending_review'
+  );
+  assert.equal(
+    getUtrReviewStatus(expiresAt, new Date('2026-10-27T12:10:00.000Z')),
+    'utr_submitted'
+  );
 });
 
 test('A matching SMS delivers credentials only once', () => {
@@ -200,6 +227,10 @@ test('Track status messages use the customer-facing wording for each payment sta
   assert.equal(
     getTrackOrderMessage('Waiting for SMS'),
     'We are waiting for your payment confirmation. Please wait a few minutes and check again.'
+  );
+  assert.equal(
+    getTrackOrderMessage('Late Payment - Pending Review'),
+    'Aapka payment verify ho raha hai. Agar paisa kat gaya hai to chinta na karein, order approve hote hi mil jayega.'
   );
   assert.equal(
     getTrackOrderMessage('Rejected'),
@@ -302,25 +333,17 @@ test('Draft cleanup expires only drafts past their 15-minute deadline', () => {
   assert.deepEqual(remaining.map((draft) => draft.orderId), ['current']);
 });
 
-test('Expiry cleanup uses timestamp values and releases expired-order reservations', () => {
+test('Payment UTR orders never expire automatically; only drafts expire after grace', () => {
   const now = new Date('2026-10-27T12:30:00.000Z');
-  const rows = [
-    { id: 'expired', status: 'utr_submitted', expiresAt: new Date('2026-10-27T12:29:00.000Z') },
-    { id: 'active', status: 'utr_submitted', expiresAt: new Date('2026-10-27T12:31:00.000Z') },
-  ];
-  const vault: { poolType: string; isAssigned: boolean; reservedOrderId?: string }[] = [
-    { poolType: 'permanent', isAssigned: false, reservedOrderId: 'expired' },
-    { poolType: 'permanent', isAssigned: false, reservedOrderId: 'active' },
-  ];
-  for (const row of rows) {
-    if (isOrderExpired(row.expiresAt, now.getTime())) {
-      row.status = 'expired';
-      releaseStock(vault, row.id);
-    }
-  }
-
-  assert.equal(rows[0].status, 'expired');
-  assert.equal(rows[1].status, 'utr_submitted');
-  assert.equal(vault.find((item) => item.reservedOrderId === 'expired'), undefined);
-  assert.equal(vault.find((item) => item.reservedOrderId === 'active')?.reservedOrderId, 'active');
+  const graceExpiresAt = new Date('2026-10-27T12:15:00.000Z');
+  assert.equal(shouldExpirePaymentOrder('draft', graceExpiresAt, now.getTime()), true);
+  assert.equal(shouldExpirePaymentOrder('utr_submitted', graceExpiresAt, now.getTime()), false);
+  assert.equal(
+    shouldExpirePaymentOrder(
+      'late_payment_pending_review',
+      new Date('2026-10-27T12:29:00.000Z'),
+      now.getTime()
+    ),
+    false
+  );
 });

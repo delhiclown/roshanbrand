@@ -16,6 +16,7 @@ export type PaymentStatus =
   | 'utr_submitted'
   | 'paid_stock_pending'
   | 'paid'
+  | 'late_payment_pending_review'
   | 'expired'
   | 'rejected';
 export type GuaranteeType = 'guarantee_7days' | 'guarantee_1month';
@@ -130,6 +131,8 @@ export interface OrderRecord {
   refundReason?: string;
   createdAt: string;
   updatedAt: string;
+  paymentExpiresAt?: string;
+  utrSubmittedAt?: string;
 }
 
 export interface VaultItem {

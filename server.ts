@@ -24,12 +24,12 @@ import {
   deliverOnce,
   getTrackComplaintStatus,
   isTrackComplaintStatus,
-  isOrderExpired,
   matchesSmsPayment,
   parseCreditedSms,
   rejectOrderAndReleaseStock,
   releaseStock,
   reserveStock,
+  shouldExpirePaymentOrder,
   smsWebhookStatus,
   submitUtr,
 } from './src/paymentDelivery.ts';
@@ -43,6 +43,13 @@ const DATA_FILE = path.join(DATA_DIR, 'roshanbrand_store.json');
 const SEED_DATA_FILE = path.join(DEFAULT_DATA_DIR, 'roshanbrand_store.json');
 const ADMIN_AUTH_FILE = path.join(DATA_DIR, 'admin_auth.json');
 const ADMIN_SESSION_FILE = path.join(DATA_DIR, 'admin_sessions.json');
+const configuredGraceMinutes = Number(process.env.PAYMENT_GRACE_PERIOD_MINUTES);
+const PAYMENT_GRACE_PERIOD_MS =
+  Number.isSafeInteger(configuredGraceMinutes) &&
+  configuredGraceMinutes >= 0 &&
+  configuredGraceMinutes <= 24 * 60
+    ? configuredGraceMinutes * 60 * 1000
+    : 5 * 60 * 1000;
 const postgresPool = process.env.DATABASE_URL
   ? new Pool({ connectionString: process.env.DATABASE_URL })
   : null;
@@ -266,10 +273,12 @@ async function initializePersistence(db: PersistedDatabase): Promise<void> {
       product TEXT NOT NULL,
       quantity INTEGER NOT NULL CHECK (quantity > 0),
       amount_paise INTEGER NOT NULL CHECK (amount_paise > 0),
-      status TEXT NOT NULL CHECK (status IN ('draft', 'pending', 'utr_submitted', 'paid_stock_pending', 'paid', 'expired', 'rejected')),
+      status TEXT NOT NULL CHECK (status IN ('draft', 'pending', 'utr_submitted', 'late_payment_pending_review', 'paid_stock_pending', 'paid', 'expired', 'rejected')),
       utr TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       expires_at TIMESTAMPTZ NOT NULL,
+      payment_expires_at TIMESTAMPTZ,
+      utr_submitted_at TIMESTAMPTZ,
       delivered SMALLINT NOT NULL DEFAULT 0 CHECK (delivered IN (0, 1)),
       pack_label TEXT NOT NULL,
       customer_reference TEXT NOT NULL,
@@ -280,8 +289,16 @@ async function initializePersistence(db: PersistedDatabase): Promise<void> {
   await postgresPool.query(`
     ALTER TABLE orders
     ADD CONSTRAINT orders_status_check
-    CHECK (status IN ('draft', 'pending', 'utr_submitted', 'paid_stock_pending', 'paid', 'expired', 'rejected'))
+    CHECK (status IN ('draft', 'pending', 'utr_submitted', 'late_payment_pending_review', 'paid_stock_pending', 'paid', 'expired', 'rejected'))
   `);
+  await postgresPool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_expires_at TIMESTAMPTZ');
+  await postgresPool.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS utr_submitted_at TIMESTAMPTZ');
+  await postgresPool.query(`
+    UPDATE orders
+    SET payment_expires_at = COALESCE(payment_expires_at, created_at + INTERVAL '10 minutes')
+    WHERE payment_expires_at IS NULL
+  `);
+  await postgresPool.query('ALTER TABLE orders ALTER COLUMN payment_expires_at SET NOT NULL');
   await postgresPool.query(`
     UPDATE orders
     SET expires_at = COALESCE(created_at, NOW()) +
@@ -860,22 +877,26 @@ async function startServer() {
   ) => {
     const cookieName = orderAccessCookieName(orderId);
     if (!cookieName) return;
-    res.append(
-      'Set-Cookie',
-      `${cookieName}=${encodeURIComponent(accessToken)}; Path=/api/orders; HttpOnly; SameSite=Strict; Max-Age=${maxAgeSeconds}${
-        process.env.NODE_ENV === 'production' ? '; Secure' : ''
-      }`
-    );
+    for (const cookiePath of ['/api/orders', '/api/verify-utr']) {
+      res.append(
+        'Set-Cookie',
+        `${cookieName}=${encodeURIComponent(accessToken)}; Path=${cookiePath}; HttpOnly; SameSite=Strict; Max-Age=${maxAgeSeconds}${
+          process.env.NODE_ENV === 'production' ? '; Secure' : ''
+        }`
+      );
+    }
   };
   const clearOrderAccessCookie = (res: express.Response, orderId: string) => {
     const cookieName = orderAccessCookieName(orderId);
     if (!cookieName) return;
-    res.append(
-      'Set-Cookie',
-      `${cookieName}=; Path=/api/orders; HttpOnly; SameSite=Strict; Max-Age=0${
-        process.env.NODE_ENV === 'production' ? '; Secure' : ''
-      }`
-    );
+    for (const cookiePath of ['/api/orders', '/api/verify-utr']) {
+      res.append(
+        'Set-Cookie',
+        `${cookieName}=; Path=${cookiePath}; HttpOnly; SameSite=Strict; Max-Age=0${
+          process.env.NODE_ENV === 'production' ? '; Secure' : ''
+        }`
+      );
+    }
   };
   const clearSessionCookie = (res: express.Response) => {
     res.setHeader(
@@ -1085,7 +1106,8 @@ async function startServer() {
   const reconcileVaultReservations = async (client: import('pg').PoolClient) => {
     const activeOrders = await client.query<{ id: string }>(
       `SELECT id FROM orders
-       WHERE status IN ('utr_submitted', 'paid_stock_pending') AND delivered = 0`
+       WHERE status IN ('utr_submitted', 'late_payment_pending_review', 'paid_stock_pending')
+         AND delivered = 0`
     );
     const activeOrderIds = new Set(activeOrders.rows.map((row) => row.id));
     const staleReservationIds = new Set(
@@ -1119,6 +1141,7 @@ async function startServer() {
       utr: string | null;
       created_at: Date;
       expires_at: Date | null;
+      payment_expires_at: Date | null;
       delivered: number;
       pack_label: string;
       customer_reference: string;
@@ -1145,8 +1168,8 @@ async function startServer() {
     if (
       !payment ||
       (payment.used_order_id !== null && payment.used_order_id !== orderId) ||
-      !paymentOrder.expires_at ||
-      payment.received_at.getTime() > paymentOrder.expires_at.getTime() ||
+      !paymentOrder.payment_expires_at ||
+      payment.received_at.getTime() > paymentOrder.payment_expires_at.getTime() ||
       !matchesSmsPayment(
         { utr: paymentOrder.utr, amountPaise: paymentOrder.amount_paise, createdAt: paymentOrder.created_at },
         {
@@ -1181,6 +1204,7 @@ async function startServer() {
         adminNote: 'Awaiting payment verification.',
         createdAt: paymentOrder.created_at.toISOString(),
         updatedAt: new Date().toISOString(),
+        paymentExpiresAt: paymentOrder.payment_expires_at?.toISOString(),
       };
       db.orders.unshift(order);
     }
@@ -1253,50 +1277,6 @@ async function startServer() {
     await resolveTrackComplaints(client, orderId, order.utrNumber);
     syncVaultDisplayCounter(getVaultPoolForPackType(order.packType));
     return { result: 'delivered' as const, order };
-  };
-  const rejectExpiredUtrOrder = async (client: import('pg').PoolClient, orderId: string) => {
-    const result = await client.query<{ product: PackType }>(
-      `UPDATE orders SET status = 'rejected'
-       WHERE id = $1 AND status = 'utr_submitted' AND delivered = 0 AND expires_at <= NOW()
-         AND NOT EXISTS (
-           SELECT 1 FROM payments
-           WHERE payments.utr = orders.utr
-             AND payments.amount_paise = orders.amount_paise
-             AND payments.received_at > orders.created_at
-             AND payments.received_at <= orders.expires_at
-             AND payments.used_order_id IS NULL
-         )
-       RETURNING product`,
-      [orderId]
-    );
-    const expiredOrder = result.rows[0];
-    if (!expiredOrder) return false;
-    await client.query(
-      `UPDATE track_order_complaints
-       SET current_status = 'Rejected'
-       WHERE resolved_at IS NULL AND order_id = $1`,
-      [orderId]
-    );
-
-    const now = new Date().toISOString();
-    const existingOrder = db.orders.find((order) => order.orderId === orderId);
-    const orderToReject = existingOrder ?? {
-      status: 'utr_submitted',
-      paymentStatus: 'utr_submitted',
-      adminNote: '',
-      updatedAt: '',
-    };
-    if (!rejectOrderAndReleaseStock(
-      orderToReject,
-      db.vault,
-      orderId,
-      now,
-      'No matching bank SMS payment was received within 3 minutes.'
-    )) {
-      throw new Error(`Could not reject expired UTR order ${orderId}.`);
-    }
-    syncVaultDisplayCounter(getVaultPoolForPackType(expiredOrder.product));
-    return true;
   };
   const deliverPaidStockPending = async (
     client: import('pg').PoolClient,
@@ -1430,7 +1410,9 @@ async function startServer() {
     const orderId = `RB_${Date.now()}_${randomBytes(6).toString('hex').toUpperCase()}`;
     const accessToken = randomBytes(32).toString('hex');
     const createdAt = new Date();
-    const expiresAt = new Date(createdAt.getTime() + 15 * 60 * 1000);
+    const paymentExpiresAt = new Date(createdAt.getTime() + 10 * 60 * 1000);
+    const graceExpiresAt = new Date(paymentExpiresAt.getTime() + PAYMENT_GRACE_PERIOD_MS);
+    const expiresAt = graceExpiresAt;
     const packLabel = String(body.packLabel || `${quantity} ${product} ID Pack`).trim().slice(0, 80);
     const customerReference = String(body.customerReference || 'Direct UPI Buyer')
       .trim()
@@ -1449,13 +1431,25 @@ async function startServer() {
       await client.query(
         `INSERT INTO orders
           (id, product, quantity, amount_paise, status, created_at, expires_at,
+           payment_expires_at,
            pack_label, customer_reference, custom_spec)
-         VALUES ($1, $2, $3, $4, 'draft', $5, $6, $7, $8, $9)`,
-        [orderId, product, quantity, amountPaise, createdAt, expiresAt, packLabel, customerReference, customSpec]
+         VALUES ($1, $2, $3, $4, 'draft', $5, $6, $7, $8, $9, $10)`,
+        [
+          orderId,
+          product,
+          quantity,
+          amountPaise,
+          createdAt,
+          expiresAt,
+          paymentExpiresAt,
+          packLabel,
+          customerReference,
+          customSpec,
+        ]
       );
       db.orderAccessTokens[orderId] = createHash('sha256').update(accessToken).digest('hex');
       await saveDb(db);
-      setOrderAccessCookie(res, orderId, accessToken, 15 * 60);
+      setOrderAccessCookie(res, orderId, accessToken);
       res.status(201).json({
         orderId,
         amount: amountRupees,
@@ -1466,11 +1460,90 @@ async function startServer() {
         upiId,
         payeeName,
         accessToken,
+        paymentExpiresAt: paymentExpiresAt.toISOString(),
+        graceExpiresAt: graceExpiresAt.toISOString(),
+        serverNow: new Date().toISOString(),
         expiresAt: expiresAt.toISOString(),
       });
     } catch (error) {
       console.error('Failed to create UPI order:', error);
       res.status(500).json({ error: 'The order could not be created.' });
+    }
+  });
+
+  app.get('/api/orders/checkout/:id', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const orderId = String(req.params.id || '').trim();
+    const client = getCheckoutClient();
+    if (!postgresPool || !client) {
+      res.status(503).json({ error: 'Payment database is not configured.' });
+      return;
+    }
+    try {
+      const result = await client.query<{
+        id: string;
+        amount_paise: number;
+        status: PaymentStatus;
+        created_at: Date;
+        payment_expires_at: Date;
+        expires_at: Date;
+        utr_submitted_at: Date | null;
+      }>(
+        `SELECT id, amount_paise, status, created_at, payment_expires_at, expires_at, utr_submitted_at
+         FROM orders WHERE id = $1`,
+        [orderId]
+      );
+      const paymentOrder = result.rows[0];
+      if (!paymentOrder) {
+        res.status(404).json({ error: 'Payment order not found.' });
+        return;
+      }
+      const authorizedToken = getAuthorizedOrderAccessToken(
+        req,
+        orderId,
+        db.orderAccessTokens[orderId],
+        ''
+      );
+      if (!authorizedToken) {
+        res.status(401).json({ error: 'The order access key is invalid.' });
+        return;
+      }
+      const upiId = getMerchantUpiId();
+      const payeeName = String(process.env.PAYEE_NAME || '').trim();
+      if (
+        !payeeName ||
+        !LIMITS.UPI_ID_REGEX.test(upiId) ||
+        payeeName.length < 2 ||
+        payeeName.length > LIMITS.PAYEE_NAME_MAX
+      ) {
+        res.status(503).json({ error: 'UPI_ID and PAYEE_NAME must be configured on the server.' });
+        return;
+      }
+      const amount = paymentOrder.amount_paise / 100;
+      const upiLink = `upi://pay?${new URLSearchParams({
+        pa: upiId,
+        pn: payeeName,
+        am: String(amount),
+        cu: 'INR',
+        tn: orderId,
+      }).toString()}`;
+      setOrderAccessCookie(res, orderId, authorizedToken);
+      res.json({
+        orderId,
+        amount,
+        status: paymentOrder.status,
+        createdAt: paymentOrder.created_at.toISOString(),
+        paymentExpiresAt: paymentOrder.payment_expires_at.toISOString(),
+        graceExpiresAt: paymentOrder.expires_at.toISOString(),
+        utrSubmittedAt: paymentOrder.utr_submitted_at?.toISOString() || null,
+        serverNow: new Date().toISOString(),
+        upiLink,
+        upiId,
+        payeeName,
+      });
+    } catch (error) {
+      console.error('Failed to restore payment checkout:', error);
+      res.status(500).json({ error: 'Payment checkout could not be restored.' });
     }
   });
 
@@ -1552,7 +1625,10 @@ async function startServer() {
       const status = complaintStatus || 'Delivered';
       res.json({
         status,
-        message: getTrackOrderMessage(status),
+        message:
+          paymentStatus === 'rejected' && found?.adminNote
+            ? found.adminNote
+            : getTrackOrderMessage(status),
         order: found
           ? {
               ...found,
@@ -1561,10 +1637,7 @@ async function startServer() {
               customerReference: '',
               customSpec: '',
               deliveredCredentials: '',
-              adminNote:
-                found.status === 'rejected'
-                  ? 'Payment review could not be completed. Please contact support.'
-                  : '',
+              adminNote: found.status === 'rejected' ? found.adminNote : '',
             }
           : null,
       });
@@ -1696,8 +1769,9 @@ async function startServer() {
         amount_paise: number;
         created_at: Date;
         expires_at: Date | null;
+        payment_expires_at: Date | null;
         delivered: number;
-      }>('SELECT id, status, utr, amount_paise, created_at, expires_at, delivered FROM orders WHERE utr = $1 FOR UPDATE', [
+      }>('SELECT id, status, utr, amount_paise, created_at, expires_at, payment_expires_at, delivered FROM orders WHERE utr = $1 FOR UPDATE', [
         utr,
       ]);
       const matchedOrder = orderResult.rows[0];
@@ -1705,7 +1779,6 @@ async function startServer() {
       let orderId: string | null = null;
       let delivered = false;
       let orderNeedsStockDelivery: OrderRecord | undefined;
-      let orderAutoRejected = false;
 
       if (matchedOrder) {
         orderId = matchedOrder.id;
@@ -1732,13 +1805,6 @@ async function startServer() {
             [utr, matchedOrder.id]
           );
           await linkSmsPaymentLogs(client, utr, matchedOrder.id);
-        } else if (
-          matchedOrder.status === 'utr_submitted' &&
-          isOrderExpired(matchedOrder.expires_at) &&
-          (!matchedOrder.expires_at || receivedAt.getTime() > matchedOrder.expires_at.getTime())
-        ) {
-          orderAutoRejected = await rejectExpiredUtrOrder(client, matchedOrder.id);
-          result = orderAutoRejected ? 'rejected_expired_utr' : 'ignored_expired_utr';
         } else if (
           matchedOrder.status === 'utr_submitted' ||
           matchedOrder.status === 'paid_stock_pending'
@@ -1769,15 +1835,11 @@ async function startServer() {
         broadcastStateUpdate('order_verified', { orderId, source: 'sms' });
         broadcastStateUpdate('vault_updated', {});
       } else {
-        if (orderNeedsStockDelivery || orderAutoRejected) {
+        if (orderNeedsStockDelivery) {
           await saveDb(db);
         }
         if (orderNeedsStockDelivery) {
           broadcastStateUpdate('order_created', { order: orderNeedsStockDelivery });
-        }
-        if (orderAutoRejected) {
-          broadcastStateUpdate('order_rejected', { orderId });
-          broadcastStateUpdate('vault_updated', {});
         }
         await commitCheckoutTransaction();
       }
@@ -1812,6 +1874,7 @@ async function startServer() {
         utr: string | null;
         created_at: Date;
         expires_at: Date | null;
+        payment_expires_at: Date;
         delivered: number;
         pack_label: string;
         customer_reference: string;
@@ -1858,28 +1921,12 @@ async function startServer() {
         return;
       }
       await reconcileVaultReservations(client);
-      if (paymentOrder.status === 'draft' && isOrderExpired(paymentOrder.expires_at)) {
-        await client.query("DELETE FROM orders WHERE id = $1 AND status = 'draft'", [orderId]);
-        delete db.orderAccessTokens[orderId];
-        await saveDb(db);
-        clearOrderAccessCookie(res, orderId);
-        res.json({ status: 'expired' });
-        return;
-      }
-
-      if (paymentOrder.status === 'utr_submitted' && isOrderExpired(paymentOrder.expires_at)) {
-        const rejected = await rejectExpiredUtrOrder(client, orderId);
-        if (rejected) {
-          await saveDb(db);
-          broadcastStateUpdate('order_rejected', { orderId });
-          broadcastStateUpdate('vault_updated', {});
-          res.json({ status: 'rejected' });
-          return;
-        }
-      }
-      if (paymentOrder.status === 'expired') {
-        res.json({ status: 'expired' });
-        return;
+      if (shouldExpirePaymentOrder(paymentOrder.status, paymentOrder.expires_at)) {
+        await client.query(
+          "UPDATE orders SET status = 'expired' WHERE id = $1 AND status = 'draft'",
+          [orderId]
+        );
+        paymentOrder.status = 'expired';
       }
 
       const state = { status: paymentOrder.status, delivered: paymentOrder.delivered !== 0 };
@@ -1924,10 +1971,17 @@ async function startServer() {
         });
         return;
       }
-      if (paymentOrder.utr === utr && paymentOrder.status === 'utr_submitted') {
+      if (
+        paymentOrder.utr === utr &&
+        (paymentOrder.status === 'utr_submitted' ||
+          paymentOrder.status === 'late_payment_pending_review')
+      ) {
         const failed = await recordUtrAttempt(client, orderId, clientKey, utr);
         await commitCheckoutTransaction();
-        res.json({ status: 'utr_submitted', attempts: failed?.failed_attempts ?? attemptCount });
+        res.json({
+          status: paymentOrder.status,
+          attempts: failed?.failed_attempts ?? attemptCount,
+        });
         return;
       }
       if (
@@ -1945,6 +1999,8 @@ async function startServer() {
         paymentOrder.status !== 'draft' &&
         paymentOrder.status !== 'pending' &&
         paymentOrder.status !== 'utr_submitted' &&
+        paymentOrder.status !== 'late_payment_pending_review' &&
+        paymentOrder.status !== 'expired' &&
         paymentOrder.status !== 'rejected'
       ) {
         res.status(409).json({ error: 'This order has already received a UTR submission.' });
@@ -1999,17 +2055,57 @@ async function startServer() {
         return;
       }
       const poolType = getVaultPoolForPackType(paymentOrder.product);
-      if (paymentOrder.status !== 'utr_submitted') {
-        reserveStock(db.vault, poolType, orderId, paymentOrder.quantity);
-      }
       const submittedAt = new Date();
       const update = createSubmittedOrderUpdate(orderId, utr, submittedAt);
       const submitted = await client.query(update.text, [...update.values]);
-      if (submitted.rowCount !== 1) {
+      if (submitted.rowCount !== 1 || !submitted.rows[0]) {
         res.status(409).json({ error: 'This order is no longer available for UTR submission.' });
         return;
       }
+      const submittedStatus = submitted.rows[0].status as PaymentStatus;
+      const latePayment = submittedStatus === 'late_payment_pending_review';
+      if (!db.vault.some((item) => item.reservedOrderId === orderId)) {
+        reserveStock(db.vault, poolType, orderId, paymentOrder.quantity);
+      }
       const now = submittedAt.toISOString();
+      let reviewOrder = db.orders.find((order) => order.orderId === orderId);
+      if (!reviewOrder) {
+        reviewOrder = {
+          orderId,
+          packLabel: paymentOrder.pack_label,
+          packType: paymentOrder.product,
+          isRental24h: paymentOrder.product === 'rental_24h',
+          rentalDurationHours: paymentOrder.product === 'rental_24h' ? 24 : undefined,
+          quantity: paymentOrder.quantity,
+          unitPrice: paymentOrder.amount_paise / 100 / paymentOrder.quantity,
+          totalAmount: paymentOrder.amount_paise / 100,
+          paymentUpiId: getMerchantUpiId(),
+          utrNumber: utr,
+          upiAppUsed: 'UPI QR',
+          customerReference: paymentOrder.customer_reference,
+          customSpec: paymentOrder.custom_spec,
+          status: 'pending_verification',
+          paymentStatus: submittedStatus,
+          deliveredCredentials: '',
+          adminNote: latePayment
+            ? 'Late payment submitted; awaiting manual review.'
+            : 'UTR submitted; awaiting payment verification.',
+          createdAt: paymentOrder.created_at.toISOString(),
+          updatedAt: now,
+          paymentExpiresAt: paymentOrder.payment_expires_at.toISOString(),
+          utrSubmittedAt: now,
+        };
+        db.orders.unshift(reviewOrder);
+      } else {
+        reviewOrder.utrNumber = utr;
+        reviewOrder.paymentStatus = submittedStatus;
+        reviewOrder.adminNote = latePayment
+          ? 'Late payment submitted; awaiting manual review.'
+          : 'UTR submitted; awaiting payment verification.';
+        reviewOrder.updatedAt = now;
+        reviewOrder.paymentExpiresAt = paymentOrder.payment_expires_at.toISOString();
+        reviewOrder.utrSubmittedAt = now;
+      }
       for (const item of db.vault) {
         if (item.reservedOrderId === orderId) item.updatedAt = now;
       }
@@ -2018,13 +2114,21 @@ async function startServer() {
       const priorPayment = await client.query<{ utr: string; amount_paise: number; received_at: Date }>(
         `SELECT utr, amount_paise, received_at FROM payments
          WHERE utr = $1 AND amount_paise = $2 AND received_at > $3
-           AND (used_order_id IS NULL OR used_order_id = $4)`,
-        [utr, paymentOrder.amount_paise, paymentOrder.created_at, orderId]
+           AND received_at <= $4
+           AND (used_order_id IS NULL OR used_order_id = $5)`,
+        [
+          utr,
+          paymentOrder.amount_paise,
+          paymentOrder.created_at,
+          paymentOrder.payment_expires_at,
+          orderId,
+        ]
       );
       let paidImmediately = false;
       let paidOrder: OrderRecord | undefined;
       let orderNeedsStockDelivery: OrderRecord | undefined;
       if (
+        !latePayment &&
         priorPayment.rows[0] &&
         matchesSmsPayment(
           { utr, amountPaise: paymentOrder.amount_paise, createdAt: paymentOrder.created_at },
@@ -2058,6 +2162,8 @@ async function startServer() {
             orderId,
             orderNeedsStockDelivery?.paymentStatus === 'paid_stock_pending'
               ? 'Paid - Stock Pending'
+              : latePayment
+                ? 'Late Payment - Pending Review'
               : 'Waiting for SMS',
           ]
         );
@@ -2072,6 +2178,8 @@ async function startServer() {
       res.json({
         status: paidImmediately
           ? 'paid'
+          : latePayment
+            ? 'late_payment_pending_review'
           : orderNeedsStockDelivery?.paymentStatus === 'paid_stock_pending'
             ? 'paid_stock_pending'
             : 'utr_submitted',
@@ -2106,29 +2214,34 @@ async function startServer() {
            WHERE payments.utr = orders.utr
              AND payments.amount_paise = orders.amount_paise
              AND payments.received_at > orders.created_at
-             AND payments.received_at <= orders.expires_at
+             AND payments.received_at <= orders.payment_expires_at
              AND payments.used_order_id IS NULL
          ) AS matching_payment
          FROM orders WHERE id = $1 FOR UPDATE`,
         [req.params.id]
       );
-      if (!result.rows[0] || result.rows[0].status === 'draft') {
+      if (!result.rows[0]) {
         res.status(404).json({ status: 'not_found' });
         return;
       }
       let status: PaymentStatus | 'payment_received' = result.rows[0].status;
-      if (status === 'utr_submitted' && isOrderExpired(result.rows[0].expires_at)) {
-        const rejected = await rejectExpiredUtrOrder(client, req.params.id);
-        if (rejected) {
-          await saveDb(db);
-          broadcastStateUpdate('order_rejected', { orderId: req.params.id });
-          broadcastStateUpdate('vault_updated', {});
-          status = 'rejected';
-        } else if (result.rows[0].matching_payment) {
-          status = 'payment_received';
-        }
+      if (shouldExpirePaymentOrder(status, result.rows[0].expires_at)) {
+        await client.query(
+          "UPDATE orders SET status = 'expired' WHERE id = $1 AND status = 'draft'",
+          [req.params.id]
+        );
+        status = 'expired';
+      } else if (status === 'utr_submitted' && result.rows[0].matching_payment) {
+        status = 'payment_received';
       }
-      res.json({ status });
+      const order = db.orders.find((item) => item.orderId === req.params.id);
+      res.json({
+        status,
+        message:
+          status === 'rejected'
+            ? order?.adminNote || 'Payment was rejected. Please contact support.'
+            : '',
+      });
     } catch (error) {
       console.error('Failed to read payment order status:', error);
       res.status(500).json({ error: 'Order status is temporarily unavailable.' });
@@ -2917,6 +3030,7 @@ async function startServer() {
     };
     const orderQuery = String(req.query.orderSearch || '').trim();
     const orderStatus = String(req.query.orderStatus || 'all');
+    const orderPaymentStatus = String(req.query.orderPaymentStatus || 'all');
     const claimQuery = String(req.query.claimSearch || '').trim();
     const claimStatus = String(req.query.claimStatus || 'all');
     const orderOffset = offset('ordersOffset');
@@ -2925,8 +3039,11 @@ async function startServer() {
     const claimsPageSize = pageSize('claimsLimit');
     if (!postgresPool) {
       const normalizedOrders = db.orders.filter((order) => {
-        if (order.status === 'pending_verification') return false;
         if (orderStatus !== 'all' && order.status !== orderStatus) return false;
+        if (
+          orderPaymentStatus !== 'all' &&
+          order.paymentStatus !== orderPaymentStatus
+        ) return false;
         if (!orderQuery) return true;
         const haystack = [
           order.orderId,
@@ -3013,8 +3130,14 @@ async function startServer() {
          normalized_order_rows AS (
            SELECT order_rows.item || jsonb_build_object(
              'utrNumber',
-             COALESCE(NULLIF(payment_order.utr, ''), NULLIF(order_rows.item->>'utrNumber', ''), '')
-           ) AS item,
+               COALESCE(NULLIF(payment_order.utr, ''), NULLIF(order_rows.item->>'utrNumber', ''), ''),
+               'paymentStatus',
+               COALESCE(payment_order.status, order_rows.item->>'paymentStatus'),
+               'paymentExpiresAt',
+               COALESCE(payment_order.payment_expires_at, NULLIF(order_rows.item->>'paymentExpiresAt', '')::timestamptz),
+               'utrSubmittedAt',
+               COALESCE(payment_order.utr_submitted_at, NULLIF(order_rows.item->>'utrSubmittedAt', '')::timestamptz)
+             ) AS item,
            order_rows.ordinal
            FROM order_rows
            LEFT JOIN orders AS payment_order
@@ -3032,7 +3155,7 @@ async function startServer() {
              ON payment.utr = payment_order.utr
              AND payment.amount_paise = payment_order.amount_paise
              AND payment.received_at > payment_order.created_at
-             AND payment.received_at <= payment_order.expires_at
+             AND payment.received_at <= payment_order.payment_expires_at
              AND payment.used_order_id = payment_order.id
            WHERE payment_order.status = 'paid_stock_pending'
              AND payment_order.delivered = 0
@@ -3043,6 +3166,7 @@ async function startServer() {
            LEFT JOIN orders AS payment_order
              ON payment_order.id = normalized_order_rows.item->>'orderId'
            WHERE normalized_order_rows.item->>'status' != 'pending_verification'
+             OR payment_order.status IN ('utr_submitted', 'late_payment_pending_review')
              OR EXISTS (
                SELECT 1
                FROM payments AS payment
@@ -3065,7 +3189,7 @@ async function startServer() {
                  AND (
                    payment_order.id IS NULL OR (
                      payment_order.status = 'utr_submitted' AND
-                     payment.received_at <= payment_order.expires_at
+                     payment.received_at <= payment_order.payment_expires_at
                    )
                  )
              )
@@ -3073,6 +3197,7 @@ async function startServer() {
          filtered_orders AS (
            SELECT item, ordinal FROM eligible_order_rows
            WHERE ($3 = 'all' OR item->>'status' = $3)
+             AND ($9 = 'all' OR item->>'paymentStatus' = $9)
              AND ($4 = '' OR POSITION(LOWER($4) IN LOWER(CONCAT_WS(' ',
                item->>'orderId', item->>'utrNumber', item->>'customerReference',
                item->>'packLabel', item->>'deliveredCredentials'))) > 0)
@@ -3151,6 +3276,7 @@ async function startServer() {
           claimsPageSize,
           claimStatus,
           claimQuery,
+          orderPaymentStatus,
         ]
       );
       const smsPaymentLogs = await query(
@@ -3407,6 +3533,11 @@ async function startServer() {
   app.post('/api/admin/orders/:orderId/reject', async (req, res) => {
     try {
       const { orderId } = req.params;
+      const reason = String(req.body?.reason || '').trim();
+      if (reason.length < 5 || reason.length > LIMITS.ADMIN_NOTE_MAX) {
+        res.status(400).json({ error: 'Provide a rejection reason between 5 and 300 characters.' });
+        return;
+      }
       const order = db.orders.find((o) => o.orderId === orderId);
       if (!order) {
         res.status(404).json({ error: 'Order not found' });
@@ -3428,7 +3559,7 @@ async function startServer() {
         const updated = await client.query(
           `UPDATE orders SET status = 'rejected'
            WHERE id = $1 AND delivered = 0
-             AND status IN ('utr_submitted', 'pending')
+             AND status IN ('utr_submitted', 'late_payment_pending_review', 'pending')
              AND utr ~ '^[0-9]{12}$'
            RETURNING id`,
           [order.orderId]
@@ -3448,6 +3579,7 @@ async function startServer() {
       }
       const now = new Date().toISOString();
       rejectOrderAndReleaseStock(order, db.vault, order.orderId, now);
+      order.adminNote = `Payment rejected: ${reason}`;
       syncVaultDisplayCounter(getVaultPoolForPackType(order.packType));
       if (!(await persistDbOrRespond(res))) return;
       broadcastStateUpdate('order_rejected', { order });
@@ -3457,6 +3589,74 @@ async function startServer() {
     } catch (error) {
       console.error('Failed to reject UPI order:', error);
       res.status(500).json({ error: 'The order could not be rejected right now.' });
+    }
+  });
+
+  app.post('/api/admin/orders/:orderId/approve', async (req, res) => {
+    try {
+      const order = db.orders.find((item) => item.orderId === req.params.orderId);
+      if (!order) {
+        res.status(404).json({ error: 'Order not found.' });
+        return;
+      }
+      if (
+        order.status !== 'pending_verification' ||
+        order.paymentStatus !== 'late_payment_pending_review' ||
+        !LIMITS.UTR_REGEX.test(order.utrNumber)
+      ) {
+        res.status(409).json({ error: 'Only late payments awaiting review can be approved.' });
+        return;
+      }
+      const client = getCheckoutClient();
+      if (!client) {
+        res.status(503).json({ error: 'Payment database is not configured.' });
+        return;
+      }
+      const paymentOrder = await client.query<{
+        status: PaymentStatus;
+        delivered: number;
+      }>('SELECT status, delivered FROM orders WHERE id = $1 FOR UPDATE', [order.orderId]);
+      if (
+        paymentOrder.rows[0]?.status !== 'late_payment_pending_review' ||
+        paymentOrder.rows[0].delivered !== 0
+      ) {
+        res.status(409).json({ error: 'This late payment has already been processed.' });
+        return;
+      }
+      if (!deliverOrder(order)) {
+        res.status(409).json({ error: 'Matching product stock is not available for delivery.' });
+        return;
+      }
+      order.adminNote = 'Late payment approved by admin; product delivered.';
+      const updated = await client.query(
+        `UPDATE orders SET status = 'paid', delivered = 1
+         WHERE id = $1 AND status = 'late_payment_pending_review' AND delivered = 0
+         RETURNING id`,
+        [order.orderId]
+      );
+      if (updated.rowCount !== 1) {
+        res.status(409).json({ error: 'This late payment has already been processed.' });
+        return;
+      }
+      await client.query(
+        `UPDATE payments SET used_order_id = $2
+         WHERE utr = $1 AND (used_order_id IS NULL OR used_order_id = $2)`,
+        [order.utrNumber, order.orderId]
+      );
+      await client.query(
+        `UPDATE track_order_complaints
+         SET current_status = 'Delivered', resolved_at = COALESCE(resolved_at, NOW())
+         WHERE order_id = $1`,
+        [order.orderId]
+      );
+      syncVaultDisplayCounter(getVaultPoolForPackType(order.packType));
+      if (!(await persistDbOrRespond(res))) return;
+      broadcastStateUpdate('order_verified', { order, source: 'admin' });
+      broadcastStateUpdate('vault_updated', {});
+      res.json({ order });
+    } catch (error) {
+      console.error('Failed to approve late payment:', error);
+      res.status(500).json({ error: 'The late payment could not be approved right now.' });
     }
   });
 
@@ -3710,23 +3910,14 @@ async function startServer() {
       db.orderAccessTokens ||= {};
       db.guaranteeClaims ||= [];
 
-      const expiredResult = await client.query<{ id: string }>(
-        `SELECT id FROM orders
-         WHERE status = 'utr_submitted' AND delivered = 0 AND expires_at <= NOW()
-         FOR UPDATE SKIP LOCKED`
-      );
-      const expiredIds = new Set<string>();
-      for (const expiredOrder of expiredResult.rows) {
-        if (await rejectExpiredUtrOrder(client, expiredOrder.id)) {
-          expiredIds.add(expiredOrder.id);
-        }
-      }
-      const draftsResult = await client.query<{ id: string }>(
-        `DELETE FROM orders WHERE status = 'draft' AND expires_at <= NOW() RETURNING id`
+      const expiredDrafts = await client.query<{ id: string }>(
+        `UPDATE orders SET status = 'expired'
+         WHERE status = 'draft' AND expires_at <= NOW() RETURNING id`
       );
       const activeOrders = await client.query<{ id: string }>(
         `SELECT id FROM orders
-         WHERE status IN ('utr_submitted', 'paid_stock_pending') AND delivered = 0`
+         WHERE status IN ('utr_submitted', 'late_payment_pending_review', 'paid_stock_pending')
+           AND delivered = 0`
       );
       const activeOrderIds = new Set(activeOrders.rows.map((row) => row.id));
       const now = new Date().toISOString();
@@ -3745,9 +3936,8 @@ async function startServer() {
         }
         releaseStock(db.vault, id, now);
       }
-      for (const draft of draftsResult.rows) delete db.orderAccessTokens[draft.id];
       for (const pool of affectedPools) syncVaultDisplayCounter(pool);
-      if (expiredIds.size || draftsResult.rowCount || staleReservationIds.size) {
+      if (expiredDrafts.rowCount || staleReservationIds.size) {
         const state = JSON.stringify(db);
         await client.query(
           'UPDATE roshanbrand_state SET state = $1::jsonb, updated_at = NOW() WHERE id = 1',
@@ -3755,8 +3945,12 @@ async function startServer() {
         );
         await client.query('COMMIT');
         lastPersistedState = state;
-        if (expiredIds.size) {
-          broadcastStateUpdate('orders_rejected', { orderIds: [...expiredIds] });
+        if (expiredDrafts.rowCount) {
+          broadcastStateUpdate('orders_expired', {
+            orderIds: expiredDrafts.rows.map((order) => order.id),
+          });
+        }
+        if (staleReservationIds.size) {
           broadcastStateUpdate('vault_updated', {});
         }
       } else {
@@ -3819,10 +4013,29 @@ async function startServer() {
     app.use(
       express.static(distPath, {
         setHeaders: (res, filePath) => {
-          if (/\.(?:html?|js|mjs)$/i.test(filePath)) setNoCacheHeaders(res);
+          if (path.basename(filePath) === 'service-worker.js') {
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+          } else if (path.basename(filePath) === 'site.webmanifest') {
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
+          } else if (/\.(?:html?|js|mjs)$/i.test(filePath)) {
+            setNoCacheHeaders(res);
+          }
         },
       })
     );
+    app.use((req, res, next) => {
+      if (
+        req.method === 'GET' &&
+        (/^\/(?:service-worker\.js|site\.webmanifest)$/.test(req.path) ||
+          req.path.startsWith('/icons/'))
+      ) {
+        res.status(404).type('text/plain').send('Not found');
+        return;
+      }
+      next();
+    });
     app.get('*', (_req, res) => {
       setNoCacheHeaders(res);
       res.sendFile(path.join(distPath, 'index.html'));

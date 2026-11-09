@@ -11,7 +11,8 @@ import {
   XCircle,
 } from 'lucide-react';
 import { LIMITS } from '../src/constants';
-import { CheckoutDraft, OrderRecord, StoreConfig } from '../src/types';
+import { CheckoutDraft, OrderRecord, PaymentStatus, StoreConfig } from '../src/types';
+import { PaymentCountdown } from './PaymentCountdown';
 import { UpiQrBox } from './UpiQrBox';
 
 interface CheckoutModalProps {
@@ -19,19 +20,26 @@ interface CheckoutModalProps {
   activeOrder: OrderRecord | null;
   storeConfig: StoreConfig;
   onClose: () => void;
+  onTryAgain: () => void;
   onOrderCreated: (order: OrderRecord, accessToken?: string) => void;
 }
 
 interface CreatedPaymentOrder {
   orderId: string;
   amount: number;
-  status: 'draft';
+  status: PaymentStatus;
   createdAt: string;
+  paymentExpiresAt: string;
+  graceExpiresAt: string;
+  serverNow: string;
+  utrSubmittedAt?: string | null;
   upiLink: string;
   upiId: string;
   payeeName: string;
-  accessToken: string;
+  accessToken?: string;
 }
+
+const PENDING_CHECKOUT_STORAGE_KEY = 'roshanbrand_pending_checkout';
 
 const wait = (milliseconds: number) =>
   new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
@@ -39,6 +47,8 @@ const wait = (milliseconds: number) =>
 const WRONG_UTR_ERROR = 'Galat UTR. Receipt se 12-digit UTR dobara check karein.';
 const TOO_MANY_WRONG_UTR_ERROR = 'Bahut zyada galat UTR. Support se contact karein.';
 const UTR_ALREADY_USED_ERROR = 'Yeh UTR pehle hi use ho chuka hai.';
+const PAYMENT_PENDING_MESSAGE =
+  'Aapka payment verify ho raha hai. Agar paisa kat gaya hai to chinta na karein, order approve hote hi mil jayega.';
 const PAID_STOCK_PENDING_MESSAGE =
   'Payment mil gaya. Stock abhi available nahi hai, stock aate hi ID automatic mil jayegi.';
 
@@ -46,6 +56,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   draft,
   storeConfig,
   onClose,
+  onTryAgain,
   onOrderCreated,
 }) => {
   const [paymentOrder, setPaymentOrder] = useState<CreatedPaymentOrder | null>(null);
@@ -54,41 +65,13 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   const [verifying, setVerifying] = useState(false);
   const [wrongAttempts, setWrongAttempts] = useState(0);
   const [paymentReceived, setPaymentReceived] = useState(false);
+  const [utrSubmitted, setUtrSubmitted] = useState(false);
+  const [paymentTimeExpired, setPaymentTimeExpired] = useState(false);
   const [completedOrder, setCompletedOrder] = useState<OrderRecord | null>(null);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [copied, setCopied] = useState(false);
   const verificationRun = useRef(0);
-  const paymentOrderRef = useRef<CreatedPaymentOrder | null>(null);
-
-  const cancelPaymentOrder = (order: CreatedPaymentOrder) => {
-    const body = JSON.stringify({
-      orderId: order.orderId,
-      accessToken: order.accessToken,
-    });
-    const beaconSent = navigator.sendBeacon(
-      '/api/cancel-order',
-      new Blob([body], { type: 'application/json' })
-    );
-    if (!beaconSent) {
-      void fetch('/api/cancel-order', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body,
-        keepalive: true,
-      }).catch((cancelError: unknown) => {
-        console.error('Could not cancel checkout draft:', cancelError);
-      });
-    }
-  };
-
-  useEffect(() => {
-    const cancelDraftOnPageHide = () => {
-      if (paymentOrderRef.current) cancelPaymentOrder(paymentOrderRef.current);
-    };
-    window.addEventListener('pagehide', cancelDraftOnPageHide);
-    return () => window.removeEventListener('pagehide', cancelDraftOnPageHide);
-  }, []);
 
   useEffect(() => {
     let active = true;
@@ -96,6 +79,70 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
 
     const createOrder = async () => {
       try {
+        setCreatingOrder(true);
+        setPaymentOrder(null);
+        setUtr('');
+        setUtrSubmitted(false);
+        setPaymentTimeExpired(false);
+        setPaymentReceived(false);
+        setCompletedOrder(null);
+        setMessage('');
+        setError('');
+
+        let storedOrderId = '';
+        const stored = sessionStorage.getItem(PENDING_CHECKOUT_STORAGE_KEY);
+        if (stored) {
+          try {
+            const parsed = JSON.parse(stored) as {
+              orderId?: string;
+              draft?: CheckoutDraft;
+            };
+            if (
+              parsed.orderId &&
+              parsed.draft &&
+              JSON.stringify(parsed.draft) === JSON.stringify(draft)
+            ) {
+              storedOrderId = parsed.orderId;
+            } else {
+              sessionStorage.removeItem(PENDING_CHECKOUT_STORAGE_KEY);
+            }
+          } catch {
+            sessionStorage.removeItem(PENDING_CHECKOUT_STORAGE_KEY);
+          }
+        }
+
+        if (storedOrderId) {
+          const restoredResponse = await fetch(
+            `/api/orders/checkout/${encodeURIComponent(storedOrderId)}`,
+            { cache: 'no-store' }
+          );
+          if (restoredResponse.ok) {
+            const restored = await restoredResponse.json() as CreatedPaymentOrder;
+            if (restored.status === 'paid') {
+              const paidOrder = await fetchPaidOrder(restored);
+              finishAsPaid(paidOrder, restored.accessToken || '');
+              return;
+            }
+            if (
+              restored.status === 'utr_submitted' ||
+              restored.status === 'late_payment_pending_review' ||
+              restored.status === 'paid_stock_pending' ||
+              restored.status === 'rejected'
+            ) {
+              setUtrSubmitted(true);
+              setPaymentReceived(true);
+              setMessage(PAYMENT_PENDING_MESSAGE);
+            }
+            setPaymentOrder(restored);
+            return;
+          }
+          if (restoredResponse.status !== 401 && restoredResponse.status !== 404) {
+            const data = await restoredResponse.json();
+            throw new Error(data.error || 'Payment checkout restore nahi ho saka.');
+          }
+          sessionStorage.removeItem(PENDING_CHECKOUT_STORAGE_KEY);
+        }
+
         const response = await fetch('/api/create-order', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -115,13 +162,11 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
           if (createdOrder.status !== 'draft' || !createdOrder.orderId) {
             throw new Error('Server did not confirm the checkout draft.');
           }
-          paymentOrderRef.current = createdOrder;
+          sessionStorage.setItem(
+            PENDING_CHECKOUT_STORAGE_KEY,
+            JSON.stringify({ orderId: createdOrder.orderId, draft })
+          );
           setPaymentOrder(createdOrder);
-        } else {
-          const createdOrder = data as CreatedPaymentOrder;
-          if (createdOrder.orderId && createdOrder.accessToken) {
-            cancelPaymentOrder(createdOrder);
-          }
         }
       } catch (requestError) {
         if (active) {
@@ -140,7 +185,6 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
     return () => {
       active = false;
       verificationRun.current += 1;
-      if (paymentOrderRef.current) cancelPaymentOrder(paymentOrderRef.current);
     };
   }, [draft]);
 
@@ -182,10 +226,56 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   };
 
   const finishAsPaid = (verifiedOrder: OrderRecord, accessToken: string) => {
+    sessionStorage.removeItem(PENDING_CHECKOUT_STORAGE_KEY);
     setCompletedOrder(verifiedOrder);
     setMessage('');
     onOrderCreated(verifiedOrder, accessToken);
   };
+
+  useEffect(() => {
+    if (!paymentOrder || !utrSubmitted || completedOrder) return;
+    let active = true;
+    let timer: number | undefined;
+    const pollStatus = async () => {
+      try {
+        const response = await fetch(
+          `/api/order-status/${encodeURIComponent(paymentOrder.orderId)}`,
+          { cache: 'no-store' }
+        );
+        const data = await response.json() as { status: string; message?: string; error?: string };
+        if (!response.ok) throw new Error(data.error || 'Order status check nahi ho saka.');
+        if (!active) return;
+        if (data.status === 'paid') {
+          finishAsPaid(await fetchPaidOrder(paymentOrder), paymentOrder.accessToken || '');
+          return;
+        }
+        if (data.status === 'rejected') {
+          setMessage(data.message || 'Payment review complete nahi ho saka. Support se contact karein.');
+          return;
+        } else if (data.status === 'late_payment_pending_review') {
+          setMessage(PAYMENT_PENDING_MESSAGE);
+        } else if (data.status === 'paid_stock_pending') {
+          setMessage(PAID_STOCK_PENDING_MESSAGE);
+        } else if (data.status === 'payment_received') {
+          setMessage('Payment SMS mil gaya hai. Order delivery process mein hai.');
+        }
+      } catch (requestError) {
+        if (active) {
+          setError(
+            requestError instanceof Error
+              ? requestError.message
+              : 'Order status check nahi ho saka.'
+          );
+        }
+      }
+      if (active) timer = window.setTimeout(() => void pollStatus(), 5000);
+    };
+    void pollStatus();
+    return () => {
+      active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [paymentOrder?.orderId, utrSubmitted, completedOrder]);
 
   const pasteUtr = async () => {
     try {
@@ -263,7 +353,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
           throw new Error(statusData.error || 'Order status check nahi ho saka.');
         }
         if (statusData.status === 'paid') {
-          finishAsPaid(await fetchPaidOrder(paymentOrder), paymentOrder.accessToken);
+          finishAsPaid(await fetchPaidOrder(paymentOrder), paymentOrder.accessToken || '');
           return;
         }
         if (statusData.status !== 'paid_stock_pending') {
@@ -292,7 +382,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
       }
       if (firstCheck.attempts !== undefined) setWrongAttempts(firstCheck.attempts);
       if (firstCheck.status === 'paid') {
-        finishAsPaid(await fetchPaidOrder(paymentOrder), paymentOrder.accessToken);
+        finishAsPaid(await fetchPaidOrder(paymentOrder), paymentOrder.accessToken || '');
         return;
       }
       if (firstCheck.status === 'paid_stock_pending') {
@@ -310,84 +400,23 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         setMessage('');
         return;
       }
-      if (firstCheck.status !== 'utr_submitted') {
+      if (
+        firstCheck.status !== 'utr_submitted' &&
+        firstCheck.status !== 'late_payment_pending_review'
+      ) {
         throw new Error('Server did not confirm the submitted UTR.');
       }
 
-      setMessage('Verification ho rahi hai...');
-      const deadline = Date.now() + 3 * 60 * 1000;
-      let matchingPaymentSeen = false;
-      while (Date.now() < deadline && isCurrentRun()) {
-        await wait(Math.min(5000, deadline - Date.now()));
-        if (!isCurrentRun()) return;
-
-        const statusResponse = await fetch(
-          `/api/order-status/${encodeURIComponent(paymentOrder.orderId)}`,
-          { cache: 'no-store' }
-        );
-        const statusData = await statusResponse.json();
-        if (!statusResponse.ok) {
-          throw new Error(statusData.error || 'Order status check nahi ho saka.');
-        }
-        if (statusData.status === 'expired') {
-          setMessage('Order expire ho gaya. Support se contact karein.');
-          return;
-        }
-        if (statusData.status === 'rejected') {
-          const attempts = firstCheck.attempts ?? wrongAttempts + 1;
-          setWrongAttempts(attempts);
-          setError(attempts >= 3 ? TOO_MANY_WRONG_UTR_ERROR : WRONG_UTR_ERROR);
-          setMessage('');
-          return;
-        }
-        if (statusData.status === 'paid') {
-          finishAsPaid(await fetchPaidOrder(paymentOrder), paymentOrder.accessToken);
-          return;
-        }
-        if (statusData.status === 'paid_stock_pending') {
-          await waitForStockDelivery();
-          return;
-        }
-        if (statusData.status === 'payment_received') {
-          matchingPaymentSeen = true;
-          setPaymentReceived(true);
-        }
-      }
-
-      if (isCurrentRun()) {
-        const statusResponse = await fetch(
-          `/api/order-status/${encodeURIComponent(paymentOrder.orderId)}`,
-          { cache: 'no-store' }
-        );
-        const statusData = await statusResponse.json();
-        if (!statusResponse.ok) {
-          throw new Error(statusData.error || 'Order status check nahi ho saka.');
-        }
-        if (statusData.status === 'paid') {
-          finishAsPaid(await fetchPaidOrder(paymentOrder), paymentOrder.accessToken);
-          return;
-        }
-        if (statusData.status === 'paid_stock_pending') {
-          await waitForStockDelivery();
-          return;
-        }
-        if (statusData.status === 'rejected') {
-          const attempts = firstCheck.attempts ?? wrongAttempts + 1;
-          setWrongAttempts(attempts);
-          setError(attempts >= 3 ? TOO_MANY_WRONG_UTR_ERROR : WRONG_UTR_ERROR);
-          setMessage('');
-          return;
-        }
-        if (statusData.status === 'payment_received' || matchingPaymentSeen) {
-          setPaymentReceived(true);
-          setMessage('Payment SMS mil gaya hai. Order delivery process mein hai.');
-          return;
-        }
-        const attempts = firstCheck.attempts ?? wrongAttempts + 1;
-        setWrongAttempts(attempts);
-        setError(attempts >= 3 ? TOO_MANY_WRONG_UTR_ERROR : WRONG_UTR_ERROR);
-        setMessage('');
-      }
+      setPaymentOrder({
+        ...paymentOrder,
+        status:
+          firstCheck.status === 'late_payment_pending_review'
+            ? 'late_payment_pending_review'
+            : 'utr_submitted',
+      });
+      setUtrSubmitted(true);
+      setPaymentReceived(true);
+      setMessage(PAYMENT_PENDING_MESSAGE);
     } catch (requestError) {
       if (isCurrentRun()) {
         setError(
@@ -403,6 +432,11 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   };
 
   if (!draft) return null;
+  const paymentExpired = Boolean(
+    paymentOrder &&
+      (paymentTimeExpired ||
+        Date.parse(paymentOrder.paymentExpiresAt) <= Date.parse(paymentOrder.serverNow))
+  );
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/80 backdrop-blur-md overflow-y-auto">
@@ -491,13 +525,51 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                 <div className="text-xs text-slate-300">{draft.packLabel}</div>
               </div>
 
-              <UpiQrBox
-                upiId={paymentOrder.upiId}
-                payeeName={paymentOrder.payeeName}
-                amount={paymentOrder.amount}
-                orderNote={paymentOrder.orderId}
-                paymentLink={paymentOrder.upiLink}
-              />
+              {!utrSubmitted && (
+                <PaymentCountdown
+                  paymentExpiresAt={paymentOrder.paymentExpiresAt}
+                  serverNow={paymentOrder.serverNow}
+                  onExpire={() => setPaymentTimeExpired(true)}
+                />
+              )}
+
+              {paymentExpired && !utrSubmitted ? (
+                <div className="space-y-3 rounded-xl border border-rose-400/40 bg-rose-950/30 p-4 text-center">
+                  <p className="font-extrabold text-rose-200">Payment time expired.</p>
+                  <p className="text-xs text-slate-300">
+                    QR payment is closed. Already paid? Submit your 12-digit UTR below during the
+                    grace period or contact support.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      sessionStorage.removeItem(PENDING_CHECKOUT_STORAGE_KEY);
+                      onTryAgain();
+                    }}
+                    className="rounded-lg border border-sky-400/40 bg-sky-500 px-4 py-2 text-sm font-extrabold text-slate-950 hover:bg-sky-400"
+                  >
+                    New Order / Try Again
+                  </button>
+                </div>
+              ) : null}
+
+              {!paymentExpired && !utrSubmitted && (
+                <UpiQrBox
+                  upiId={paymentOrder.upiId}
+                  payeeName={paymentOrder.payeeName}
+                  amount={paymentOrder.amount}
+                  orderNote={paymentOrder.orderId}
+                  paymentLink={paymentOrder.upiLink}
+                />
+              )}
+
+              {utrSubmitted && (
+                <p className="rounded-xl border border-amber-400/40 bg-amber-950/30 p-3 text-center text-sm font-bold text-amber-200">
+                  {paymentOrder.status === 'late_payment_pending_review'
+                    ? 'Late Payment - Pending Review'
+                    : 'UTR Submitted - Verification Pending'}
+                </p>
+              )}
 
               <form onSubmit={handleVerify} className="space-y-3">
                 <div className="flex items-center justify-between gap-2">

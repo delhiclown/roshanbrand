@@ -23,6 +23,7 @@ import {
 import { AdminPortal } from '../components/AdminPortal';
 import { CheckoutModal } from '../components/CheckoutModal';
 import { DeliveredOrderDetails } from '../components/DeliveredOrderDetails';
+import { InstallAppButton } from './components/InstallAppButton';
 import { DEFAULT_STORE_CONFIG, getTrackOrderMessage, LIMITS } from './constants';
 import {
   CheckoutDraft,
@@ -34,6 +35,48 @@ import {
 } from './types';
 
 const cookieAuthenticatedOrder = 'http-only-cookie';
+const PENDING_CHECKOUT_STORAGE_KEY = 'roshanbrand_pending_checkout';
+
+function isPackType(value: unknown): value is PackType {
+  return (
+    value === 'pack_1' ||
+    value === 'pack_2' ||
+    value === 'pack_5' ||
+    value === 'pack_10' ||
+    value === 'bulk' ||
+    value === 'custom' ||
+    value === 'rental_24h' ||
+    value === 'guarantee_7days' ||
+    value === 'guarantee_1month'
+  );
+}
+
+function isCheckoutDraft(value: unknown): value is CheckoutDraft {
+  if (!value || typeof value !== 'object') return false;
+  const draft = value as Record<string, unknown>;
+  return (
+    isPackType(draft.packType) &&
+    typeof draft.packLabel === 'string' &&
+    typeof draft.quantity === 'number' &&
+    Number.isInteger(draft.quantity) &&
+    typeof draft.unitPrice === 'number' &&
+    Number.isFinite(draft.unitPrice) &&
+    typeof draft.totalAmount === 'number' &&
+    Number.isFinite(draft.totalAmount) &&
+    typeof draft.initialCustomSpec === 'string'
+  );
+}
+
+function restoreCheckoutDraft(): CheckoutDraft | null {
+  try {
+    const stored = sessionStorage.getItem(PENDING_CHECKOUT_STORAGE_KEY);
+    if (!stored) return null;
+    const value = JSON.parse(stored) as { draft?: unknown };
+    return isCheckoutDraft(value.draft) ? value.draft : null;
+  } catch {
+    return null;
+  }
+}
 
 const clearStoredOrderData = () => {
   try {
@@ -78,7 +121,7 @@ export default function App() {
   const [quantity, setQuantity] = useState<number>(1);
   const [outOfStockQuantity, setOutOfStockQuantity] = useState<number | null>(null);
   const [customNote, setCustomNote] = useState<string>('');
-  const [checkoutDraft, setCheckoutDraft] = useState<CheckoutDraft | null>(null);
+  const [checkoutDraft, setCheckoutDraft] = useState<CheckoutDraft | null>(restoreCheckoutDraft);
   const [rentalStockNoticeOpen, setRentalStockNoticeOpen] = useState(false);
 
   const [trackedOrderId, setTrackedOrderId] = useState('');
@@ -802,6 +845,8 @@ export default function App() {
                 </div>
               )}
             </div>
+
+            <InstallAppButton />
 
             <button
               type="button"
@@ -1737,6 +1782,9 @@ export default function App() {
           activeOrder={null}
           storeConfig={storeConfig}
           onClose={() => setCheckoutDraft(null)}
+          onTryAgain={() =>
+            setCheckoutDraft((current) => current ? { ...current } : current)
+          }
           onOrderCreated={handleOrderCreated}
         />
       )}

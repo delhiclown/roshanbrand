@@ -124,9 +124,13 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   const [claimScreenshot, setClaimScreenshot] = useState<{ title: string; dataUrl: string } | null>(
     null
   );
-  const [statusFilter, setStatusFilter] = useState<'all' | OrderRecord['status']>('all');
+  const [statusFilter, setStatusFilter] = useState<
+    'all' | OrderRecord['status'] | 'late_payment_pending_review'
+  >('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [busyOrderId, setBusyOrderId] = useState<string | null>(null);
+  const [rejectingOrderId, setRejectingOrderId] = useState<string | null>(null);
+  const [latePaymentRejectionReason, setLatePaymentRejectionReason] = useState('');
   const [copiedUtr, setCopiedUtr] = useState<string | null>(null);
   const [trackOrderComplaints, setTrackOrderComplaints] = useState<TrackOrderComplaint[]>([]);
   const [trackOrderComplaintsCount, setTrackOrderComplaintsCount] = useState(0);
@@ -136,7 +140,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   const adminFiltersRef = useRef({
     ordersOffset: 0,
     claimsOffset: 0,
-    statusFilter: 'all' as 'all' | OrderRecord['status'],
+    statusFilter: 'all' as 'all' | OrderRecord['status'] | 'late_payment_pending_review',
     searchQuery: '',
     claimStatusFilter: 'all' as 'all' | GuaranteeClaimStatus,
     claimSearchQuery: '',
@@ -263,7 +267,14 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
         claimsOffset: String(requestClaimsOffset),
         ordersLimit: '50',
         claimsLimit: '50',
-        orderStatus: filters.statusFilter,
+        orderStatus:
+          filters.statusFilter === 'late_payment_pending_review'
+            ? 'all'
+            : filters.statusFilter,
+        orderPaymentStatus:
+          filters.statusFilter === 'late_payment_pending_review'
+            ? 'late_payment_pending_review'
+            : 'all',
         orderSearch: filters.searchQuery,
         claimStatus: filters.claimStatusFilter,
         claimSearch: filters.claimSearchQuery,
@@ -451,14 +462,26 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     }
   };
 
-  const handleRejectOrder = async (order: OrderRecord) => {
+  const handleRejectOrder = async (order: OrderRecord, reason: string) => {
+    const cleanReason = reason.trim();
+    if (cleanReason.length < 5 || cleanReason.length > 300) {
+      setOrderErrors((previous) => ({
+        ...previous,
+        [order.orderId]: 'Rejection reason must be between 5 and 300 characters.',
+      }));
+      return;
+    }
     setBusyOrderId(order.orderId);
     try {
       const res = await fetch(`/api/admin/orders/${order.orderId}/reject`, {
         method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason: cleanReason }),
       });
       if (res.ok) {
         setOrderErrors((previous) => ({ ...previous, [order.orderId]: '' }));
+        setRejectingOrderId(null);
+        setLatePaymentRejectionReason('');
         await fetchAdminState(false, true);
       } else {
         const data = await res.json();
@@ -477,6 +500,26 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     }
   };
 
+  const handleApproveLatePayment = async (order: OrderRecord) => {
+    setBusyOrderId(order.orderId);
+    setOrderErrors((previous) => ({ ...previous, [order.orderId]: '' }));
+    try {
+      const response = await fetch(`/api/admin/orders/${order.orderId}/approve`, {
+        method: 'POST',
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'The payment could not be approved.');
+      await fetchAdminState(false, true);
+    } catch (error) {
+      setOrderErrors((previous) => ({
+        ...previous,
+        [order.orderId]:
+          error instanceof Error ? error.message : 'The payment could not be approved.',
+      }));
+    } finally {
+      setBusyOrderId(null);
+    }
+  };
   const handleDeleteOrder = async (orderId: string) => {
     try {
       const res = await fetch(`/api/admin/orders/${orderId}`, { method: 'DELETE' });
@@ -644,7 +687,11 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   );
 
   const filteredOrders = orders.filter((o) => {
-    if (statusFilter !== 'all' && o.status !== statusFilter) return false;
+    if (statusFilter === 'late_payment_pending_review') {
+      if (o.paymentStatus !== 'late_payment_pending_review') return false;
+    } else if (statusFilter !== 'all' && o.status !== statusFilter) {
+      return false;
+    }
     if (!searchQuery.trim()) return true;
     const q = searchQuery.toLowerCase();
     return (
@@ -1301,6 +1348,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     [
                       { id: 'all', label: `All (${ordersTotal})` },
                       { id: 'pending_verification', label: `Pending (${pendingCount})` },
+                      { id: 'late_payment_pending_review', label: 'Late Payments' },
                       { id: 'verified_delivered', label: `Delivered (${deliveredCount})` },
                       { id: 'rejected', label: 'Rejected' },
                     ] as const
@@ -1406,7 +1454,14 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                                 {order.orderId}
                               </span>
                               <span>·</span>
-                              {order.status === 'pending_verification' && (
+                              {order.paymentStatus === 'late_payment_pending_review' && (
+                                <span className="text-rose-300 font-extrabold flex items-center gap-1">
+                                  <Clock className="w-3.5 h-3.5" />
+                                  Late Payment - Pending Review
+                                </span>
+                              )}
+                              {order.status === 'pending_verification' &&
+                                order.paymentStatus !== 'late_payment_pending_review' && (
                                 <span className="text-amber-300 font-extrabold flex items-center gap-1">
                                   <Clock className="w-3.5 h-3.5" />
                                   Pending UTR Verification
@@ -1457,7 +1512,10 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                                     {order.utrNumber}
                                   </span>
                                   <span className="mt-1 block text-[11px] font-semibold text-slate-400">
-                                    UTR submitted: {formatClaimDate(order.createdAt)}
+                                    Order time: {formatClaimDate(order.createdAt)}
+                                  </span>
+                                  <span className="mt-0.5 block text-[11px] font-semibold text-slate-400">
+                                    UTR submitted: {formatClaimDate(order.utrSubmittedAt || order.createdAt)}
                                   </span>
                                   <span className="mt-0.5 block text-[11px] font-semibold text-cyan-200">
                                     ID type: {getVaultPoolLabel(getOrderVaultPool(order))} ID
@@ -1505,9 +1563,15 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
 
                           <div className="w-full lg:w-[26rem] space-y-3 bg-slate-950/90 p-4 rounded-2xl border border-cyan-500/35">
                             <p className="text-xs leading-relaxed text-slate-300">
-                              Matching SMS payments deliver automatically when the correct stock is
-                              available. This panel cannot approve or deliver an order manually.
+                              {order.paymentStatus === 'late_payment_pending_review'
+                                ? 'Match the UTR and payment amount before approving this late payment.'
+                                : 'Matching SMS payments deliver automatically when the correct stock is available.'}
                             </p>
+                            {order.paymentStatus === 'late_payment_pending_review' && (
+                              <p className="rounded-lg border border-amber-400/30 bg-amber-950/30 p-3 text-sm font-extrabold text-amber-200">
+                                Amount to verify: ₹{order.totalAmount.toLocaleString('en-IN')}
+                              </p>
+                            )}
                             {orderErrors[order.orderId] && (
                               <p className="text-xs text-rose-300" role="alert">
                                 {orderErrors[order.orderId]}
@@ -1515,11 +1579,28 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                             )}
 
                             <div className="flex flex-wrap items-center gap-2 pt-1">
+                              {order.paymentStatus === 'late_payment_pending_review' && (
+                                <button
+                                  type="button"
+                                  disabled={busyOrderId === order.orderId}
+                                  onClick={() => void handleApproveLatePayment(order)}
+                                  className="py-2.5 px-3 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white border border-emerald-400/40 font-bold text-xs transition-colors disabled:opacity-50"
+                                >
+                                  {busyOrderId === order.orderId ? 'Processing...' : 'Approve & Deliver'}
+                                </button>
+                              )}
                               {order.status === 'pending_verification' && (
                                 <button
                                   type="button"
                                   disabled={busyOrderId === order.orderId}
-                                  onClick={() => handleRejectOrder(order)}
+                                  onClick={() => {
+                                    setRejectingOrderId(order.orderId);
+                                    setLatePaymentRejectionReason('');
+                                    setOrderErrors((previous) => ({
+                                      ...previous,
+                                      [order.orderId]: '',
+                                    }));
+                                  }}
                                   className="py-2.5 px-3 rounded-xl bg-rose-950/80 hover:bg-rose-900 text-rose-300 border border-rose-500/40 font-bold text-xs transition-colors cursor-pointer"
                                 >
                                   Reject
@@ -1535,6 +1616,48 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                                 <Trash2 className="w-4 h-4" />
                               </button>
                             </div>
+                            {rejectingOrderId === order.orderId && (
+                              <div className="space-y-2 rounded-lg border border-rose-400/30 bg-rose-950/20 p-3">
+                                <label
+                                  htmlFor={`reject-reason-${order.orderId}`}
+                                  className="block text-xs font-bold text-rose-200"
+                                >
+                                  Rejection reason (sent to customer)
+                                </label>
+                                <textarea
+                                  id={`reject-reason-${order.orderId}`}
+                                  value={latePaymentRejectionReason}
+                                  maxLength={300}
+                                  onChange={(event) =>
+                                    setLatePaymentRejectionReason(event.target.value)
+                                  }
+                                  className="w-full rounded-lg border border-rose-400/30 bg-slate-950 p-2 text-xs text-white"
+                                  rows={3}
+                                />
+                                <div className="flex gap-2">
+                                  <button
+                                    type="button"
+                                    disabled={busyOrderId === order.orderId}
+                                    onClick={() =>
+                                      void handleRejectOrder(order, latePaymentRejectionReason)
+                                    }
+                                    className="rounded-lg bg-rose-700 px-3 py-2 text-xs font-bold text-white disabled:opacity-50"
+                                  >
+                                    Confirm Reject
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setRejectingOrderId(null);
+                                      setLatePaymentRejectionReason('');
+                                    }}
+                                    className="rounded-lg border border-slate-600 px-3 py-2 text-xs font-bold text-slate-200"
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              </div>
+                            )}
                           </div>
                         </div>
                       </div>

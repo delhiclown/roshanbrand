@@ -26,6 +26,8 @@ export function submitUtr(state: DeliveryState): boolean {
     state.status !== 'draft' &&
     state.status !== 'pending' &&
     state.status !== 'utr_submitted' &&
+    state.status !== 'late_payment_pending_review' &&
+    state.status !== 'expired' &&
     state.status !== 'rejected'
   ) {
     return false;
@@ -73,6 +75,22 @@ export function isOrderExpired(
   return isDraftExpired(expiresAt, now);
 }
 
+export function shouldExpirePaymentOrder(
+  status: string,
+  graceExpiresAt: Date | number | null | undefined,
+  now = Date.now()
+): boolean {
+  return status === 'draft' && isOrderExpired(graceExpiresAt, now);
+}
+
+export function getUtrReviewStatus(paymentExpiresAt: Date | number, submittedAt: Date | number) {
+  const paymentDeadline = paymentExpiresAt instanceof Date
+    ? paymentExpiresAt.getTime()
+    : paymentExpiresAt;
+  const submittedTime = submittedAt instanceof Date ? submittedAt.getTime() : submittedAt;
+  return submittedTime > paymentDeadline ? 'late_payment_pending_review' as const : 'utr_submitted' as const;
+}
+
 export function getTrackComplaintStatus(
   status: string | null | undefined,
   delivered = false
@@ -80,6 +98,7 @@ export function getTrackComplaintStatus(
   if (delivered || status === 'paid' || status === 'verified_delivered') return null;
   if (!status) return 'UTR not found';
   if (status === 'paid_stock_pending') return 'Paid - Stock Pending';
+  if (status === 'late_payment_pending_review') return 'Late Payment - Pending Review';
   if (status === 'rejected') return 'Rejected';
   if (status === 'expired') return 'Order expired';
   return 'Waiting for SMS';
@@ -89,20 +108,23 @@ export function isTrackComplaintStatus(status: string | null): boolean {
   return (
     status === 'UTR not found' ||
     status === 'Paid - Stock Pending' ||
+    status === 'Late Payment - Pending Review' ||
     status === 'Waiting for SMS'
   );
 }
 
 export function createSubmittedOrderUpdate(orderId: string, utr: string, submittedAt: Date) {
   return {
-    text: `UPDATE orders SET status = 'utr_submitted', utr = $2, expires_at = $3
-           WHERE id = $1 AND status IN ('draft', 'pending', 'utr_submitted', 'rejected') AND delivered = 0
-           RETURNING id`,
-    values: [
-      orderId,
-      utr,
-      new Date(submittedAt.getTime() + 3 * 60 * 1000),
-    ] as const,
+    text: `UPDATE orders
+           SET status = CASE WHEN $3 > payment_expires_at
+                             THEN 'late_payment_pending_review'
+                             ELSE 'utr_submitted' END,
+               utr = $2, utr_submitted_at = $3
+           WHERE id = $1
+             AND status IN ('draft', 'pending', 'utr_submitted', 'late_payment_pending_review', 'expired', 'rejected')
+             AND delivered = 0
+           RETURNING id, status`,
+    values: [orderId, utr, submittedAt] as const,
   };
 }
 

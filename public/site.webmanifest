@@ -1,0 +1,15 @@
+{
+  "name": "Roshanbrand",
+  "short_name": "Roshanbrand",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#050816",
+  "theme_color": "#050816",
+  "icons": [
+    {
+      "src": "/favicon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    }
+  ]
+}
